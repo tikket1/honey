@@ -58,42 +58,44 @@ cargo run -- --asm examples/exec.hny   # disassemble what codegen produced
 5. **Poll the ring buffer** and decode each record using the field offsets in
    the manifest.
 
-## What codegen supports today (and what's next)
+## What codegen supports today
 
-All example programs compile and run in-kernel:
+Every example program compiles and runs in-kernel, each verified in the
+commit that added it:
 
-| Program                      | Status                                                  |
-|------------------------------|---------------------------------------------------------|
-| `examples/exec.hny`          | runs: emit an event with builtin fields                 |
-| `examples/exec_burst.hny`    | runs: `const`, `hash` map get/insert, `if let`, arithmetic, threshold compare |
-| `examples/sensitive_open.hny`| runs: `arg(n)`, `read_user_str` into `str<N>`, `starts_with`, `byte_at`, bounded (unrolled) `for`, bit tests |
-| `examples/shadow_open_ok.hny`| runs: `kprobe` + `kretprobe` on the same function, shared map keyed by `tid()`, `retval()` with a signed compare, `i64` field |
+| Program                        | What it shows                                                                 |
+|--------------------------------|-------------------------------------------------------------------------------|
+| `examples/exec.hny`            | tracepoint; emit an event with builtin fields                                 |
+| `examples/exec_burst.hny`      | `const`, `hash` map get/insert, `if let`, arithmetic, threshold compare       |
+| `examples/sensitive_open.hny`  | `arg(n)`, `read_user_str` into `str<N>`, `starts_with`, `byte_at`, unrolled `for`, bit tests |
+| `examples/shadow_open_ok.hny`  | `kprobe` + `kretprobe` on one function, map keyed by `tid()`, `retval()` signed compare, `i64` |
+| `examples/lsm_block_uid.hny`   | `lsm("file_open")` enforcement: `deny()` blocks a quarantined uid (EPERM)     |
+| `examples/file_open_path.hny`  | kernel struct walk `path -> dentry -> d_name -> name` via BTF, CO-RE-style relocation |
+| `examples/exec_shell.hny`      | `path == "/bin/sh"` exact string equality on the execve filename              |
+| `examples/exec_sampled.hny`    | `sample(100)`: 2 events from 200 execs                                        |
+| `examples/getenv_trace.hny`    | `uprobe(libc:getenv)` reading the env-var name, a user string argument        |
+| `examples/usdt_tick.hny`       | `usdt(usdt_demo:honey:tick)` with `arg(0)`/`arg(1)` from the note, semaphore |
+| `examples/icmp_drop.hny`       | `xdp("lo")` drops ICMP; `ipv4` fields; `src == "127.0.0.1"`                   |
+| `examples/ipv6_ping.hny`       | `ipv6`/`mac` fields, `src != "::1"`                                           |
+| `examples/xdp_structs.hny`     | `ptr<ethhdr>`/`ptr<iphdr>` views, `ip.saddr` through the anonymous union, `in_subnet` |
+| `examples/xdp_structs6.hny`    | `ptr<ipv6hdr>` view, `in6_addr` as `ipv6`, IPv6 `in_subnet`                   |
+| `examples/xdp_tcp4.hny`        | `ip.ihl` bitfield + `pkt.view(14 + ihl*4)` runtime-offset view of `tcphdr`   |
+| `examples/xdp_tcp6.hny`        | `pkt.ipv6_l4` extension-header walk + `pkt.l4()` (extension branches verifier-checked; test traffic has none) |
 
-Supported: `const` integer literals; `map` (`hash<K, V>`, `array<V>`) with
-`.get`, `.insert`, `.delete`; `let`, assignment, `if`/`else`,
-`if let Some(x) = map.get(k)`, `return`, `emit`; integer/bool literals, names,
-nullary builtins (`pid tgid tid uid gid ktime`), `comm()` as an emit field,
-`*ptr`, unsigned arithmetic/bitwise/comparison, `&&`/`||`/`!`.
+Supported: `const`; `map` (`hash<K, V>`, `array<V>`) with `.get`, `.insert`,
+`.delete`; `let`, assignment, `if`/`else`, `if let Some(x) = map.get(k)`,
+unrolled `for`, `return`, `emit`; integer/bool literals; builtins per probe
+kind (`pid tgid tid uid gid ktime comm arg retval deny allow drop pass
+sample in_subnet read_user_str read_kernel_str`); `*ptr`; unsigned and
+`i64` arithmetic/bitwise/comparison; `&&`/`||`/`!`; `str<N>` with
+`starts_with`, `byte_at`, `==`/`!=`; `ipv4`/`ipv6`/`mac` with `==`/`!=`;
+kernel struct reads via `ptr<S>`; packet views, bitfields, runtime views,
+the IPv6 walk.
 
-Address equality (`a == "::1"`, `m == n`) is unrolled into 8/4/2/1-byte
-chunk compares (a literal's chunk is loaded as a 64-bit immediate in the
-byte order the CPU would read it); `ip == "10.0.0.1"` on a `u32` rewrites
-the literal into the integer and takes the ordinary compare path.
-
-String equality (`s == "lit"`, `s == t`) is unrolled into one byte compare
-per position with an early exit on mismatch and, for `s == t`, on a shared
-NUL; a literal test ends with a terminator check unless the literal fills the
-capacity. `!=` is `==` followed by `xor r0, 1`.
-
-Bounded `for` loops are **fully unrolled**: both ends must be compile-time
-constants, so the verifier sees straight-line code with no back-edge. The loop
-variable is a constant inside the body. Strings are fixed `str<N>` stack
-buffers; `read_user_str` reads into one, `starts_with`/`byte_at` read out of
-one, and an `emit` copies one into the record.
-
-Not yet (clear "not yet" errors, never unverifiable bytecode): `as` casts,
-signed comparisons, `return <value>`, writing through a map pointer, dynamic
-loop bounds, `field.access` beyond builtins, indexing.
+Not supported (clear errors, never unverifiable bytecode): `as` casts,
+signed widths other than `i64`, `return <value>`, writing through map
+pointers, dynamic loop bounds, functions, more than one live runtime view,
+writing packet bytes.
 
 ### Probe kinds and multiple probes
 
@@ -169,6 +171,30 @@ Byte arrays of 6/16 and `struct in6_addr` are blobs copied with the usual
 chunked copy; embedded structs become deeper views; bitfields and pointers
 are rejected by the checker. The pre-pass adds `offset + sizeof(struct)` to
 the entry bound.
+
+**Bitfields.** A bitfield member (BTF records its bit offset and width) is
+read by loading the narrowest 1/2/4/8-byte container that covers the bits,
+then `rsh` by the bit offset within the container and `and` with the width
+mask. BTF numbers bits little-endian, which is exactly how a little-endian
+load places them in a register, so no swap is involved. The same shape is
+used for kernel-struct bitfields via `bpf_probe_read_kernel`.
+
+**Dynamic views.** `pkt.view(expr)` evaluates the offset, masks it to 12
+bits so the verifier has a bound, builds `R9 = data + off`, and checks
+`R9 + sizeof(S) <= data_end` once; the checked pointer stays in `R9`
+(callee-saved, reserved from the allocator while the probe uses dynamic
+views) and field reads are `[R9 + member]`. The verifier tracks the range
+on that register, which is why the pointer is kept rather than recomputed.
+
+**IPv6 extension walk.** `pkt.ipv6_l4(off)` reads `nexthdr` from the IPv6
+header (covered by the entry bound), sets `R9 = data + off + 40`, and
+unrolls four hops: if the current protocol is an extension kind
+(0/43/44/60/51) check that 2 bytes are readable at `R9`, read the next
+protocol and the length byte, compute the header size (fragment 8,
+AH `(len+2)*4`, otherwise `(len+1)*8` — a packet byte scaled by ≤ 8, so
+bounded) and advance `R9`. It ends with the transport protocol in `R0` and
+`R9` at the transport header, which `pkt.l4()` then bounds-checks for the
+struct it binds.
 
 **Subnet matching.** `in_subnet(u32, "a.b.c.d/n")` is `(addr & mask) ==
 (net & mask)` with both immediates folded at compile time. For `ipv6` it is

@@ -63,15 +63,125 @@ every probe and prints the events, dispatching on an id in each record.
 
 Probe kinds:
 
-| Probe                              | Hook                                    | Available |
-|------------------------------------|-----------------------------------------|-----------|
-| `tracepoint("syscalls", "sys_enter_openat")` | a static kernel tracepoint    | `arg(n)`  |
-| `kprobe("do_sys_openat2")`         | entry of a kernel function              | `arg(n)`  |
-| `kretprobe("do_sys_openat2")`      | return of a kernel function             | `retval()`|
+| Probe                                        | Hook                                       | Gives you |
+|----------------------------------------------|--------------------------------------------|-----------|
+| `tracepoint("syscalls", "sys_enter_openat")` | a static kernel tracepoint                 | `arg(n)`, process context |
+| `kprobe("do_sys_openat2")`                   | entry of a kernel function                 | `arg(n)` as `ptr<S>` struct reads, process context |
+| `kretprobe("do_sys_openat2")`                | return of a kernel function                | `retval()`, process context |
+| `uprobe("/lib/libc.so.6:getenv")`            | entry of a userspace function              | `arg(n)` (user pointers: `read_user_str`), process context |
+| `uretprobe("/lib/libc.so.6:getenv")`         | return of a userspace function             | `retval()`, process context |
+| `usdt("/usr/bin/python3:python:function__entry")` | a static marker compiled into a binary | `arg(n)` (from the marker's note), process context |
+| `lsm("file_open")`                           | a kernel access-control hook               | `arg(n)`, `deny()`, `allow()`, process context |
+| `xdp("eth0")`                                | packets arriving on an interface           | `pkt`, `drop()`, `pass()` — no process context |
 
 A tracepoint sees the *request*; to know the *result* hook the function with
 a `kprobe` and a `kretprobe` and correlate them through a map keyed by
-`tid()` (see `examples/shadow_open_ok.hny`).
+`tid()` (see `examples/shadow_open_ok.hny`). Any number of probes can share a
+program; each is its own BPF program with its own stack budget and the
+builtins that make sense for it — using the wrong one is a type error.
+
+### Reading kernel structs (kprobe, LSM)
+
+A kernel argument is usually a pointer to a struct. Give it a type and walk
+it with `.`; pointers are followed with bounded kernel reads, embedded
+structs are offsets, byte arrays (`task_struct.comm`) are readable strings:
+
+```honey
+probe kprobe("vfs_open") {                       // vfs_open(struct path *, struct file *)
+    let p: ptr<path> = arg(0);
+    let name: str<64> = read_kernel_str(p.dentry.d_name.name);
+    emit Open { file: name };
+}
+```
+
+Field names, offsets, widths and endianness come from the kernel's BTF,
+passed at compile time (`./honey run` exports and passes it for you). Every
+field access is also recorded in the manifest and re-resolved by the loader
+against the running kernel's BTF before loading, so a compiled probe reads
+the right bytes after a kernel upgrade (CO-RE, honey-sized). Bitfields are
+read with a shift and mask; unknown structs and fields are compile errors.
+
+### Enforcement (LSM)
+
+An `lsm` probe runs inside the kernel's access-control path and can *block*:
+`deny()` returns from the probe denying the action (the syscall fails with
+EPERM), `allow()` returns allowing it, and falling off the end allows. The
+hook name is a kernel LSM hook without the `bpf_lsm_` prefix, for example
+`file_open`, `bprm_check_security`, `task_kill`.
+
+### Userspace functions and markers (uprobe, USDT)
+
+A `uprobe` names `path:symbol`; the symbol's offset in the file is resolved
+at load time, so it survives library updates. Arguments are user pointers,
+so `read_user_str(arg(0))` reads string arguments. A `usdt` probe names
+`path:provider:name`, a static marker compiled into the binary; the loader
+reads the marker's note for its address, its semaphore (incremented while a
+probe is attached, so the program knows to prepare marker data) and where
+each argument lives, and `arg(n)` reads them through a spec at runtime.
+
+### Packets (XDP)
+
+An `xdp` probe sees each packet on an interface before the kernel does
+anything with it. `pkt` is the packet's bytes, readable three ways:
+
+**Raw offsets.** `pkt.u8/u16/u32(off)` at a constant offset; multi-byte
+reads are converted from network to host order. `pkt.ipv6(off)` and
+`pkt.mac(off)` copy an address out as bytes. `pkt.len()` is the length.
+
+**Headers by name.** Lay a kernel struct over the bytes and read its fields:
+
+```honey
+let eth: ptr<ethhdr> = pkt.at(0);
+let ip: ptr<iphdr> = pkt.at(14);
+if eth.h_proto == 0x0800 && ip.protocol == 6 {
+    emit Seen { src: ip.saddr, smac: eth.h_source, ihl: ip.ihl };
+}
+```
+
+A field the kernel declares `__be16`/`__be32` is converted to host order; a
+6- or 16-byte array or `struct in6_addr` is a `mac`/`ipv6`; an embedded
+struct is another view; a bitfield such as `ip.ihl` is loaded, shifted and
+masked into the narrowest integer that holds it; a pointer field is an
+error. Views exist only at compile time and cost no stack or registers.
+
+**Headers at runtime offsets.** The transport header is not at a fixed
+place: IPv4's header length is `ihl * 4`, and IPv6 may have extension
+headers in between.
+
+```honey
+let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);       // any integer offset
+
+let proto = pkt.ipv6_l4(14);                              // walk the IPv6 chain
+if proto == 6 {
+    let tcp: ptr<tcphdr> = pkt.l4();                      // view where it stopped
+    if tcp.dest == 22 { ... }
+}
+```
+
+`pkt.view(expr)` bounds the offset, builds a packet pointer, and checks it
+against the packet end for the struct's size once; field reads are then
+plain loads. `pkt.ipv6_l4(off)` follows hop-by-hop, routing, fragment,
+destination-options and AH headers (up to four, each read bounds-checked),
+returns the transport protocol, and leaves the transport header's location
+for `pkt.l4()`. A short packet passes through untouched at any of these
+checks. One runtime view is live at a time.
+
+**Actions and bounds.** `drop()` and `pass()` return immediately; falling off
+the end passes. Every packet read must be provably in bounds or the verifier
+rejects the program: honey takes the furthest constant byte the probe
+touches (reads, blobs and `pkt.at` views, at most 256) and checks the packet
+is at least that long once, on entry; runtime views add their own single
+check. Constant offsets must be literals or `const`s.
+
+**Subnets.** `in_subnet(addr, "10.0.0.0/8")` for a `u32` address,
+`in_subnet(a6, "fe80::/10")` for an `ipv6`; the CIDR is validated at compile
+time.
+
+### Sampling
+
+`sample(N)` is `true` on 1 of every N times it runs, backed by a counter
+honey keeps per call site. Use it to thin out a high-rate hook:
+`if sample(100) { emit Exec { ... }; }`.
 
 ---
 
@@ -245,7 +355,7 @@ Precedence, lowest to highest: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`,
 | `&V`                    | A checked pointer, only bound by `if let Some(v)` and only inside that block. `*v` reads it. |
 | `ipv4`                  | A `u32` to the type system, printed by the loader as a dotted quad (`127.0.0.1`). Assign from `pkt.u32(...)`. |
 | `ipv6`, `mac`           | 16- and 6-byte values copied straight from the packet with `pkt.ipv6(off)` / `pkt.mac(off)`. Bind with `let`, compare with `==`/`!=` against a literal (`"::1"`, `"aa:bb:cc:dd:ee:ff"`) or another address of the same kind, emit; printed as addresses. Cannot be reassigned and cannot live in maps. |
-| `ptr<S>`                | A kernel pointer to `struct S` (a real kernel type, checked against BTF). From `let p: ptr<S> = arg(n);`. Read fields with `.` (pointers auto-deref). |
+| `ptr<S>`                | A kernel pointer to `struct S` (a real kernel type, checked against BTF). From `let p: ptr<S> = arg(n);`. Read fields with `.` (pointers auto-deref). In an `xdp` probe, `let v: ptr<S> = pkt.at(off)` / `pkt.view(expr)` / `pkt.l4()` is instead a *view* of packet bytes: fields are read by value, never followed. |
 
 Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 
@@ -271,40 +381,55 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 - **No pointer writes** in v1: `*p = v` is rejected, use `map.insert`.
 - **Immutability.** Assignment needs `let mut`.
 
-## 6. Builtins (draft — stage 3 makes them real)
+## 6. Builtins
 
-| Builtin                    | Type                              | BPF helper / source           |
-|----------------------------|-----------------------------------|-------------------------------|
-| `pid()`                    | `u32`                             | `bpf_get_current_pid_tgid`    |
-| `tgid()`                   | `u32`                             | `bpf_get_current_pid_tgid`    |
-| `uid()`                    | `u32`                             | `bpf_get_current_uid_gid`     |
-| `comm()`                   | `str<16>`                         | `bpf_get_current_comm`        |
-| `ktime()`                  | `u64`                             | `bpf_ktime_get_ns`            |
-| `arg(n)`                   | `u64`                             | tracepoint: record field `n`; kprobe: `pt_regs` argument `n` (per arch); not in kretprobe |
-| `retval()`                 | `i64`                             | kretprobe only: the return register (`x0` / `rax`) |
-| `tid()`                    | `u32`                             | `bpf_get_current_pid_tgid` low half; key for kprobe↔kretprobe correlation |
-| `read_user_str(p)`         | `str<N>` (N from the let type)    | `bpf_probe_read_user_str`     |
-| `m.get(k)` / `m.insert(k,v)` | `Option<&V>` / `()`             | `bpf_map_lookup/update_elem`  |
-| `emit E { … }`             | statement                         | `bpf_ringbuf_output`          |
-| `s.starts_with("…")`, `s.byte_at(i)` | `bool` / `u8`           | inline, bounded by `N`        |
-| `s == "…"`, `s != t`       | `bool`                            | exact C-string equality, unrolled, bounded by `N` |
-| `a == "::1"`, `m != n`, `ip == "1.2.3.4"` | `bool`             | address equality: ipv6/mac chunk compares; a dotted quad is a `u32` literal |
+| Builtin                                   | Type                       | Where              | Underneath |
+|-------------------------------------------|----------------------------|--------------------|------------|
+| `pid()`, `tgid()`, `tid()`                | `u32`                      | not xdp            | `bpf_get_current_pid_tgid` |
+| `uid()`, `gid()`                          | `u32`                      | not xdp            | `bpf_get_current_uid_gid` |
+| `comm()`                                  | `str<16>` (emit field only)| not xdp            | `bpf_get_current_comm` |
+| `ktime()`                                 | `u64`                      | anywhere           | `bpf_ktime_get_ns` |
+| `arg(n)`                                  | `u64`                      | tracepoint, kprobe, uprobe, usdt, lsm | record field / `pt_regs` / USDT spec / hook args |
+| `retval()`                                | `i64`                      | kretprobe, uretprobe | the return register |
+| `read_user_str(p)`                        | `str<N>` (from the let)    | anywhere           | `bpf_probe_read_user_str` |
+| `read_kernel_str(p)`                      | `str<N>` (from the let)    | anywhere           | `bpf_probe_read_kernel_str` |
+| `m.get(k)` / `m.insert(k, v)` / `m.delete(k)` | `Option<&V>` / `()`    | anywhere           | `bpf_map_lookup/update/delete_elem` |
+| `emit E { … }`                            | statement                  | anywhere           | `bpf_ringbuf_reserve/submit` |
+| `deny()` / `allow()`                      | statement                  | lsm                | return -EPERM / 0 |
+| `drop()` / `pass()`                       | statement                  | xdp                | XDP_DROP / XDP_PASS |
+| `sample(N)`                               | `bool`                     | anywhere           | a hidden per-site counter map |
+| `in_subnet(addr, "cidr")`                 | `bool`                     | anywhere           | mask-and-compare, folded at compile time |
+| `s.starts_with("…")`, `s.byte_at(i)`      | `bool` / `u8`              | anywhere           | unrolled, bounded by `N` |
+| `s == "…"`, `s != t`, `a == "::1"`, `ip == "1.2.3.4"` | `bool`         | anywhere           | unrolled equality; literals validated |
+| `pkt.u8/u16/u32(off)`, `pkt.len()`        | ints                       | xdp                | bounded loads, host order |
+| `pkt.ipv6(off)`, `pkt.mac(off)`           | `ipv6`, `mac`              | xdp                | byte copies |
+| `pkt.at(off)`, `pkt.view(expr)`, `pkt.l4()` | `ptr<S>` view (via `let`) | xdp               | struct layouts from BTF |
+| `pkt.ipv6_l4(off)`                        | `u8`                       | xdp                | 4-hop extension-header walk |
 
-## 7. Roadmap
+## 7. Status
 
-| Stage | Deliverable                                                            | Runs on   |
-|-------|------------------------------------------------------------------------|-----------|
-| 1     | Lexer. `cargo test` green in `crates/honeyc`.                           | macOS     |
-| 2     | Parser → AST. Pretty-printer for round-trip tests.                     | macOS     |
-| 3     | Bytecode emitter + disassembler; C loader. Done: all three examples run in-kernel (maps, control flow, arithmetic, bounded `for`, strings, `arg`). | Docker Linux |
-| 4     | Verifier-aware type checker: the rules in §5. Done: `honeyc check`, all errors at source lines, `examples/bad/` demonstrates each rule. | macOS |
+Every stage is done and every feature above is verified against a live
+kernel (`examples/*.hny`, each with the evidence in its commit message):
 
-Non-goals for v1: enforcement (LSM), networking (XDP), CO-RE/BTF relocation,
-anything that needs a heap.
+| Stage | Deliverable                                                          |
+|-------|----------------------------------------------------------------------|
+| 1     | Lexer                                                                |
+| 2     | Parser → AST, pretty-printer                                         |
+| 3     | Bytecode emitter + disassembler, C loader; every probe kind; CO-RE-style struct reads; packet views; register allocator |
+| 4     | Verifier-aware type checker: `honeyc check`, every rule an error at the source line, `examples/bad/` one program per rule |
 
-## 8. Open questions (decide when they bite)
+Not done, and not planned for v1: writing packet fields or checksums, more
+than one live runtime view, TCP option parsing, IPv6 in maps, functions.
 
-- Should `str<N>` comparisons (`==`) be allowed, or only `starts_with`?
-- Does `emit` need a rate limit / sampling primitive built in?
-- kprobe argument offsets are per architecture (`--arch aarch64|x86_64`);
-  the manifest records the arch and the loader warns on mismatch.
+## 8. Decisions taken along the way
+
+- String and address equality *are* allowed (`==`/`!=`), unrolled and
+  bounded; `<`/`>` on them are not.
+- Rate limiting is a builtin: `sample(N)`.
+- kprobe/uprobe argument offsets are per architecture (`--arch`, default
+  aarch64); the manifest records the arch and the loader warns on mismatch.
+- USDT arguments are resolved at attach time into a runtime spec rather than
+  at compile time, so one compiled probe works wherever the marker's
+  arguments happen to live.
+- The register allocator does not shrink instruction counts (BPF has no
+  memory-operand ALU forms); it removes stack traffic and stack use.

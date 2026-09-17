@@ -21,12 +21,19 @@ first and refuse to generate code for anything that fails.
 | loops that can't be proven to terminate        | `for` bounds must be compile-time constants; at most 64 iterations; there is no `while` |
 | using a map lookup result before its NULL check| `map.get` has type `Option<&V>`. The only way to reach the `&V` is `if let Some(v) = ...`. `*` on an `Option` is a type error with the fix in the message |
 | using a checked pointer after the check's scope| the `Some(v)` binding exists only inside that `if` body; outside it is an unknown name |
-| reads of unknown length into the stack         | `read_user_str` may only initialise a declared `str<N>`; `N` is the read bound and cannot be omitted |
+| reads of unknown length into the stack         | `read_user_str`/`read_kernel_str` may only initialise a declared `str<N>`; `N` is the read bound and cannot be omitted |
 | out-of-range stack access                      | `byte_at(i)` needs a constant `i < N`; `starts_with` and `==` literals must fit in `N` |
 | more than 512 bytes of stack                   | locals are summed along each scope path; the peak plus the compiler's reserve must fit, or it is an error naming the numbers |
 | writes through map value pointers (v1 choice)  | `*p = v` is rejected; `map.insert` is the supported update |
 | unsafe integer truncation                      | four unsigned widths plus `i64`, no implicit conversion; mixing widths is a type error and literals are range-checked |
 | reading arguments after they are gone          | `arg(n)` is rejected in a return probe (`kretprobe`/`uretprobe`); `retval()` only in a return probe |
+| calling a control-flow helper in the wrong hook| `deny()`/`allow()` only in `lsm`; `drop()`/`pass()`, `pkt` only in `xdp`; process builtins rejected in `xdp` |
+| reading a struct field that isn't there        | `ptr<S>` is checked against BTF; unknown structs and fields are errors, and `ptr<>` without `--btf` is an error |
+| packet access past the end of the packet       | `pkt` reads (including `ipv6`/`mac` blobs and `pkt.at` views) need constant offsets ending within 256 bytes; codegen emits one entry check covering the largest |
+| unbounded packet pointer arithmetic            | `pkt.view` offsets must be integers and are masked to a known range; the view is checked once for `sizeof(S)`; the IPv6 walk is unrolled to four hops with a check per hop; `pkt.l4()` needs a preceding walk |
+| reading a header field that isn't a value      | a packet view's pointer members are errors; `pkt.at`/`view`/`l4` without a `ptr<S>` is an error |
+| misusing a byte blob as a number               | `ipv6`/`mac` come only from the packet, compare only with `==`/`!=` against the same kind or a valid literal, can't be reassigned or stored in maps |
+| a detection rule that can never match          | address literals (`"::1"`, `"aa:bb:..."`, `"10.0.0.1"`) and CIDRs are parsed at compile time; a malformed one is an error; a string literal longer than its `str<N>` is an error |
 
 Everything else is ordinary static typing: `bool` conditions, event fields
 set exactly once with the right types, map key/value types on every access,
@@ -73,9 +80,9 @@ All errors in a file are reported together, not just the first.
 
 ## What is deliberately not here yet
 
-- LSM and XDP probe kinds; uprobes.
-- Functions.
-- `as` casts, signed widths other than `i64`, in-place map updates.
-- Rate limiting or sampling for `emit`.
+- Writing packet fields or recomputing checksums; TCP option parsing.
+- More than one live runtime view (`pkt.view`/`pkt.l4` own one register).
+- Functions; `as` casts; signed widths other than `i64`; in-place map
+  updates; `ipv6`/`mac` as map keys.
 
 Each of these is an addition to the same checker, not a redesign.

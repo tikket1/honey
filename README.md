@@ -14,10 +14,11 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 
 Status: **v1 complete: tracepoints, kprobes (with kernel struct-field reads),
 uprobes and USDT markers with their arguments, LSM enforcement, XDP packet
-filtering with header structs by name and subnet matching, sampling, string
-and address equality, multi-probe programs, JSON output with typed fields
-(`ipv4`, `ipv6`, `mac` print as addresses), a callee-saved register
-allocator, and a `./honey run` one-shot.** Every example
+filtering with header structs by name (bitfields, runtime-offset views, an
+IPv6 extension-header walk) and subnet matching, sampling, string and address
+equality, multi-probe programs, JSON output with typed fields (`ipv4`,
+`ipv6`, `mac` print as addresses), a callee-saved register allocator, and a
+`./honey run` one-shot.** Every example
 compiles to eBPF bytecode the kernel verifier accepts and the loader prints live
 events (text, or `--json` for a log pipeline). The stage 4 type checker turns every verifier rule into an error
 at your source line; `examples/bad/` holds one program per rule, each rejected with a
@@ -81,7 +82,7 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   tests/parser.rs    stage 2 acceptance tests (44)
   tests/codegen.rs   stage 3 acceptance tests (55)
   tests/typeck.rs    stage 4 acceptance tests (58)
-  tests/kernel_fields.rs  struct-field and packet-view tests (18, synthetic BTF)
+  tests/kernel_fields.rs  struct-field and packet-view tests (23, synthetic BTF)
 linux/               the Linux side (build + run against a real kernel)
   loader.c           loads bytecode, attaches (tracepoint/kprobe/uprobe/usdt/lsm/xdp), reads events
   usdt_demo.c        a program with a USDT marker + semaphore, for the usdt example
@@ -96,7 +97,7 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 247 tests
+cargo test                                  # 252 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
@@ -115,6 +116,10 @@ linux/honey-linux ./linux/run.sh --json build/fop.bin build/fop.json
 # packets by header name (BTF exported automatically):
 ./honey run examples/xdp_structs.hny --json
 #   -> {"event":"Seen","proto":1,"ttl":64,"src":"127.0.0.1",...,"loopback":true,"private":false}
+
+# TCP ports through a runtime-offset header (IPv4) or the IPv6 extension chain:
+./honey run examples/xdp_tcp6.hny --json
+#   -> {"event":"Tcp6","src":"::1","dst":"::1","proto":6,"sport":56218,"dport":2224}
 
 # packets: drop ICMP on loopback and watch ping fail
 cargo run -- build examples/icmp_drop.hny -o build/icmp
@@ -142,10 +147,11 @@ buffers.
    budget, bounded reads: illegal-to-verify becomes illegal-to-typecheck.
 
 All four stages are in place, plus kprobes/kretprobes and multi-probe programs.
-Everything on the list, and the optional list after it, is done: every probe
-kind with arguments, CO-RE-style struct reads in kprobes, header structs by
-name in XDP, subnet matching, address fields and comparisons, sampling, a
-register allocator, and `./honey run`.
+Everything on every list is done: every probe kind with arguments,
+CO-RE-style struct reads in kprobes, header structs by name in XDP including
+bitfields, runtime-offset views and the IPv6 extension-header walk, subnet
+matching, address fields and comparisons, sampling, a register allocator,
+and `./honey run`.
 
 ## Prior art
 
