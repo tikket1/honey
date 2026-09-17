@@ -12,7 +12,7 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 }
 ```
 
-Status: **stage 1 (lexer) complete.** Next: stage 2, the parser.
+Status: **stages 1 and 2 (lexer, parser) complete.** Next: stage 3, bytecode + loader.
 
 ## Layout
 
@@ -20,8 +20,12 @@ Status: **stage 1 (lexer) complete.** Next: stage 2, the parser.
 crates/honeyc/        the compiler (Rust, no dependencies)
   src/token.rs       token vocabulary — the lexer/parser contract
   src/lexer.rs       stage 1, done
-  src/main.rs        `honeyc file.hny`
-  tests/lexer.rs     stage 1 acceptance tests
+  src/ast.rs         tree shape — the parser/later-stages contract
+  src/parser.rs      stage 2, done
+  src/pretty.rs      AST → source, for debugging and round-trip tests
+  src/main.rs        `honeyc file.hny` (pretty-prints the AST), `honeyc --tokens file.hny`
+  tests/lexer.rs     stage 1 acceptance tests (50)
+  tests/parser.rs    stage 2 acceptance tests (44)
 docs/LANGUAGE.md     language reference (§3 is normative for stage 1)
 docs/STAGE-1.md      what to build, in what order, and the Rust you need
 examples/*.hny      programs the compiler must eventually accept
@@ -30,8 +34,9 @@ examples/*.hny      programs the compiler must eventually accept
 ## Build & test
 
 ```bash
-cargo test                                  # 50 lexer tests
-cargo run -- examples/exec.hny             # dump tokens
+cargo test                                  # 94 tests
+cargo run -- examples/exec.hny             # parse and pretty-print
+cargo run -- --tokens examples/exec.hny    # dump tokens
 ```
 
 Stages 1–2 run entirely on macOS. Stage 3 (loading bytecode into a kernel)
