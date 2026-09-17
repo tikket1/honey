@@ -48,6 +48,9 @@ pub fn kernel_btf() -> Btf {
     let s_protocol = s("protocol", &mut strs);
     let s_saddr = s("saddr", &mut strs);
     let s_daddr = s("daddr", &mut strs);
+    let s_tcphdr = s("tcphdr", &mut strs);
+    let s_source = s("source", &mut strs);
+    let s_dest = s("dest", &mut strs);
     let s_path = s("path", &mut strs);
     let s_dentry = s("dentry", &mut strs);
     let s_qstr = s("qstr", &mut strs);
@@ -114,6 +117,10 @@ pub fn kernel_btf() -> Btf {
     member(&mut types, s_ttl, 13, 8);
     member(&mut types, s_protocol, 13, 9);
     member(&mut types, 0, 16, 12); // anonymous union/struct holding saddr/daddr
+    // [18] struct tcphdr { source: be16 @0, dest: be16 @2 } size 20
+    push(&mut types, s_tcphdr, info(STRUCT, 2), 20);
+    member(&mut types, s_source, 11, 0);
+    member(&mut types, s_dest, 11, 2);
 
     let hdr_len = 24u32;
     let type_len = types.len() as u32;

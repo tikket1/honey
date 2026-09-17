@@ -1,0 +1,35 @@
+// xdp_tcp6.hny — TCP ports over IPv6, through any extension headers.
+//
+// In IPv6 the transport header is not at a fixed offset: hop-by-hop,
+// routing, fragment, destination-options and AH headers can sit between
+// the IPv6 header and the payload, each saying what comes next and how
+// long it is. `pkt.ipv6_l4(off)` walks that chain (up to four headers,
+// each read bounds-checked) and returns the transport protocol, leaving
+// the transport header's verified location for `pkt.l4()` to bind a view.
+//
+//   ./honey run examples/xdp_tcp6.hny --json
+//   ... then in the environment:  nc -6 -l 2224 &  echo hi | nc -6 ::1 2224
+
+event Tcp6 {
+    src: ipv6,
+    dst: ipv6,
+    proto: u8,
+    sport: u16,
+    dport: u16,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x86DD {
+        return;
+    }
+    let ip6: ptr<ipv6hdr> = pkt.at(14);
+    let proto = pkt.ipv6_l4(14);
+    if proto != 6 {
+        return;
+    }
+    let tcp: ptr<tcphdr> = pkt.l4();
+    if tcp.dest == 2224 || tcp.source == 2224 {
+        emit Tcp6 { src: ip6.saddr, dst: ip6.daddr, proto: proto, sport: tcp.source, dport: tcp.dest };
+    }
+}

@@ -1,0 +1,34 @@
+// xdp_tcp4.hny — TCP ports over IPv4, with the header offset computed from
+// the header itself.
+//
+// `ip.ihl` is a 4-bit bitfield: honey loads the containing byte, shifts and
+// masks. The IP header's length is `ihl * 4`, so the TCP header sits at a
+// *runtime* offset. `pkt.view(expr)` binds a struct there: the offset is
+// bounded, the resulting pointer is checked against the packet end for the
+// struct's size once, and then `tcp.dest` is a plain load.
+//
+//   ./honey run examples/xdp_tcp4.hny --json
+//   ... then in the environment:  nc -l 2223 &  echo hi | nc 127.0.0.1 2223
+
+event Tcp4 {
+    src: ipv4,
+    dst: ipv4,
+    sport: u16,
+    dport: u16,
+    ihl: u8,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 6 {
+        return;
+    }
+    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);
+    if tcp.dest == 2223 || tcp.source == 2223 {
+        emit Tcp4 { src: ip.saddr, dst: ip.daddr, sport: tcp.source, dport: tcp.dest, ihl: ip.ihl };
+    }
+}

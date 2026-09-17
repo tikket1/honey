@@ -205,6 +205,9 @@ enum Ty {
     /// A packet struct view: `struct name` at this constant packet offset.
     /// Never stored; every field read is `[R7 + off + field]`.
     PktPtr(String, i16),
+    /// A packet struct view at a runtime offset: the verified packet pointer
+    /// lives in R9 (reserved for it); reads are `[R9 + field]`.
+    PktDyn(String),
 }
 
 impl Ty {
@@ -232,7 +235,7 @@ impl Ty {
             Ty::Ipv6 => 16,
             Ty::Mac => 6,
             Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::KPtr(_) | Ty::KCharPtr => 8,
-            Ty::PktPtr(..) => 0,
+            Ty::PktPtr(..) | Ty::PktDyn(_) => 0,
         }
     }
 
@@ -559,6 +562,7 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>, btf: Option<&Btf>)
                         "u32" => 4,
                         "mac" => 6,
                         "ipv6" => 16,
+                        "ipv6_l4" => 40, // the IPv6 header the walk starts from
                         _ => 0,
                     };
                     if width > 0
@@ -651,9 +655,25 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>, btf: Option<&Btf>)
     Ok(max)
 }
 
+/// (container byte offset, container width in bytes, right shift) for a
+/// bitfield at `bit_offset` of `bit_size` bits: the narrowest 1/2/4/8-byte
+/// load that covers the bits.
+fn bitfield_container(bit_offset: u32, bit_size: u32) -> (u32, u32, u32) {
+    let byte = bit_offset / 8;
+    let shift = bit_offset % 8;
+    let span = shift + bit_size;
+    let width = if span <= 8 { 1 } else if span <= 16 { 2 } else if span <= 32 { 4 } else { 8 };
+    (byte, width, shift)
+}
+
 fn is_pkt_at(e: &Expr) -> bool {
     matches!(&e.kind, ExprKind::MethodCall { receiver, method, .. }
         if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") && method.name == "at")
+}
+
+fn is_pkt_dyn(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::MethodCall { receiver, method, .. }
+        if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") && matches!(method.name.as_str(), "view" | "l4"))
 }
 
 /// Which of R6..R9 this probe may use for locals and temporaries.
@@ -668,7 +688,42 @@ fn free_callee_saved(kind: &ProbeKind, body: &Block) -> Vec<Reg> {
     if matches!(kind, ProbeKind::Usdt { .. }) {
         regs.retain(|r| *r != Reg::R9);
     }
+    if matches!(kind, ProbeKind::Xdp { .. }) && body_uses_dyn_view(body) {
+        regs.retain(|r| *r != Reg::R9);
+    }
     regs
+}
+
+/// Does the body use `pkt.view` / `pkt.ipv6_l4` / `pkt.l4` (which own R9)?
+fn body_uses_dyn_view(body: &Block) -> bool {
+    fn expr(e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::MethodCall { receiver, method, args } => {
+                (matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt")
+                    && matches!(method.name.as_str(), "view" | "ipv6_l4" | "l4"))
+                    || expr(receiver)
+                    || args.iter().any(expr)
+            }
+            ExprKind::Call { args, .. } => args.iter().any(expr),
+            ExprKind::Binary { lhs, rhs, .. } => expr(lhs) || expr(rhs),
+            ExprKind::Unary { expr: i, .. } | ExprKind::Cast { expr: i, .. } | ExprKind::Field { expr: i, .. } => expr(i),
+            ExprKind::Index { expr: i, index } => expr(i) || expr(index),
+            _ => false,
+        }
+    }
+    body.stmts.iter().any(|s| match &s.kind {
+        StmtKind::Let { value, .. } | StmtKind::Return(Some(value)) | StmtKind::Expr(value) => expr(value),
+        StmtKind::Assign { target, value } => expr(target) || expr(value),
+        StmtKind::If { cond, then, otherwise } => {
+            (match cond {
+                Cond::Expr(e) | Cond::Let { value: e, .. } => expr(e),
+            }) || body_uses_dyn_view(then)
+                || otherwise.as_ref().is_some_and(body_uses_dyn_view)
+        }
+        StmtKind::For { start, end, body, .. } => expr(start) || expr(end) || body_uses_dyn_view(body),
+        StmtKind::Emit { fields, .. } => fields.iter().any(|(_, v)| expr(v)),
+        StmtKind::Return(None) => false,
+    })
 }
 
 fn body_has_emit(body: &Block) -> bool {
@@ -843,7 +898,7 @@ impl Cg<'_> {
                 Ty::Str(n) => n.div_ceil(8) * 8,
                 Ty::Ipv6 => 16,
                 Ty::Mac => 8,
-                Ty::PktPtr(..) => 0,
+                Ty::PktPtr(..) | Ty::PktDyn(_) => 0,
                 _ => 8,
             };
             self.stack_top -= bytes as i32;
@@ -920,7 +975,42 @@ impl Cg<'_> {
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktPtr(sname, o), reg: None });
                     return Ok(());
                 }
+                // Dynamic views: `let t: ptr<tcphdr> = pkt.view(expr)` / `pkt.l4()`.
+                // The verified packet pointer lives in R9; bounds-checked here
+                // against sizeof(struct), so field reads are plain loads.
+                if let Some(t) = ty
+                    && t.name.name == "ptr"
+                    && is_pkt_dyn(value)
+                {
+                    let sname = match t.args.as_slice() {
+                        [TypeArg::Type(inner)] => inner.name.name.clone(),
+                        _ => return Err("dynamic views need `ptr<Struct>`".into()),
+                    };
+                    let size = self.sh.btf.and_then(|b| b.struct_size(&sname)).ok_or_else(|| format!("unknown struct `{sname}` (need --btf)"))?;
+                    let ExprKind::MethodCall { method, args, .. } = &value.kind else { unreachable!() };
+                    if method.name == "view" {
+                        let [off] = args.as_slice() else { return Err("`pkt.view` takes one offset".into()) };
+                        self.expr(off)?; // R0 = runtime offset
+                        // bound the scalar before adding it to a packet pointer
+                        self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xfff));
+                        self.prog.push(mov64_reg(Reg::R9, Reg::R7));
+                        self.prog.push(alu64_reg(AluOp::Add, Reg::R9, Reg::R0));
+                    }
+                    // if R9 + size > data_end: pass (short packet)
+                    self.prog.push(mov64_reg(Reg::R2, Reg::R9));
+                    self.prog.push(alu64_imm(AluOp::Add, Reg::R2, size as i32));
+                    self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, self.exit_label);
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktDyn(sname), reg: None });
+                    return Ok(());
+                }
                 // Byte blobs: `let a = pkt.ipv6(22);` copies straight from the packet.
+                if let Some((width, off)) = self.pkt_blob_with_base(value)? {
+                    let ty = if width == 16 { Ty::Ipv6 } else { Ty::Mac };
+                    let dst = self.alloc_bytes(width);
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: dst, ty, reg: None });
+                    self.copy_bytes(Reg::R9, off, Reg::R10, dst, width);
+                    return Ok(());
+                }
                 if let Some((width, off)) = self.pkt_blob(value)? {
                     let ty = if width == 16 { Ty::Ipv6 } else { Ty::Mac };
                     let dst = self.alloc_bytes(width);
@@ -1138,6 +1228,13 @@ impl Cg<'_> {
             }
             if matches!(fl.kind, FieldKind::Ipv6 | FieldKind::Mac) {
                 let width = fl.size;
+                if let Some((w, poff)) = self.pkt_blob_with_base(value)? {
+                    if w != width {
+                        return Err(format!("field `{}` is {width} bytes but the packet read is {w}", fname.name));
+                    }
+                    self.copy_bytes(Reg::R9, poff, Reg::R6, off, width);
+                    continue;
+                }
                 if let Some((w, poff)) = self.pkt_blob(value)? {
                     if w != width {
                         return Err(format!("field `{}` is {width} bytes but the packet read is {w}", fname.name));
@@ -1188,7 +1285,7 @@ impl Cg<'_> {
             ExprKind::Str(_) => Err("string values are not supported in expressions".into()),
             ExprKind::Ident(name) => {
                 if let Some(local) = self.lookup(name).cloned() {
-                    if !matches!(local.ty, Ty::PktPtr(..)) {
+                    if !matches!(local.ty, Ty::PktPtr(..) | Ty::PktDyn(_)) {
                         self.load_local(&local);
                     }
                     return Ok(local.ty);
@@ -1264,7 +1361,10 @@ impl Cg<'_> {
             ExprKind::Field { expr, field } => {
                 let base = self.expr(expr)?;
                 if let Ty::PktPtr(sname, poff) = base {
-                    return self.pkt_field(&sname, poff, &field.name);
+                    return self.pkt_field(&sname, Reg::R7, poff, &field.name);
+                }
+                if let Ty::PktDyn(sname) = base {
+                    return self.pkt_field(&sname, Reg::R9, 0, &field.name);
                 }
                 let Ty::KPtr(sname) = base else {
                     return Err(format!("`.{}` needs a kernel struct pointer", field.name));
@@ -1274,6 +1374,15 @@ impl Cg<'_> {
                     .member(&sname, &field.name)
                     .ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
                 let off = member.offset_bytes as i32;
+                if member.bitfield() {
+                    let (cont_off, width, shift) = bitfield_container(member.bit_offset, member.bit_size);
+                    self.emit_kernel_read(&sname, &field.name, cont_off as i32, width);
+                    if shift > 0 {
+                        self.prog.push(alu64_imm(AluOp::Rsh, Reg::R0, shift as i32));
+                    }
+                    self.prog.push(alu64_imm(AluOp::And, Reg::R0, ((1u64 << member.bit_size) - 1) as i32));
+                    return Ok(Ty::Uint(width));
+                }
                 match btf.resolve(member.type_id) {
                     Resolved::Struct { name } => {
                         // embedded struct: address = base + off (no read)
@@ -1748,6 +1857,12 @@ impl Cg<'_> {
                 Ok(Ty::Uint(4))
             }
             ("ipv6" | "mac", _) => Err(format!("`pkt.{method}` is a byte blob: bind it with `let` or emit it directly")),
+            ("ipv6_l4", [off]) => {
+                let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
+                self.emit_ipv6_walk(o);
+                Ok(Ty::Uint(1))
+            }
+            ("at" | "view" | "l4", _) => Err(format!("`pkt.{method}` must be bound with `let x: ptr<Struct> = ...`")),
             (m, a) => Err(format!("`pkt` has no method `{m}` taking {} argument(s)", a.len())),
         }
     }
@@ -1868,11 +1983,26 @@ impl Cg<'_> {
     /// plain loads (byte-swapped when the kernel declares the field `__be*`);
     /// embedded structs are views at a deeper offset; 6/16-byte arrays and
     /// `in6_addr` are blobs (handled by `pkt_blob` at let/emit sites).
-    fn pkt_field(&mut self, sname: &str, poff: i16, field: &str) -> Result<Ty, String> {
+    fn pkt_field(&mut self, sname: &str, base: Reg, poff: i16, field: &str) -> Result<Ty, String> {
         let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
         let member = btf.member(sname, field).ok_or_else(|| format!("struct `{sname}` has no field `{field}`"))?;
-        if member.bitfield {
-            return Err(format!("`{field}` is a bitfield"));
+        if member.bitfield() {
+            // Load the smallest container holding the bits, then shift and
+            // mask. BTF bit offsets use little-endian numbering, which is
+            // exactly how a little-endian load places bits in the register.
+            let (cont_off, width, shift) = bitfield_container(member.bit_offset, member.bit_size);
+            let size = match width {
+                1 => Size::B,
+                2 => Size::H,
+                4 => Size::W,
+                _ => Size::DW,
+            };
+            self.prog.push(ldx_mem(size, Reg::R0, base, poff + cont_off as i16));
+            if shift > 0 {
+                self.prog.push(alu64_imm(AluOp::Rsh, Reg::R0, shift as i32));
+            }
+            self.prog.push(alu64_imm(AluOp::And, Reg::R0, ((1u64 << member.bit_size) - 1) as i32));
+            return Ok(Ty::Uint(width));
         }
         let off = poff + member.offset_bytes as i16;
         match btf.resolve(member.type_id) {
@@ -1883,7 +2013,7 @@ impl Cg<'_> {
                     4 => Size::W,
                     _ => Size::DW,
                 };
-                self.prog.push(ldx_mem(size, Reg::R0, Reg::R7, off));
+                self.prog.push(ldx_mem(size, Reg::R0, base, off));
                 if big_endian && bytes >= 2 {
                     self.prog.push(bswap(Reg::R0, (bytes * 8) as u8));
                 }
@@ -1894,6 +2024,60 @@ impl Cg<'_> {
             Resolved::Array { elem_bytes: 1, len: 6 | 16 } => Err(format!("`{field}` is a byte blob: bind it with `let` or emit it directly")),
             _ => Err(format!("field `{field}` has a type honey can't read from a packet")),
         }
+    }
+
+    /// Walk the IPv6 extension-header chain starting at the IPv6 header at
+    /// packet offset `off` (its 40 bytes are covered by the entry bound).
+    /// Leaves the transport protocol in R0 and a verified packet pointer to
+    /// the transport header in R9. Unrolled to `IPV6_EXT_MAX` hops; each hop
+    /// bounds-checks the 2 bytes it reads (next header, length) against
+    /// data_end and passes the packet if they are missing. Extension kinds:
+    /// hop-by-hop 0, routing 43, fragment 44 (fixed 8 bytes), destination
+    /// options 60, AH 51 ((len+2)*4); everything else ends the walk.
+    fn emit_ipv6_walk(&mut self, off: i16) {
+        const IPV6_EXT_MAX: usize = 4;
+        let done = self.prog.new_label();
+        // R0 = nexthdr (ipv6hdr byte 6); R9 = data + off + 40
+        self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R7, off + 6));
+        self.prog.push(mov64_reg(Reg::R9, Reg::R7));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R9, off as i32 + 40));
+        for _ in 0..IPV6_EXT_MAX {
+            let ext = self.prog.new_label();
+            let is_frag = self.prog.new_label();
+            let is_ah = self.prog.new_label();
+            let advance = self.prog.new_label();
+            for kind in [0, 43, 44, 60, 51] {
+                self.prog.jmp_imm_to(JmpOp::Eq, Reg::R0, kind, ext);
+            }
+            self.prog.ja_to(done);
+            self.prog.bind(ext);
+            // need [R9, R9+2): if R9 + 2 > data_end: pass
+            self.prog.push(mov64_reg(Reg::R3, Reg::R9));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R3, 2));
+            self.prog.jmp_reg_to(JmpOp::Gt, Reg::R3, Reg::R8, self.exit_label);
+            // R4 = header length in 8-byte units (byte 1); R5 = this header's kind
+            self.prog.push(ldx_mem(Size::B, Reg::R4, Reg::R9, 1));
+            self.prog.push(mov64_reg(Reg::R5, Reg::R0));
+            // R0 = next header (byte 0)
+            self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R9, 0));
+            // size: fragment -> 8; AH -> (len+2)*4; else (len+1)*8
+            self.prog.jmp_imm_to(JmpOp::Eq, Reg::R5, 44, is_frag);
+            self.prog.jmp_imm_to(JmpOp::Eq, Reg::R5, 51, is_ah);
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R4, 1));
+            self.prog.push(alu64_imm(AluOp::Lsh, Reg::R4, 3));
+            self.prog.ja_to(advance);
+            self.prog.bind(is_ah);
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R4, 2));
+            self.prog.push(alu64_imm(AluOp::Lsh, Reg::R4, 2));
+            self.prog.ja_to(advance);
+            self.prog.bind(is_frag);
+            self.prog.push(mov64_imm(Reg::R4, 8));
+            self.prog.bind(advance);
+            // R4 is a byte from the packet scaled by <= 8: bounded, so the
+            // verifier accepts adding it to the packet pointer.
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R9, Reg::R4));
+        }
+        self.prog.bind(done);
     }
 
     /// `in_subnet(addr, "cidr")` → R0 = 1 if the address is in the network.
@@ -1952,6 +2136,29 @@ impl Cg<'_> {
     /// If `e` is `pkt.ipv6(off)` / `pkt.mac(off)` — or a blob-typed field of a
     /// packet view — return (width, packet offset).
     fn pkt_blob(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
+        self.pkt_blob_static(e)
+    }
+
+    /// Blob fields of a *dynamic* view: (width, offset from R9).
+    fn pkt_blob_with_base(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
+        if let ExprKind::Field { expr, field } = &e.kind
+            && let ExprKind::Ident(n) = &expr.kind
+            && let Some(Local { ty: Ty::PktDyn(sname), .. }) = self.lookup(n).cloned()
+        {
+            let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
+            let member = btf.member(&sname, &field.name).ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
+            let off = member.offset_bytes as i16;
+            return Ok(match btf.resolve(member.type_id) {
+                Resolved::Array { elem_bytes: 1, len: 6 } => Some((6, off)),
+                Resolved::Array { elem_bytes: 1, len: 16 } => Some((16, off)),
+                Resolved::Struct { name } if name == "in6_addr" => Some((16, off)),
+                _ => None,
+            });
+        }
+        Ok(None)
+    }
+
+    fn pkt_blob_static(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
         if let ExprKind::Field { expr, field } = &e.kind
             && let ExprKind::Ident(n) = &expr.kind
             && let Some(Local { ty: Ty::PktPtr(sname, poff), .. }) = self.lookup(n).cloned()

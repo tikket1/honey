@@ -181,16 +181,14 @@ fn saddr_is_found_through_the_anonymous_union() {
     let d = btf.member("iphdr", "daddr").unwrap();
     assert_eq!(d.offset_bytes, 16);
     assert!(matches!(btf.resolve(m.type_id), honeyc::btf::Resolved::Int { bytes: 4, big_endian: true, .. }));
-    assert!(btf.member("iphdr", "ihl").unwrap().bitfield);
+    assert!(btf.member("iphdr", "ihl").unwrap().bitfield());
     assert_eq!(btf.struct_size("iphdr"), Some(20));
 }
 
 #[test]
-fn bitfields_pointers_and_unbound_views_are_errors() {
-    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: ip.ihl == 5 };"));
-    assert!(msg.contains("`ihl` is a bitfield"), "{msg}");
+fn pointers_and_unbound_views_are_errors() {
     let msg = first(&xdp("    let x = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
-    assert!(msg.contains("`pkt.at(offset)` needs a struct type"), "{msg}");
+    assert!(msg.contains("`pkt.at` needs a struct type"), "{msg}");
     let msg = first(&xdp("    let f: ptr<file> = pkt.at(0);\n    emit E { a: 1, m: pkt.mac(0), b: f.f_path.dentry.d_name.name == \"x\" };"));
     assert!(msg.contains("is a pointer; packet structs are read by value") || msg.contains("cannot compare"), "{msg}");
     // a view past the bound
@@ -258,4 +256,81 @@ fn in_subnet_compiles_to_mask_and_compare() {
     // ::1/128 needs both chunks
     let text = asm_xdp("    let s = pkt.ipv6(22);\n    emit E { a: 1, m: pkt.mac(0), b: in_subnet(s, \"::1/128\") };");
     assert_eq!(text.matches("if r1 != r0 goto").count(), 2, "{text}");
+}
+
+// -------------------------------------------------------------- bitfields
+
+#[test]
+fn bitfields_load_a_container_then_shift_and_mask() {
+    // iphdr.ihl: 4 bits at bit 0 -> byte load, mask 15, no shift.
+    check_ok(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: ip.ihl == 5 };"));
+    let text = asm_xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: ip.ihl == 5 };");
+    assert!(text.contains("ldx8 r0, [r7 +14]"), "{text}");
+    assert!(text.contains("and r0, 15"), "{text}");
+    let after = text.split("ldx8 r0, [r7 +14]").nth(1).unwrap();
+    assert!(!after.lines().nth(1).unwrap().contains("rsh"), "no shift for bit 0\n{text}");
+    // a bitfield's type is the narrowest int holding it
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let v: u32 = ip.ihl;\n    emit E { a: v, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("expected `u32`, found `u8`"), "{msg}");
+}
+
+#[test]
+fn bitfield_container_math_is_right_for_offset_bits() {
+    // A synthetic 4-bit field at bit 4 (like iphdr.version) needs rsh 4.
+    let btf = kernel_btf();
+    let ihl = btf.member("iphdr", "ihl").unwrap();
+    assert_eq!((ihl.bit_offset, ihl.bit_size), (0, 4));
+    assert!(ihl.bitfield());
+    // anonymous-union members keep their bit offsets relative to the outer struct
+    assert_eq!(btf.member("iphdr", "daddr").unwrap().bit_offset, 16 * 8);
+}
+
+// ---------------------------------------------------------- dynamic views
+
+#[test]
+fn view_at_a_runtime_offset_is_bounds_checked_in_r9() {
+    // IPv4 transport header: 14 + ihl*4, a runtime offset.
+    let body = "    let ip: ptr<iphdr> = pkt.at(14);\n    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    emit E { a: 1, m: pkt.mac(0), b: tcp.dest == 22 };";
+    check_ok(&xdp(body));
+    let text = asm_xdp(body);
+    // offset masked, pointer built in r9, checked against data_end with sizeof(tcphdr)
+    assert!(text.contains("and r0, 4095"), "{text}");
+    assert!(text.contains("mov r9, r7"), "{text}");
+    assert!(text.contains("add r9, r0"), "{text}");
+    assert!(text.contains("mov r2, r9"), "{text}");
+    assert!(text.contains("add r2, 20"), "sizeof(tcphdr) = 20\n{text}");
+    // field read from the dynamic base, byte-swapped (dest is __be16)
+    assert!(text.contains("ldx16 r0, [r9 +2]"), "{text}");
+    assert!(text.contains("bswap16 r0"), "{text}");
+}
+
+#[test]
+fn view_offset_must_be_an_integer_and_r9_is_reserved() {
+    let msg = first(&xdp("    let m = pkt.mac(0);\n    let t: ptr<tcphdr> = pkt.view(m);\n    emit E { a: 1, m: m, b: true };"));
+    assert!(msg.contains("`pkt.view` takes an integer offset"), "{msg}");
+    // with a dynamic view live, locals must not take r9
+    let body = "    let t: ptr<tcphdr> = pkt.view(34);\n    let x = pkt.u32(26);\n    emit E { a: x, m: pkt.mac(0), b: t.dest == 1 };";
+    let text = asm_xdp(body);
+    assert!(!text.contains("mov r9, r0\n"), "r9 belongs to the view\n{text}");
+}
+
+#[test]
+fn ipv6_walk_then_l4_view() {
+    let body = "    let proto = pkt.ipv6_l4(14);\n    if proto == 6 {\n        let tcp: ptr<tcphdr> = pkt.l4();\n        emit E { a: 1, m: pkt.mac(0), b: tcp.dest == 22 };\n    }";
+    check_ok(&xdp(body));
+    let text = asm_xdp(body);
+    // walk starts at nexthdr (14+6) with r9 = data + 54; four unrolled hops,
+    // each checking 2 bytes against data_end
+    assert!(text.contains("ldx8 r0, [r7 +20]"), "{text}");
+    assert!(text.contains("add r9, 54"), "{text}");
+    assert_eq!(text.matches("add r3, 2").count(), 4, "four hops\n{text}");
+    assert_eq!(text.matches("if r0 == 44 goto").count(), 4, "{text}");
+    // then the l4 view checks sizeof(tcphdr) and reads dest from r9
+    assert!(text.contains("add r2, 20"), "{text}");
+    assert!(text.contains("ldx16 r0, [r9 +2]"), "{text}");
+    // the entry bound covers the 40-byte IPv6 header at 14
+    assert!(text.contains("add r2, 54"), "{text}");
+    // l4 without a walk is an error
+    let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.l4();\n    emit E { a: 1, m: pkt.mac(0), b: tcp.dest == 22 };"));
+    assert!(msg.contains("needs a preceding `pkt.ipv6_l4"), "{msg}");
 }

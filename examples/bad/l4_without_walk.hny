@@ -1,0 +1,12 @@
+// error: `pkt.l4()` needs a preceding `pkt.ipv6_l4(...)` in this probe
+//
+// The transport header's offset is only known after walking the IPv6
+// extension-header chain; `pkt.l4()` binds a view at wherever that walk
+// stopped, so the walk has to come first.
+
+event E { port: u16 }
+
+probe xdp("lo") {
+    let tcp: ptr<tcphdr> = pkt.l4();
+    emit E { port: tcp.dest };
+}

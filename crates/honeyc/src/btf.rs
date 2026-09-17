@@ -60,8 +60,16 @@ pub struct Member {
     pub name: String,
     pub offset_bytes: u32,
     pub type_id: u32,
-    /// A bitfield member (honey cannot read those).
-    pub bitfield: bool,
+    /// Bit offset from the start of the struct (little-endian numbering).
+    pub bit_offset: u32,
+    /// Width in bits for a bitfield member, 0 otherwise.
+    pub bit_size: u32,
+}
+
+impl Member {
+    pub fn bitfield(&self) -> bool {
+        self.bit_size > 0
+    }
 }
 
 type MemberVec = Vec<Member>;
@@ -176,12 +184,13 @@ impl Btf {
                         // bits are still the bit offset. honey's structs are
                         // byte-aligned, so bit offset / 8 is the byte offset.
                         let bit_off = if kind_flag == 1 { moff & 0xffffff } else { moff };
-                        let bitfield = kind_flag == 1 && (moff >> 24) != 0;
+                        let bit_size = if kind_flag == 1 { moff >> 24 } else { 0 };
                         members.push(Member {
                             name: name_of(mn),
                             offset_bytes: bit_off / 8,
                             type_id: mt,
-                            bitfield,
+                            bit_offset: bit_off,
+                            bit_size,
                         });
                     }
                 }
@@ -243,7 +252,7 @@ impl Btf {
             return None;
         }
         if let Some(m) = t.members.iter().find(|m| m.name == field) {
-            return Some(Member { offset_bytes: base + m.offset_bytes, ..m.clone() });
+            return Some(Member { offset_bytes: base + m.offset_bytes, bit_offset: base * 8 + m.bit_offset, ..m.clone() });
         }
         for m in t.members.iter().filter(|m| m.name.is_empty()) {
             if let Some(found) = self.member_in(m.type_id, field, base + m.offset_bytes) {

@@ -1,4 +1,4 @@
-// error: `pkt.at(offset)` needs a struct type
+// error: `pkt.at` needs a struct type
 
 event E { a: u8 }
 

@@ -223,6 +223,8 @@ struct Checker<'a> {
     diags: Vec<Diag>,
     /// The kind of the probe whose body is being checked.
     probe_kind: Option<ProbeKind>,
+    /// Whether this probe has run `pkt.ipv6_l4(...)` (so `pkt.l4()` is bound).
+    l4_ready: bool,
 }
 
 pub fn check(program: &Program) -> Result<Checked, Vec<Diag>> {
@@ -240,6 +242,7 @@ pub fn check_with_btf(program: &Program, btf: Option<&Btf>) -> Result<Checked, V
         stack_peak: 0,
         diags: Vec::new(),
         probe_kind: None,
+        l4_ready: false,
     };
     let peak = c.program(program);
     if c.diags.is_empty() {
@@ -459,6 +462,7 @@ impl Checker<'_> {
             );
         }
         self.probe_kind = kind;
+        self.l4_ready = false;
         self.push_scope();
         self.block(&p.body);
         self.pop_scope();
@@ -605,20 +609,42 @@ impl Checker<'_> {
                 self.error(value.span, "`pkt.at` is only available in an `xdp` probe");
             }
             let target = self.ptr_target(t);
-            let ExprKind::MethodCall { args, .. } = &value.kind else { unreachable!() };
-            if let ([off], Some(sname)) = (args.as_slice(), &target) {
-                let size = self.btf.and_then(|b| b.struct_size(sname)).unwrap_or(0);
-                match self.const_eval_global(off) {
-                    Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
-                    Some(o) if o as u32 + size > MAX_PKT_BOUND => self.error_help(
-                        off.span,
-                        format!("`{sname}` ({size} bytes) at offset {o} ends past {MAX_PKT_BOUND} bytes, the most an XDP probe may inspect"),
-                        "keep the view within the first 256 bytes of the packet",
-                    ),
-                    _ => {}
+            let ExprKind::MethodCall { method, args, .. } = &value.kind else { unreachable!() };
+            match (method.name.as_str(), args.as_slice()) {
+                ("at", [off]) => {
+                    if let Some(sname) = &target {
+                        let size = self.btf.and_then(|b| b.struct_size(sname)).unwrap_or(0);
+                        match self.const_eval_global(off) {
+                            Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
+                            Some(o) if o as u32 + size > MAX_PKT_BOUND => self.error_help(
+                                off.span,
+                                format!("`{sname}` ({size} bytes) at offset {o} ends past {MAX_PKT_BOUND} bytes, the most an XDP probe may inspect"),
+                                "keep the view within the first 256 bytes of the packet",
+                            ),
+                            _ => {}
+                        }
+                    }
                 }
-            } else if args.len() != 1 {
-                self.error(value.span, "`pkt.at` takes one constant offset");
+                ("at", _) => self.error(value.span, "`pkt.at` takes one constant offset"),
+                ("view", [off]) => {
+                    // a runtime offset: bounds-checked when bound, not here
+                    let ot = self.expr(off);
+                    if !ot.is_int() && ot != Ty::Unit {
+                        self.error(off.span, format!("`pkt.view` takes an integer offset, found `{ot}`"));
+                    }
+                }
+                ("view", _) => self.error(value.span, "`pkt.view` takes one offset expression"),
+                ("l4", []) => {
+                    if !self.l4_ready {
+                        self.error_help(
+                            value.span,
+                            "`pkt.l4()` needs a preceding `pkt.ipv6_l4(...)` in this probe",
+                            "walk the IPv6 extension headers first: `let proto = pkt.ipv6_l4(14);`",
+                        );
+                    }
+                }
+                ("l4", _) => self.error(value.span, "`pkt.l4()` takes no arguments"),
+                _ => unreachable!(),
             }
             match target {
                 Some(sname) => self.declare(&name.name, Ty::PktPtr(sname), mutable, None),
@@ -842,6 +868,14 @@ impl Checker<'_> {
             self.error(field.span, format!("`struct {struct_name}` has no field `{}`", field.name));
             return Ty::Unit;
         };
+        if member.bitfield() {
+            return match member.bit_size {
+                0..=8 => Ty::U8,
+                9..=16 => Ty::U16,
+                17..=32 => Ty::U32,
+                _ => Ty::U64,
+            };
+        }
         match btf.resolve(member.type_id) {
             Resolved::Int { bytes, .. } => match bytes {
                 1 => Ty::U8,
@@ -880,9 +914,13 @@ impl Checker<'_> {
             self.error(field.span, format!("`struct {struct_name}` has no field `{}`", field.name));
             return Ty::Unit;
         };
-        if member.bitfield {
-            self.error_help(field.span, format!("`{}` is a bitfield; honey can't read those yet", field.name), "read the containing byte with `pkt.u8(off)` and mask it");
-            return Ty::Unit;
+        if member.bitfield() {
+            return match member.bit_size {
+                0..=8 => Ty::U8,
+                9..=16 => Ty::U16,
+                17..=32 => Ty::U32,
+                _ => Ty::U64,
+            };
         }
         match btf.resolve(member.type_id) {
             Resolved::Int { bytes, .. } => match bytes {
@@ -1283,9 +1321,23 @@ impl Checker<'_> {
             }
             return match (method.name.as_str(), args) {
                 ("len", []) => Ty::U32,
-                ("at", _) => {
-                    self.error_help(span, "`pkt.at(offset)` needs a struct type", "bind it: `let ip: ptr<iphdr> = pkt.at(14);` then read `ip.saddr`");
+                ("at" | "view" | "l4", _) => {
+                    self.error_help(span, format!("`pkt.{}` needs a struct type", method.name), "bind it: `let ip: ptr<iphdr> = pkt.at(14);` then read `ip.saddr`");
                     Ty::Unit
+                }
+                ("ipv6_l4", [off]) => {
+                    // walks the extension-header chain from the IPv6 header at `off`
+                    match self.const_eval_global(off) {
+                        Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
+                        Some(o) if o as u32 + 40 > MAX_PKT_BOUND => self.error(off.span, "the IPv6 header must lie within the first 256 bytes"),
+                        _ => {}
+                    }
+                    self.l4_ready = true;
+                    Ty::U8
+                }
+                ("ipv6_l4", _) => {
+                    self.error(span, "`pkt.ipv6_l4(offset)` takes the constant offset of the IPv6 header (14 after Ethernet)");
+                    Ty::U8
                 }
                 ("u8" | "u16" | "u32" | "ipv6" | "mac", [off]) => {
                     let width: u32 = match method.name.as_str() {
@@ -1317,7 +1369,7 @@ impl Checker<'_> {
                     Ty::Unit
                 }
                 (m, _) => {
-                    self.error(method.span, format!("`pkt` has no method `{m}`; use `u8/u16/u32(off)`, `ipv6(off)`, `mac(off)`, `at(off)`, or `len()`"));
+                    self.error(method.span, format!("`pkt` has no method `{m}`; use `u8/u16/u32(off)`, `ipv6(off)`, `mac(off)`, `at(off)`, `view(expr)`, `ipv6_l4(off)`, `l4()`, or `len()`"));
                     Ty::Unit
                 }
             };
@@ -1481,10 +1533,12 @@ fn compatible(expected: &Ty, actual: &Ty) -> bool {
     }
 }
 
-/// `pkt.at(off)`: a packet struct view.
+/// `pkt.at(off)`, `pkt.view(expr)`, `pkt.l4()`: expressions that bind a
+/// packet struct view (and therefore need a `ptr<S>` annotation).
 fn is_pkt_at(e: &Expr) -> bool {
     matches!(&e.kind, ExprKind::MethodCall { receiver, method, .. }
-        if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") && method.name == "at")
+        if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt")
+            && matches!(method.name.as_str(), "at" | "view" | "l4"))
 }
 
 /// `pkt.ipv6(...)` / `pkt.mac(...)`: the only producers of blob values.

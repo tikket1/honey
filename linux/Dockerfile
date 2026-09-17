@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iputils-ping \
         iproute2 \
         systemtap-sdt-dev \
+        netcat-openbsd \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
