@@ -1,4 +1,4 @@
-// error: `arg()` is not available in a `kretprobe`
+// error: `arg()` is not available in a return probe
 //
 // By the time a function returns, its argument registers have been reused.
 // Reading them at return is the classic silent bug in kretprobe code; honey

@@ -423,3 +423,51 @@ fn xdp_program_kind_and_no_bounds_check_without_reads() {
     let text = disasm_bytes(&c.programs[0].bytecode);
     assert!(!text.contains("if r2 > r8"), "no reads, no check\n{text}");
 }
+
+// ------------------------------------------------------ uprobes & sampling
+
+#[test]
+fn uprobe_kinds_and_pt_regs_args() {
+    let src = "event E { p: u64 } probe uprobe(\"/lib/libc.so.6:getenv\") { emit E { p: arg(0) }; }";
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert!(matches!(&c.programs[0].kind, honeyc::codegen::ProbeKind::Uprobe { target } if target == "/lib/libc.so.6:getenv"));
+    // arg(0) reads pt_regs like a kprobe: aarch64 x0 at +0.
+    let asm = disasm_bytes(&c.programs[0].bytecode);
+    assert!(asm.contains("ldx64 r0, [r0 +0]"), "{asm}");
+    // x86_64 uses rdi at +112.
+    let cx = compile(&prog, Arch::X86_64).unwrap();
+    assert!(disasm_bytes(&cx.programs[0].bytecode).contains("ldx64 r0, [r0 +112]"));
+}
+
+#[test]
+fn sample_creates_one_counter_map_sized_to_the_sites() {
+    let src = "event E { a: u32 } probe tracepoint(\"s\",\"n\") { if sample(10) { emit E { a: 1 }; } if sample(20) { emit E { a: 2 }; } }";
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    let m = c.maps.iter().find(|m| m.name == "__honey_sample").expect("hidden sample map");
+    assert_eq!(m.kind, honeyc::codegen::MapKind::Array);
+    assert_eq!(m.max_entries, 2, "one counter per call site");
+}
+
+#[test]
+fn sample_increments_a_counter_and_tests_the_rate() {
+    let src = "event E { a: u32 } probe tracepoint(\"s\",\"n\") { if sample(100) { emit E { a: 1 }; } }";
+    let asm = asm_helper(src);
+    assert!(asm.contains("call 1"), "map_lookup_elem\n{asm}");   // lookup
+    assert!(asm.contains("add r1, 1"), "increment\n{asm}");
+    assert!(asm.contains("mod r1, 100"), "1-in-100\n{asm}");
+}
+
+fn asm_helper(src: &str) -> String {
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    disasm_bytes(&c.programs[0].bytecode)
+}
+
+#[test]
+fn no_sample_map_when_unused() {
+    let prog = parse(EXEC).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert!(!c.maps.iter().any(|m| m.name == "__honey_sample"));
+}

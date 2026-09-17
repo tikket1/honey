@@ -100,6 +100,10 @@ pub enum ProbeKind {
     Lsm { hook: String },
     /// An XDP program on a network interface. Returns an XDP action.
     Xdp { interface: String },
+    /// A uprobe on a userspace function entry (`path:symbol`).
+    Uprobe { target: String },
+    /// A uretprobe on a userspace function return (`path:symbol`).
+    Uretprobe { target: String },
 }
 
 const XDP_DROP: i32 = 1;
@@ -232,6 +236,8 @@ struct Shared<'a> {
     consts: HashMap<String, i64>,
     arch: Arch,
     btf: Option<&'a Btf>,
+    /// Map index of the hidden sampling counter array, if any `sample()` used.
+    sample_map: Option<i32>,
 }
 
 
@@ -248,6 +254,8 @@ struct Cg<'a> {
     ctx_slot: i16,
     /// (instruction index, struct, field) field-offset relocations.
     relocs: Vec<(usize, String, String)>,
+    /// Running counter that assigns each `sample()` site its map slot.
+    sample_next: &'a mut u32,
 }
 
 // -------------------------------------------------------------------- entry
@@ -266,6 +274,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
         consts: HashMap::new(),
         arch,
         btf,
+        sample_map: None,
     };
     let mut probes = Vec::new();
 
@@ -292,7 +301,23 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
         return Err("no probe to compile".into());
     }
 
+    // Sampling: if any probe calls `sample()`, reserve a hidden array-map of
+    // one u64 counter per call site.
+    let sample_sites: u32 = probes.iter().map(|p| count_samples(&p.body)).sum();
+    if sample_sites > 0 {
+        let idx = (sh.maps.len() as i32) + 1;
+        sh.sample_map = Some(idx);
+        sh.maps.push(MapSpec {
+            name: "__honey_sample".into(),
+            kind: MapKind::Array,
+            key_size: 4,
+            value_size: 8,
+            max_entries: sample_sites,
+        });
+    }
+
     let mut programs = Vec::new();
+    let mut sample_next: u32 = 0;
     for p in probes {
         let kind = match (p.kind.name.as_str(), p.args.as_slice()) {
             ("tracepoint", [c, n]) => ProbeKind::Tracepoint { category: c.clone(), name: n.clone() },
@@ -300,6 +325,8 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ("kretprobe", [f]) => ProbeKind::Kretprobe { function: f.clone() },
             ("lsm", [h]) => ProbeKind::Lsm { hook: h.clone() },
             ("xdp", [i]) => ProbeKind::Xdp { interface: i.clone() },
+            ("uprobe", [t]) => ProbeKind::Uprobe { target: t.clone() },
+            ("uretprobe", [t]) => ProbeKind::Uretprobe { target: t.clone() },
             (k, a) => return Err(format!("probe `{k}` with {} argument(s) is not supported", a.len())),
         };
         let name = match &kind {
@@ -308,8 +335,10 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ProbeKind::Kretprobe { function } => format!("kretprobe:{function}"),
             ProbeKind::Lsm { hook } => format!("lsm:{hook}"),
             ProbeKind::Xdp { interface } => format!("xdp:{interface}"),
+            ProbeKind::Uprobe { target } => format!("uprobe:{target}"),
+            ProbeKind::Uretprobe { target } => format!("uretprobe:{target}"),
         };
-        let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p)?;
+        let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p, &mut sample_next)?;
         programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs });
     }
 
@@ -325,7 +354,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
     })
 }
 
-fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8>, u32, Vec<Reloc>), String> {
+fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut u32) -> Result<(Vec<u8>, u32, Vec<Reloc>), String> {
     let mut prog = Prog::new();
     let exit_label = prog.new_label();
     let mut cg = Cg {
@@ -339,6 +368,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8
         exit_label,
         ctx_slot: 0,
         relocs: Vec::new(),
+        sample_next,
     };
 
     // Prologue: save the context pointer (R1) for `arg` / `retval`.
@@ -543,6 +573,72 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, Str
     let mut max = 0;
     block(body, consts, &mut max)?;
     Ok(max)
+}
+
+/// Count `sample()` call sites in a probe body (for sizing the hidden map).
+fn count_samples(body: &Block) -> u32 {
+    fn expr(e: &Expr, n: &mut u32) {
+        match &e.kind {
+            ExprKind::Call { callee, args } => {
+                if matches!(&callee.kind, ExprKind::Ident(name) if name == "sample") {
+                    *n += 1;
+                }
+                for a in args {
+                    expr(a, n);
+                }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                expr(receiver, n);
+                for a in args {
+                    expr(a, n);
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expr(lhs, n);
+                expr(rhs, n);
+            }
+            ExprKind::Unary { expr: i, .. } | ExprKind::Cast { expr: i, .. } | ExprKind::Field { expr: i, .. } => expr(i, n),
+            ExprKind::Index { expr: i, index } => {
+                expr(i, n);
+                expr(index, n);
+            }
+            _ => {}
+        }
+    }
+    fn block(b: &Block, n: &mut u32) {
+        for s in &b.stmts {
+            match &s.kind {
+                StmtKind::Let { value, .. } | StmtKind::Return(Some(value)) | StmtKind::Expr(value) => expr(value, n),
+                StmtKind::Assign { target, value } => {
+                    expr(target, n);
+                    expr(value, n);
+                }
+                StmtKind::If { cond, then, otherwise } => {
+                    match cond {
+                        Cond::Expr(e) | Cond::Let { value: e, .. } => expr(e, n),
+                    }
+                    block(then, n);
+                    if let Some(o) = otherwise {
+                        block(o, n);
+                    }
+                }
+                StmtKind::For { start, end, body, .. } => {
+                    expr(start, n);
+                    expr(end, n);
+                    block(body, n);
+                }
+                StmtKind::Emit { fields, .. } => {
+                    for (_, v) in fields {
+                        expr(v, n);
+                    }
+                }
+                StmtKind::Return(None) => {}
+            }
+        }
+    }
+    let mut n = 0;
+    block(body, &mut n);
+    n
 }
 
 fn str_capacity(t: &Type) -> Result<u32, String> {
@@ -1107,9 +1203,9 @@ impl Cg<'_> {
                 Ok(Ty::Uint(8))
             }
             "retval" => {
-                let ProbeKind::Kretprobe { .. } = self.kind else {
-                    return Err("`retval()` is only available in a kretprobe".into());
-                };
+                if !matches!(self.kind, ProbeKind::Kretprobe { .. } | ProbeKind::Uretprobe { .. }) {
+                    return Err("`retval()` is only available in a return probe".into());
+                }
                 let off = self.sh.arch.retval_offset();
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot));
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R0, off));
@@ -1160,13 +1256,13 @@ impl Cg<'_> {
                         }
                         (8 * n) as i16
                     }
-                    ProbeKind::Kprobe { .. } => self
+                    ProbeKind::Kprobe { .. } | ProbeKind::Uprobe { .. } => self
                         .sh
                         .arch
                         .kprobe_arg_offset(n)
                         .ok_or_else(|| format!("arg index {n} out of range for {}", self.sh.arch.name()))?,
-                    ProbeKind::Kretprobe { .. } => {
-                        return Err("`arg()` is not available in a kretprobe".into());
+                    ProbeKind::Kretprobe { .. } | ProbeKind::Uretprobe { .. } => {
+                        return Err("`arg()` is not available in a return probe".into());
                     }
                     ProbeKind::Xdp { .. } => {
                         return Err("`arg()` is not available in an xdp probe".into());
@@ -1175,6 +1271,10 @@ impl Cg<'_> {
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot));
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R0, off));
                 Ok(Ty::Uint(8))
+            }
+            ("sample", [n]) => {
+                let rate = self.const_eval(n)?;
+                self.emit_sample(rate)
             }
             ("read_user_str", _) => Err("`read_user_str` may only initialise a `str<N>` local".into()),
             (other, _) => Err(format!("builtin `{other}` does not take arguments here")),
@@ -1256,6 +1356,42 @@ impl Cg<'_> {
             }
             (m, a) => Err(format!("`pkt` has no method `{m}` taking {} argument(s)", a.len())),
         }
+    }
+
+    /// `sample(N)`: true on 1 of every N calls. Backed by a per-site counter
+    /// in the hidden `__honey_sample` array map. Result (0/1) lands in R0.
+    fn emit_sample(&mut self, rate: i64) -> Result<Ty, String> {
+        let map_idx = self.sh.sample_map.ok_or("internal: sample map not reserved")?;
+        let site = *self.sample_next as i32;
+        *self.sample_next += 1;
+
+        let miss = self.prog.new_label();
+        let end = self.prog.new_label();
+
+        // key = site index -> stack; r0 = array_lookup(map, &key)
+        let kslot = self.alloc_slot();
+        self.prog.push(st_mem(Size::W, Reg::R10, kslot, site));
+        self.prog.push(ld_map_fd(Reg::R1, map_idx));
+        self.prog.push(mov64_reg(Reg::R2, Reg::R10));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R2, kslot as i32));
+        self.prog.push(call(Helper::MapLookupElem));
+        self.free_slot();
+        // array lookups shouldn't fail, but the verifier needs the null check.
+        self.prog.jmp_imm_to(JmpOp::Eq, Reg::R0, 0, miss);
+        // c = *r0 + 1; *r0 = c   (map_value pointer is writable)
+        self.prog.push(ldx_mem(Size::DW, Reg::R1, Reg::R0, 0));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R1, 1));
+        self.prog.push(stx_mem(Size::DW, Reg::R0, 0, Reg::R1));
+        // result = (c % rate == 0)
+        self.prog.push(alu64_imm(AluOp::Mod, Reg::R1, rate as i32));
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.jmp_imm_to(JmpOp::Ne, Reg::R1, 0, end);
+        self.prog.push(mov64_imm(Reg::R0, 1));
+        self.prog.ja_to(end);
+        self.prog.bind(miss);
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.bind(end);
+        Ok(Ty::Bool)
     }
 
     fn str_method(&mut self, off: i16, cap: u32, method: &str, args: &[Expr]) -> Result<Ty, String> {

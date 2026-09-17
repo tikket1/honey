@@ -316,8 +316,8 @@ fn declarations_are_validated() {
     assert!(msg.contains("duplicate field `a`"), "{msg}");
     let msg = first_message("const N: u8 = 300;\nevent E { a: u64 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }");
     assert!(msg.contains("300 does not fit in `u8`"), "{msg}");
-    let msg = first_message("event E { a: u64 }\nprobe uprobe(\"/bin/sh\") { emit E { a: 1 }; }");
-    assert!(msg.contains("unsupported probe kind `uprobe`"), "{msg}");
+    let msg = first_message("event E { a: u64 }\nprobe usdt(\"/bin/sh\") { emit E { a: 1 }; }");
+    assert!(msg.contains("unsupported probe kind `usdt`"), "{msg}");
     let msg = first_message("event E { a: u64 }\nprobe kprobe(\"a\", \"b\") { emit E { a: 1 }; }");
     assert!(msg.contains("`kprobe` takes one string argument"), "{msg}");
     let msg = first_message("event E { a: u64 }");
@@ -338,7 +338,7 @@ fn kret(body: &str) -> String {
 fn kprobe_gets_args_but_not_retval() {
     ok(&kprobe("    emit E { a: arg(1), r: 0 };"));
     let ds = diags(&kprobe("    emit E { a: 1, r: retval() };"));
-    assert!(ds[0].message.contains("`retval()` is only available in a `kretprobe`"), "{ds:#?}");
+    assert!(ds[0].message.contains("`retval()` is only available in a return probe"), "{ds:#?}");
     assert!(ds[0].help.as_deref().unwrap().contains("kretprobe"));
 }
 
@@ -346,7 +346,7 @@ fn kprobe_gets_args_but_not_retval() {
 fn kretprobe_gets_retval_but_not_args() {
     ok(&kret("    emit E { a: 1, r: retval() };"));
     let ds = diags(&kret("    emit E { a: arg(0), r: retval() };"));
-    assert!(ds[0].message.contains("`arg()` is not available in a `kretprobe`"), "{ds:#?}");
+    assert!(ds[0].message.contains("`arg()` is not available in a return probe"), "{ds:#?}");
     assert!(ds[0].help.as_deref().unwrap().contains("tid()"), "{ds:#?}");
 }
 
@@ -365,7 +365,7 @@ fn retval_is_signed_and_does_not_mix_with_unsigned() {
 #[test]
 fn tracepoint_has_no_retval() {
     let msg = first_message(&probe("    let r = retval();\n    emit E { a: 1, b: true };"));
-    assert!(msg.contains("only available in a `kretprobe`"), "{msg}");
+    assert!(msg.contains("only available in a return probe"), "{msg}");
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn lsm_takes_one_hook_argument() {
 fn lsm_has_args_but_no_retval() {
     ok("event E { a: u64 } probe lsm(\"file_open\") { emit E { a: arg(0) }; }");
     let msg = first_message("event E { a: u64, r: i64 } probe lsm(\"file_open\") { emit E { a: 1, r: retval() }; }");
-    assert!(msg.contains("`retval()` is only available in a `kretprobe`"), "{msg}");
+    assert!(msg.contains("`retval()` is only available in a return probe"), "{msg}");
 }
 
 // -------------------------------------------------------------- xdp probes
@@ -454,4 +454,44 @@ fn pkt_only_in_xdp_and_offsets_are_constants() {
     assert!(msg.contains("ends past 256 bytes"), "{msg}");
     // consts are fine
     ok(&format!("const IP_PROTO: u64 = 23;\n{}", xdp("    if pkt.u8(IP_PROTO) == 6 { drop(); }")));
+}
+
+// ------------------------------------------------------- uprobes & sampling
+
+#[test]
+fn uprobe_target_must_be_path_and_symbol() {
+    ok("event E { p: u32 } probe uprobe(\"/lib/libc.so.6:getenv\") { emit E { p: pid() }; }");
+    let msg = first_message("event E { p: u32 } probe uprobe(\"getenv\") { emit E { p: pid() }; }");
+    assert!(msg.contains("uprobe target must be `path:symbol`"), "{msg}");
+}
+
+#[test]
+fn uprobe_has_args_and_process_context() {
+    // arg + read_user_str + pid all work at a uprobe.
+    ok("event E { p: u32, n: str<16> } probe uprobe(\"/l:getenv\") { let n: str<16> = read_user_str(arg(0)); emit E { p: pid(), n: n }; }");
+    // retval does not, at entry.
+    let msg = first_message("event E { r: i64 } probe uprobe(\"/l:getenv\") { emit E { r: retval() }; }");
+    assert!(msg.contains("only available in a return probe"), "{msg}");
+}
+
+#[test]
+fn uretprobe_has_retval_but_not_args() {
+    ok("event E { r: i64 } probe uretprobe(\"/l:getenv\") { emit E { r: retval() }; }");
+    let msg = first_message("event E { p: u64 } probe uretprobe(\"/l:getenv\") { emit E { p: arg(0) }; }");
+    assert!(msg.contains("not available in a return probe"), "{msg}");
+}
+
+#[test]
+fn sample_returns_bool_with_a_positive_rate() {
+    ok(&probe("    if sample(100) { emit E { a: 1, b: true }; }"));
+    ok(&probe("    let x = sample(1000);\n    emit E { a: 1, b: x };"));
+    let msg = first_message(&probe("    if sample(0) { emit E { a: 1, b: true }; }"));
+    assert!(msg.contains("the rate must be at least 1"), "{msg}");
+    let msg = first_message(&probe("    if sample(x) { emit E { a: 1, b: true }; }"));
+    assert!(msg.contains("unknown name `x`") || msg.contains("constant"), "{msg}");
+}
+
+#[test]
+fn sample_works_in_any_probe_kind() {
+    ok("event E { t: u16 } probe xdp(\"lo\") { if sample(10) { emit E { t: pkt.u16(12) }; } }");
 }

@@ -1,0 +1,26 @@
+// getenv_trace.hny — trace which environment variables a process looks up,
+// by hooking libc's getenv in userspace.
+//
+// A uprobe attaches to a function inside a user binary or shared library.
+// getenv(const char *name) takes the variable name as arg 0, a pointer into
+// the calling process's memory, so read_user_str reads it. Uprobes have full
+// process context, so pid/uid/comm all work too.
+//
+// The path names a specific file on this machine (here, the aarch64 libc);
+// change it for your box. The symbol offset inside it is resolved at load
+// time, so the probe keeps working across libc updates.
+//
+//   honeyc build examples/getenv_trace.hny -o build/getenv
+//   linux/honey-linux ./linux/run.sh --json build/getenv.bin build/getenv.json
+//   ... then run anything that reads the environment, e.g. id or date.
+
+event Getenv {
+    pid: u32,
+    comm: str<16>,
+    name: str<32>,
+}
+
+probe uprobe("/lib/aarch64-linux-gnu/libc.so.6:getenv") {
+    let name: str<32> = read_user_str(arg(0));
+    emit Getenv { pid: pid(), comm: comm(), name: name };
+}

@@ -1,0 +1,11 @@
+// error: `sample(0)`: the rate must be at least 1
+//
+// 1-in-0 has no meaning, and dividing by it would fault.
+
+event E { p: u32 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    if sample(0) {
+        emit E { p: pid() };
+    }
+}

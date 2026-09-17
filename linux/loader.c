@@ -31,6 +31,9 @@
 #include <signal.h>
 #include <net/if.h>
 #include <linux/if_link.h>
+#include <fcntl.h>
+#include <gelf.h>
+#include <libelf.h>
 
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
@@ -117,6 +120,7 @@ struct program {
     char function[64];  // kprobe / kretprobe
     char hook[64];      // lsm
     char interface[32]; // xdp
+    char target[192];   // uprobe/uretprobe: path:symbol
     size_t offset;
     size_t insns;
     const char *relocs; // pointer into the manifest text: the "relocs":[...] array
@@ -193,6 +197,102 @@ static int load_and_attach_lsm(const char *hook, const char *license,
         return -1;
     }
     return prog_fd;
+}
+
+// Resolve a function symbol to its file offset in an ELF binary, so a uprobe
+// can attach by name. Handles versioned symbols (`getenv@@GLIBC_2.17`) by
+// matching the base name, and converts the symbol's virtual address to a file
+// offset via the containing PT_LOAD segment.
+static long elf_symbol_offset(const char *path, const char *want) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "uprobe: cannot open %s: %s\n", path, strerror(errno)); return -1; }
+    if (elf_version(EV_CURRENT) == EV_NONE) { close(fd); return -1; }
+    Elf *e = elf_begin(fd, ELF_C_READ, NULL);
+    if (!e) { close(fd); fprintf(stderr, "uprobe: %s is not an ELF file\n", path); return -1; }
+
+    long found = -1;
+    Elf_Scn *scn = NULL;
+    while (found < 0 && (scn = elf_nextscn(e, scn)) != NULL) {
+        GElf_Shdr sh;
+        if (!gelf_getshdr(scn, &sh)) continue;
+        if (sh.sh_type != SHT_SYMTAB && sh.sh_type != SHT_DYNSYM) continue;
+        Elf_Data *data = elf_getdata(scn, NULL);
+        if (!data) continue;
+        int n = sh.sh_size / sh.sh_entsize;
+        for (int i = 0; i < n; i++) {
+            GElf_Sym sym;
+            if (!gelf_getsym(data, i, &sym)) continue;
+            if (GELF_ST_TYPE(sym.st_info) != STT_FUNC || sym.st_value == 0) continue;
+            const char *name = elf_strptr(e, sh.sh_link, sym.st_name);
+            if (!name) continue;
+            // match base name up to a '@' (version suffix)
+            size_t k = 0;
+            while (name[k] && name[k] != '@' && want[k] && name[k] == want[k]) k++;
+            int matched = (want[k] == 0) && (name[k] == 0 || name[k] == '@');
+            if (matched) { found = (long)sym.st_value; break; }
+        }
+    }
+    elf_end(e);
+
+    if (found < 0) { close(fd); fprintf(stderr, "uprobe: symbol `%s` not found in %s\n", want, path); return -1; }
+
+    // st_value is a virtual address; convert to a file offset via PT_LOAD.
+    long file_off = found; // for ET_DYN with vaddr 0 this is already the offset
+    Elf *e2 = elf_begin(fd, ELF_C_READ, NULL);
+    size_t phnum = 0;
+    if (e2 && elf_getphdrnum(e2, &phnum) == 0) {
+        for (size_t i = 0; i < phnum; i++) {
+            GElf_Phdr ph;
+            if (gelf_getphdr(e2, i, &ph) && ph.p_type == PT_LOAD
+                && (GElf_Addr)found >= ph.p_vaddr && (GElf_Addr)found < ph.p_vaddr + ph.p_memsz) {
+                file_off = (long)(found - ph.p_vaddr + ph.p_offset);
+                break;
+            }
+        }
+    }
+    if (e2) elf_end(e2);
+    close(fd);
+    return file_off;
+}
+
+static int uprobe_pmu_type(void) {
+    return read_int_file("/sys/bus/event_source/devices/uprobe/type");
+}
+
+static int attach_uprobe(const char *target, int retprobe, int prog_fd) {
+    // target is "path:symbol".
+    char path[160], *sym;
+    snprintf(path, sizeof path, "%s", target);
+    sym = strrchr(path, ':');
+    if (!sym) { fprintf(stderr, "uprobe: target `%s` must be path:symbol\n", target); return -1; }
+    *sym++ = 0;
+    long off = elf_symbol_offset(path, sym);
+    if (off < 0) return -1;
+
+    int pmu = uprobe_pmu_type();
+    if (pmu < 0) { fprintf(stderr, "kernel has no uprobe perf PMU\n"); return -1; }
+    int retbit = 0;
+    FILE *f = fopen("/sys/bus/event_source/devices/uprobe/format/retprobe", "r");
+    if (f) { if (fscanf(f, "config:%d", &retbit) != 1) retbit = 0; fclose(f); }
+
+    struct perf_event_attr attr = {0};
+    attr.type = pmu;
+    attr.size = sizeof(attr);
+    attr.config = retprobe ? (1ULL << retbit) : 0;
+    attr.config1 = (uint64_t)(uintptr_t)path; // binary path
+    attr.config2 = (uint64_t)off;             // file offset of the symbol
+    attr.sample_period = 1;
+    attr.wakeup_events = 1;
+    int pfd = perf_open(&attr);
+    if (pfd < 0) {
+        fprintf(stderr, "perf_event_open(%s %s:%s @ %#lx): %s\n",
+                retprobe ? "uretprobe" : "uprobe", path, sym, off, strerror(errno));
+        return -1;
+    }
+    if (ioctl(pfd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) { perror("SET_BPF"); return -1; }
+    if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) < 0) { perror("ENABLE"); return -1; }
+    fprintf(stderr, "  resolved %s:%s -> file offset %#lx\n", path, sym, off);
+    return pfd;
 }
 
 // XDP programs attach to a network interface, not to a perf event, and they
@@ -481,6 +581,7 @@ int main(int argc, char **argv) {
         json_str_in(p, next, "function", pr->function, sizeof pr->function);
         json_str_in(p, next, "hook", pr->hook, sizeof pr->hook);
         json_str_in(p, next, "interface", pr->interface, sizeof pr->interface);
+        json_str_in(p, next, "target", pr->target, sizeof pr->target);
         pr->offset = json_int_in(p, next, "offset", 0);
         pr->insns = json_int_in(p, next, "insns", 0);
         pr->relocs = strstr(p, "\"relocs\":");
@@ -546,8 +647,10 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        int is_uprobe = strcmp(pr->type, "uprobe") == 0 || strcmp(pr->type, "uretprobe") == 0;
         int is_kprobe = strcmp(pr->type, "kprobe") == 0 || strcmp(pr->type, "kretprobe") == 0;
-        enum bpf_prog_type pt = is_kprobe ? BPF_PROG_TYPE_KPROBE : BPF_PROG_TYPE_TRACEPOINT;
+        // uprobe/kprobe programs share BPF_PROG_TYPE_KPROBE.
+        enum bpf_prog_type pt = (is_kprobe || is_uprobe) ? BPF_PROG_TYPE_KPROBE : BPF_PROG_TYPE_TRACEPOINT;
         LIBBPF_OPTS(bpf_prog_load_opts, opts, .log_buf = log, .log_size = sizeof log, .log_level = 1);
         char short_name[16];
         snprintf(short_name, sizeof short_name, "honey%d", i);
@@ -557,7 +660,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         int pfd;
-        if (is_kprobe)
+        if (is_uprobe)
+            pfd = attach_uprobe(pr->target, strcmp(pr->type, "uretprobe") == 0, prog_fd);
+        else if (is_kprobe)
             pfd = attach_kprobe(pr->function, strcmp(pr->type, "kretprobe") == 0, prog_fd);
         else
             pfd = attach_tracepoint(pr->category, pr->tracepoint, prog_fd);

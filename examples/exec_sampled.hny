@@ -1,0 +1,14 @@
+// exec_sampled.hny — like exec.hny, but only report 1 in every 100 execs.
+//
+// On a busy host some hooks fire thousands of times a second. `sample(N)` is
+// true on 1 of every N calls, backed by a counter honey keeps for you, so you
+// get a representative trickle instead of a flood. Combine it with any other
+// condition.
+
+event Exec { pid: u32, uid: u32, comm: str<16> }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    if sample(100) {
+        emit Exec { pid: pid(), uid: uid(), comm: comm() };
+    }
+}

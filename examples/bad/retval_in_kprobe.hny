@@ -1,4 +1,4 @@
-// error: `retval()` is only available in a `kretprobe`
+// error: `retval()` is only available in a return probe
 //
 // At function entry there is no return value yet. The kernel would let you
 // read the register, and you would get garbage. honey knows which probe

@@ -26,7 +26,7 @@ first and refuse to generate code for anything that fails.
 | more than 512 bytes of stack                   | locals are summed along each scope path; the peak plus the compiler's reserve must fit, or it is an error naming the numbers |
 | writes through map value pointers (v1 choice)  | `*p = v` is rejected; `map.insert` is the supported update |
 | unsafe integer truncation                      | four unsigned widths plus `i64`, no implicit conversion; mixing widths is a type error and literals are range-checked |
-| reading arguments after they are gone          | `arg(n)` is rejected in a `kretprobe`; `retval()` is rejected everywhere but a `kretprobe` |
+| reading arguments after they are gone          | `arg(n)` is rejected in a return probe (`kretprobe`/`uretprobe`); `retval()` only in a return probe |
 
 Everything else is ordinary static typing: `bool` conditions, event fields
 set exactly once with the right types, map key/value types on every access,

@@ -1,0 +1,9 @@
+// error: `retval()` is only available in a return probe
+//
+// At function entry there is no return value yet; use `uretprobe`.
+
+event E { r: i64 }
+
+probe uprobe("/lib/x86_64-linux-gnu/libc.so.6:getenv") {
+    emit E { r: retval() };
+}

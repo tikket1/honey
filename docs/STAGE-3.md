@@ -96,6 +96,21 @@ per architecture: pass `--arch x86_64` when compiling for an x86 box (the
 default is aarch64, the dev environment). Every record starts with an
 8-byte header carrying the event id so one ring buffer serves every probe.
 
+### Userspace functions (uprobes)
+
+A `uprobe`/`uretprobe` is `BPF_PROG_TYPE_KPROBE` attached through the uprobe
+perf PMU. The loader resolves `path:symbol` to a file offset by reading the
+binary's ELF symbol table (libelf), matching the base name of a versioned
+symbol and converting the symbol's virtual address to a file offset via the
+containing `PT_LOAD` segment. `arg(n)` reads `pt_regs` like a kprobe, and
+because the arguments are user pointers, `read_user_str` works on them.
+
+### Sampling
+
+`sample(N)` compiles to a lookup-increment-modulo against a hidden
+`__honey_sample` array map that honey adds automatically, one u64 counter per
+call site. It fires on every Nth call. No map declaration, no state to manage.
+
 ### Packets (XDP)
 
 An `xdp` probe is `BPF_PROG_TYPE_XDP`, attached to an interface with

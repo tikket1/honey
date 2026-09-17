@@ -161,6 +161,10 @@ enum ProbeKind {
     Lsm,
     /// An XDP program on a network interface: sees raw packets, can `drop()`.
     Xdp,
+    /// A uprobe on a userspace function entry.
+    Uprobe,
+    /// A uretprobe on a userspace function return.
+    Uretprobe,
 }
 
 // ----------------------------------------------------------------- checker
@@ -379,6 +383,12 @@ impl Checker<'_> {
             ("kretprobe", 1) => Some(ProbeKind::Kretprobe),
             ("lsm", 1) => Some(ProbeKind::Lsm),
             ("xdp", 1) => Some(ProbeKind::Xdp),
+            ("uprobe", 1) => Some(ProbeKind::Uprobe),
+            ("uretprobe", 1) => Some(ProbeKind::Uretprobe),
+            ("uprobe" | "uretprobe", _) => {
+                self.error(p.span, format!("`{}` takes one string argument: `\"/path/to/binary:symbol\"`", p.kind.name));
+                None
+            }
             ("xdp", _) => {
                 self.error(p.span, "`xdp` takes one string argument: the interface name, e.g. `xdp(\"eth0\")`");
                 None
@@ -395,13 +405,23 @@ impl Checker<'_> {
                 self.error_help(
                     p.kind.span,
                     format!("unsupported probe kind `{other}`"),
-                    "use `tracepoint(\"category\", \"name\")`, `kprobe(\"function\")`, `kretprobe(\"function\")`, `lsm(\"hook\")`, or `xdp(\"interface\")`",
+                    "use `tracepoint`, `kprobe`, `kretprobe`, `lsm`, `xdp`, `uprobe`, or `uretprobe`",
                 );
                 None
             }
         };
         if p.args.iter().any(|a| a.is_empty()) {
             self.error(p.span, "probe target must not be empty");
+        }
+        if matches!(kind, Some(ProbeKind::Uprobe) | Some(ProbeKind::Uretprobe))
+            && let [target] = p.args.as_slice()
+            && !target.contains(':')
+        {
+            self.error_help(
+                p.span,
+                "uprobe target must be `path:symbol`",
+                "for example `uprobe(\"/lib/x86_64-linux-gnu/libc.so.6:getenv\")`",
+            );
         }
         self.probe_kind = kind;
         self.push_scope();
@@ -928,11 +948,11 @@ impl Checker<'_> {
                 Ty::Str(16)
             }
             ("arg", [idx]) => {
-                if self.probe_kind == Some(ProbeKind::Kretprobe) {
+                if matches!(self.probe_kind, Some(ProbeKind::Kretprobe) | Some(ProbeKind::Uretprobe)) {
                     self.error_help(
                         span,
-                        "`arg()` is not available in a `kretprobe`: the arguments are gone by the time the function returns",
-                        "record what you need in a `kprobe` on the same function and share it through a map keyed by `tid()`",
+                        "`arg()` is not available in a return probe: the arguments are gone by the time the function returns",
+                        "record what you need in the entry probe and share it through a map keyed by `tid()`",
                     );
                 }
                 match self.const_eval(idx) {
@@ -943,14 +963,26 @@ impl Checker<'_> {
                 Ty::U64
             }
             ("retval", []) => {
-                if self.probe_kind != Some(ProbeKind::Kretprobe) {
+                if !matches!(self.probe_kind, Some(ProbeKind::Kretprobe) | Some(ProbeKind::Uretprobe)) {
                     self.error_help(
                         span,
-                        "`retval()` is only available in a `kretprobe`",
-                        "a return value only exists when the function returns; use `probe kretprobe(\"fn\")`",
+                        "`retval()` is only available in a return probe",
+                        "a return value only exists when the function returns; use `kretprobe(\"fn\")` or `uretprobe(\"path:sym\")`",
                     );
                 }
                 Ty::I64
+            }
+            ("sample", [n]) => {
+                match self.const_eval(n) {
+                    Some(v) if v >= 1 => {}
+                    Some(v) => self.error(n.span, format!("`sample({v})`: the rate must be at least 1")),
+                    None => {}
+                }
+                Ty::Bool
+            }
+            ("sample", _) => {
+                self.error(span, "`sample(N)` takes one constant rate");
+                Ty::Unit
             }
             ("read_user_str" | "read_kernel_str", _) => {
                 self.error_help(span, format!("`{name}` must initialise a bounded string"), format!("write `let s: str<N> = {name}(ptr);`"));
