@@ -1,0 +1,8 @@
+// error: `pkt.at(offset)` needs a struct type
+
+event E { a: u8 }
+
+probe xdp("lo") {
+    let x = pkt.at(14);
+    emit E { a: 1 };
+}

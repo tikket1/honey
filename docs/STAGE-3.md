@@ -159,6 +159,23 @@ them) and emits one bounds check for the largest offset the body reads; each
 `pkt.uN(off)` is then a plain load the verifier has already proven safe, with
 a `bswap` for 16/32-bit values. The default return is `XDP_PASS`.
 
+**Packet struct views.** `let ip: ptr<iphdr> = pkt.at(14)` is a compile-time
+binding: `Ty::PktPtr(struct, offset)`, nothing emitted. `ip.saddr` looks the
+member up in BTF — descending through anonymous struct/union members, which
+is how modern kernels wrap `saddr`/`daddr` — and emits a plain load from
+`[R7 + 14 + 12]`. If the member's typedef chain names a `__be*` type the
+load is followed by a `bswap`, so network-order fields arrive host-order.
+Byte arrays of 6/16 and `struct in6_addr` are blobs copied with the usual
+chunked copy; embedded structs become deeper views; bitfields and pointers
+are rejected by the checker. The pre-pass adds `offset + sizeof(struct)` to
+the entry bound.
+
+**Subnet matching.** `in_subnet(u32, "a.b.c.d/n")` is `(addr & mask) ==
+(net & mask)` with both immediates folded at compile time. For `ipv6` it is
+one masked compare per non-zero 8-byte chunk of the mask (so `/10` is a
+single compare and `/128` is two), the literal loaded in the byte order the
+CPU reads it.
+
 `ipv6` and `mac` values are byte blobs, not registers: `pkt.ipv6(off)` in a
 `let` allocates a 16-byte stack buffer and copies the packet bytes into it;
 in an `emit` it copies packet → record directly. Copies go in 8/4/2/1-byte

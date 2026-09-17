@@ -58,6 +58,9 @@ pub enum Ty {
     KPtr(String),
     /// A kernel pointer to a char: a string address for `read_kernel_str`.
     KCharPtr,
+    /// A view of packet bytes as a named struct (`let ip: ptr<iphdr> = pkt.at(14)`).
+    /// Read with `.field`; lives nowhere at runtime.
+    PktPtr(String),
     /// Statements-as-expressions (`map.insert`) produce this.
     Unit,
     /// An integer literal that has not yet picked a width.
@@ -100,7 +103,7 @@ impl Ty {
             Ty::Str(n) => n.div_ceil(8) * 8,
             Ty::Ipv6 => 16,
             Ty::Mac => 8,
-            Ty::Unit => 0,
+            Ty::PktPtr(_) | Ty::Unit => 0,
             _ => 8,
         }
     }
@@ -134,6 +137,7 @@ impl std::fmt::Display for Ty {
             Ty::Ref(inner) => write!(f, "&{inner}"),
             Ty::KPtr(name) => write!(f, "ptr<{name}>"),
             Ty::KCharPtr => write!(f, "ptr<char>"),
+            Ty::PktPtr(name) => write!(f, "ptr<{name}> (packet)"),
             Ty::Unit => write!(f, "()"),
             Ty::Int => write!(f, "{{integer}}"),
         }
@@ -593,6 +597,37 @@ impl Checker<'_> {
         // pointer). Needs BTF to know that `S` is a real kernel struct.
         if let Some(t) = ty
             && t.name.name == "ptr"
+            && is_pkt_at(value)
+        {
+            // A packet view: only in xdp, struct from BTF, bounded like every
+            // other packet read (offset + sizeof(struct) within the limit).
+            if self.probe_kind != Some(ProbeKind::Xdp) {
+                self.error(value.span, "`pkt.at` is only available in an `xdp` probe");
+            }
+            let target = self.ptr_target(t);
+            let ExprKind::MethodCall { args, .. } = &value.kind else { unreachable!() };
+            if let ([off], Some(sname)) = (args.as_slice(), &target) {
+                let size = self.btf.and_then(|b| b.struct_size(sname)).unwrap_or(0);
+                match self.const_eval_global(off) {
+                    Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
+                    Some(o) if o as u32 + size > MAX_PKT_BOUND => self.error_help(
+                        off.span,
+                        format!("`{sname}` ({size} bytes) at offset {o} ends past {MAX_PKT_BOUND} bytes, the most an XDP probe may inspect"),
+                        "keep the view within the first 256 bytes of the packet",
+                    ),
+                    _ => {}
+                }
+            } else if args.len() != 1 {
+                self.error(value.span, "`pkt.at` takes one constant offset");
+            }
+            match target {
+                Some(sname) => self.declare(&name.name, Ty::PktPtr(sname), mutable, None),
+                None => self.declare(&name.name, Ty::Unit, mutable, None),
+            }
+            return;
+        }
+        if let Some(t) = ty
+            && t.name.name == "ptr"
         {
             let target = self.ptr_target(t);
             let at = self.expr(value);
@@ -635,7 +670,7 @@ impl Checker<'_> {
         if let Ty::Str(_) = ty {
             self.error_help(value.span, "strings can only come from `read_user_str`", "declare `let s: str<N> = read_user_str(ptr);`");
         }
-        if matches!(ty, Ty::Ipv6 | Ty::Mac) && !is_pkt_call(value) {
+        if matches!(ty, Ty::Ipv6 | Ty::Mac) && !is_pkt_call(value) && !matches!(value.kind, ExprKind::Field { .. }) {
             self.error_help(value.span, format!("an `{ty}` value can only come straight from the packet"), format!("write `let x: {ty} = pkt.{ty}(offset);`"));
         }
         self.declare(&name.name, ty, mutable, None);
@@ -814,6 +849,12 @@ impl Checker<'_> {
                 4 => Ty::U32,
                 _ => Ty::U64,
             },
+            // A char array (task_struct.comm): its address, readable with read_kernel_str.
+            Resolved::Array { elem_bytes: 1, .. } => Ty::KCharPtr,
+            Resolved::Array { .. } => {
+                self.error(field.span, format!("field `{}` is an array honey can't read as a value; only byte arrays are supported", field.name));
+                Ty::Unit
+            }
             Resolved::Struct { name } => Ty::KPtr(name),
             Resolved::PtrToStruct { name } => Ty::KPtr(name),
             Resolved::PtrToChar => Ty::KCharPtr,
@@ -824,6 +865,42 @@ impl Checker<'_> {
                     format!("field `{}` has a type honey can't read yet (array, enum, or function pointer)", field.name),
                     "read a scalar, an embedded struct, or a pointer field instead",
                 );
+                Ty::Unit
+            }
+        }
+    }
+
+    /// Type of `view.field` where `view` is a packet struct view.
+    fn pkt_field_type(&mut self, struct_name: &str, field: &Ident) -> Ty {
+        let Some(btf) = self.btf else {
+            self.error(field.span, "packet struct access needs `--btf`");
+            return Ty::Unit;
+        };
+        let Some(member) = btf.member(struct_name, &field.name) else {
+            self.error(field.span, format!("`struct {struct_name}` has no field `{}`", field.name));
+            return Ty::Unit;
+        };
+        if member.bitfield {
+            self.error_help(field.span, format!("`{}` is a bitfield; honey can't read those yet", field.name), "read the containing byte with `pkt.u8(off)` and mask it");
+            return Ty::Unit;
+        }
+        match btf.resolve(member.type_id) {
+            Resolved::Int { bytes, .. } => match bytes {
+                1 => Ty::U8,
+                2 => Ty::U16,
+                4 => Ty::U32,
+                _ => Ty::U64,
+            },
+            Resolved::Array { elem_bytes: 1, len: 6 } => Ty::Mac,
+            Resolved::Array { elem_bytes: 1, len: 16 } => Ty::Ipv6,
+            Resolved::Struct { name } if name == "in6_addr" => Ty::Ipv6,
+            Resolved::Struct { name } => Ty::PktPtr(name),
+            Resolved::PtrToStruct { .. } | Resolved::PtrToChar | Resolved::PtrToOther => {
+                self.error(field.span, format!("`{}` is a pointer; packet structs are read by value, not followed", field.name));
+                Ty::Unit
+            }
+            Resolved::Array { .. } | Resolved::Other => {
+                self.error(field.span, format!("field `{}` has a type honey can't read from a packet", field.name));
                 Ty::Unit
             }
         }
@@ -841,6 +918,7 @@ impl Checker<'_> {
                 if let Some(v) = self.lookup(name) {
                     return v.ty.clone();
                 }
+                // (a PktPtr local is fine to name: `.field` follows.)
                 if let Some((t, _)) = self.consts.get(name) {
                     return t.clone();
                 }
@@ -897,6 +975,7 @@ impl Checker<'_> {
                 let base = self.expr(expr);
                 match base {
                     Ty::KPtr(name) => self.field_type(&name, field),
+                    Ty::PktPtr(name) => self.pkt_field_type(&name, field),
                     Ty::Unit => Ty::Unit,
                     other => {
                         self.error_help(
@@ -1100,6 +1179,32 @@ impl Checker<'_> {
                 }
                 Ty::I64
             }
+            ("in_subnet", [a, cidr]) => {
+                let at = self.expr(a);
+                let ExprKind::Str(lit) = &cidr.kind else {
+                    self.error(cidr.span, "`in_subnet` takes a CIDR string literal like \"10.0.0.0/8\"");
+                    return Ty::Bool;
+                };
+                match at {
+                    Ty::U32 | Ty::Int => {
+                        if addr::parse_cidr4(lit).is_none() {
+                            self.error_help(cidr.span, format!("{lit:?} is not an IPv4 CIDR"), "write it like \"10.0.0.0/8\"");
+                        }
+                    }
+                    Ty::Ipv6 => {
+                        if addr::parse_cidr6(lit).is_none() {
+                            self.error_help(cidr.span, format!("{lit:?} is not an IPv6 CIDR"), "write it like \"fe80::/10\"");
+                        }
+                    }
+                    Ty::Unit => {}
+                    other => self.error(a.span, format!("`in_subnet` needs a `u32` or `ipv6` address, found `{other}`")),
+                }
+                Ty::Bool
+            }
+            ("in_subnet", _) => {
+                self.error(span, "`in_subnet(address, \"cidr\")` takes an address and a CIDR literal");
+                Ty::Bool
+            }
             ("sample", [n]) => {
                 match self.const_eval(n) {
                     Some(v) if v >= 1 => {}
@@ -1178,6 +1283,10 @@ impl Checker<'_> {
             }
             return match (method.name.as_str(), args) {
                 ("len", []) => Ty::U32,
+                ("at", _) => {
+                    self.error_help(span, "`pkt.at(offset)` needs a struct type", "bind it: `let ip: ptr<iphdr> = pkt.at(14);` then read `ip.saddr`");
+                    Ty::Unit
+                }
                 ("u8" | "u16" | "u32" | "ipv6" | "mac", [off]) => {
                     let width: u32 = match method.name.as_str() {
                         "u8" => 1,
@@ -1208,7 +1317,7 @@ impl Checker<'_> {
                     Ty::Unit
                 }
                 (m, _) => {
-                    self.error(method.span, format!("`pkt` has no method `{m}`; use `u8/u16/u32(off)`, `ipv6(off)`, `mac(off)`, or `len()`"));
+                    self.error(method.span, format!("`pkt` has no method `{m}`; use `u8/u16/u32(off)`, `ipv6(off)`, `mac(off)`, `at(off)`, or `len()`"));
                     Ty::Unit
                 }
             };
@@ -1370,6 +1479,12 @@ fn compatible(expected: &Ty, actual: &Ty) -> bool {
         (_, Ty::Unit) | (Ty::Unit, _) => true,
         _ => false,
     }
+}
+
+/// `pkt.at(off)`: a packet struct view.
+fn is_pkt_at(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::MethodCall { receiver, method, .. }
+        if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") && method.name == "at")
 }
 
 /// `pkt.ipv6(...)` / `pkt.mac(...)`: the only producers of blob values.

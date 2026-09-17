@@ -158,3 +158,104 @@ fn embedded_struct_field_adds_offset_pointer_field_reads() {
     assert_eq!(text.matches("call 113").count(), 2, "two pointer reads\n{text}");
     assert_eq!(text.matches("call 115").count(), 1, "one string read\n{text}");
 }
+
+// ------------------------------------------------- packet struct views (XDP)
+
+fn xdp(body: &str) -> String {
+    format!("event E {{ a: u32, m: mac, b: bool }}\nprobe xdp(\"lo\") {{\n{body}\n}}")
+}
+
+#[test]
+fn packet_views_type_fields_from_btf() {
+    check_ok(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: ip.saddr, m: eth.h_source, b: ip.protocol == 1 };"));
+    // h_proto is a __be16 -> u16, not u32
+    let msg = first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    emit E { a: eth.h_proto, m: eth.h_dest, b: true };"));
+    assert!(msg.contains("expected `u32`, found `u16`"), "{msg}");
+}
+
+#[test]
+fn saddr_is_found_through_the_anonymous_union() {
+    let btf = kernel_btf();
+    let m = btf.member("iphdr", "saddr").expect("saddr via anonymous member");
+    assert_eq!(m.offset_bytes, 12);
+    let d = btf.member("iphdr", "daddr").unwrap();
+    assert_eq!(d.offset_bytes, 16);
+    assert!(matches!(btf.resolve(m.type_id), honeyc::btf::Resolved::Int { bytes: 4, big_endian: true, .. }));
+    assert!(btf.member("iphdr", "ihl").unwrap().bitfield);
+    assert_eq!(btf.struct_size("iphdr"), Some(20));
+}
+
+#[test]
+fn bitfields_pointers_and_unbound_views_are_errors() {
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: ip.ihl == 5 };"));
+    assert!(msg.contains("`ihl` is a bitfield"), "{msg}");
+    let msg = first(&xdp("    let x = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("`pkt.at(offset)` needs a struct type"), "{msg}");
+    let msg = first(&xdp("    let f: ptr<file> = pkt.at(0);\n    emit E { a: 1, m: pkt.mac(0), b: f.f_path.dentry.d_name.name == \"x\" };"));
+    assert!(msg.contains("is a pointer; packet structs are read by value") || msg.contains("cannot compare"), "{msg}");
+    // a view past the bound
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(240);\n    emit E { a: ip.saddr, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("ends past 256 bytes"), "{msg}");
+    // views only in xdp
+    let msg = first("event E { a: u32 } probe kprobe(\"f\") { let ip: ptr<iphdr> = pkt.at(14); emit E { a: ip.saddr }; }");
+    assert!(msg.contains("only available in an `xdp` probe"), "{msg}");
+}
+
+fn asm_xdp(body: &str) -> String {
+    asm(&xdp(body))
+}
+
+#[test]
+fn view_fields_are_plain_loads_swapped_when_big_endian() {
+    let text = asm_xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: ip.saddr, m: eth.h_source, b: eth.h_proto == 0x0800 };");
+    // saddr: 14 + 12 = 26, a 32-bit load then bswap32
+    assert!(text.contains("ldx32 r0, [r7 +26]"), "{text}");
+    assert!(text.contains("bswap32 r0"), "{text}");
+    // h_proto: 16-bit load at 12 then bswap16
+    assert!(text.contains("ldx16 r0, [r7 +12]"), "{text}");
+    assert!(text.contains("bswap16 r0"), "{text}");
+    // h_source: a 6-byte copy from packet offset 6 (4 + 2)
+    assert!(text.contains("ldx32 r0, [r7 +6]") && text.contains("ldx16 r0, [r7 +10]"), "{text}");
+    // the bound covers the iphdr view: 14 + 20 = 34
+    assert!(text.contains("add r2, 34"), "{text}");
+    // a view is compile-time only: nothing stored for eth/ip
+    assert!(!text.contains("stx64 [r10 -16]"), "{text}");
+}
+
+#[test]
+fn protocol_read_is_an_unswapped_byte() {
+    let text = asm_xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: ip.protocol == 1 };");
+    assert!(text.contains("ldx8 r0, [r7 +23]"), "{text}");
+    let after = text.split("ldx8 r0, [r7 +23]").nth(1).unwrap();
+    assert!(!after.lines().nth(1).unwrap().contains("bswap"), "{text}");
+}
+
+// ------------------------------------------------------------- in_subnet
+
+#[test]
+fn in_subnet_types_and_validation() {
+    check_ok(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: in_subnet(ip.saddr, \"10.0.0.0/8\") };"));
+    check_ok(&xdp("    let s = pkt.ipv6(22);\n    emit E { a: 1, m: pkt.mac(0), b: in_subnet(s, \"fe80::/10\") };"));
+    let msg = first(&xdp("    emit E { a: 1, m: pkt.mac(0), b: in_subnet(pkt.u32(26), \"10.0.0.0/33\") };"));
+    assert!(msg.contains("is not an IPv4 CIDR"), "{msg}");
+    let msg = first(&xdp("    let s = pkt.ipv6(22);\n    emit E { a: 1, m: pkt.mac(0), b: in_subnet(s, \"10.0.0.0/8\") };"));
+    assert!(msg.contains("is not an IPv6 CIDR"), "{msg}");
+    let msg = first(&xdp("    let m = pkt.mac(0);\n    emit E { a: 1, m: m, b: in_subnet(m, \"10.0.0.0/8\") };"));
+    assert!(msg.contains("needs a `u32` or `ipv6` address"), "{msg}");
+}
+
+#[test]
+fn in_subnet_compiles_to_mask_and_compare() {
+    // u32: (addr & 0xff000000) == 0x0a000000
+    let text = asm_xdp("    emit E { a: 1, m: pkt.mac(0), b: in_subnet(pkt.u32(26), \"10.0.0.0/8\") };");
+    assert!(text.contains("4278190080") || text.contains("-16777216"), "mask 0xff000000\n{text}");
+    assert!(text.contains("and r0, r1"), "{text}");
+    assert!(text.contains("167772160"), "net 10.0.0.0\n{text}");
+    // ipv6 fe80::/10: only the first 8-byte chunk has mask bits; one compare
+    let text = asm_xdp("    let s = pkt.ipv6(22);\n    emit E { a: 1, m: pkt.mac(0), b: in_subnet(s, \"fe80::/10\") };");
+    assert_eq!(text.matches("if r1 != r0 goto").count(), 1, "{text}");
+    assert!(text.contains("and r1, r0"), "{text}");
+    // ::1/128 needs both chunks
+    let text = asm_xdp("    let s = pkt.ipv6(22);\n    emit E { a: 1, m: pkt.mac(0), b: in_subnet(s, \"::1/128\") };");
+    assert_eq!(text.matches("if r1 != r0 goto").count(), 2, "{text}");
+}

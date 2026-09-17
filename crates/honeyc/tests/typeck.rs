@@ -5,6 +5,8 @@
 //! diagnostic containing that text. Those files are the demo of the whole
 //! idea — verifier rejections turned into source-line errors.
 
+mod common;
+
 use honeyc::parser::parse;
 use honeyc::token::Span;
 use honeyc::typeck::{check, Diag};
@@ -55,7 +57,9 @@ fn every_bad_example_fails_where_it_should() {
             .and_then(|l| l.strip_prefix("// error: "))
             .unwrap_or_else(|| panic!("{}: first line must be `// error: ...`", path.display()));
         let prog = parse(&src).unwrap_or_else(|e| panic!("{}: parse failed: {e:?}", path.display()));
-        let ds = match check(&prog) {
+        // Examples that read kernel structs need type info: use the synthetic BTF.
+        let btf = src.contains("ptr<").then(common::kernel_btf);
+        let ds = match honeyc::typeck::check_with_btf(&prog, btf.as_ref()) {
             Ok(_) => panic!("{}: expected a type error, but it passed", path.display()),
             Err(d) => d,
         };

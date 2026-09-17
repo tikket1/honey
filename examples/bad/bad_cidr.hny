@@ -1,0 +1,7 @@
+// error: "10.0.0.0/33" is not an IPv4 CIDR
+
+event E { a: bool }
+
+probe xdp("lo") {
+    emit E { a: in_subnet(pkt.u32(26), "10.0.0.0/33") };
+}

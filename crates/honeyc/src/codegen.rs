@@ -202,6 +202,9 @@ enum Ty {
     KPtr(String),
     /// Kernel pointer to char (a string address).
     KCharPtr,
+    /// A packet struct view: `struct name` at this constant packet offset.
+    /// Never stored; every field read is `[R7 + off + field]`.
+    PktPtr(String, i16),
 }
 
 impl Ty {
@@ -229,6 +232,7 @@ impl Ty {
             Ty::Ipv6 => 16,
             Ty::Mac => 6,
             Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::KPtr(_) | Ty::KCharPtr => 8,
+            Ty::PktPtr(..) => 0,
         }
     }
 
@@ -438,7 +442,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut
         cg.prog.push(ldx_mem(Size::W, Reg::R8, Reg::R1, 4));
         // One bounds check on entry covering the furthest read in the body:
         //   if data + MAX > data_end: pass (short packet)
-        let bound = pkt_max_bound(&p.body, &sh.consts)?;
+        let bound = pkt_max_bound(&p.body, &sh.consts, sh.btf)?;
         if bound > 0 {
             cg.prog.push(mov64_reg(Reg::R2, Reg::R7));
             cg.prog.push(alu64_imm(AluOp::Add, Reg::R2, bound as i32));
@@ -527,7 +531,7 @@ fn map_spec(m: &MapDecl) -> Result<(MapSpec, Ty, Ty), String> {
 
 /// Pre-pass over an XDP probe body: the largest `offset + width` of any
 /// `pkt.u8/u16/u32(offset)` read, so one entry check can cover them all.
-fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, String> {
+fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>, btf: Option<&Btf>) -> Result<u32, String> {
     fn eval(e: &Expr, consts: &HashMap<String, i64>) -> Result<i64, String> {
         match &e.kind {
             ExprKind::Int(n) => Ok(*n as i64),
@@ -593,9 +597,24 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, Str
             _ => Ok(()),
         }
     }
-    fn block(b: &Block, consts: &HashMap<String, i64>, max: &mut u32) -> Result<(), String> {
+    fn block(b: &Block, consts: &HashMap<String, i64>, max: &mut u32, btf: Option<&Btf>) -> Result<(), String> {
         for s in &b.stmts {
             match &s.kind {
+                StmtKind::Let { value, ty: Some(t), .. } if t.name.name == "ptr" && is_pkt_at(value) => {
+                    // a struct view covers offset .. offset + sizeof(struct)
+                    let ExprKind::MethodCall { args, .. } = &value.kind else { unreachable!() };
+                    let [off] = args.as_slice() else { return Err("`pkt.at` takes one constant offset".into()) };
+                    let o = eval(off, consts)?;
+                    let sname = match t.args.as_slice() {
+                        [TypeArg::Type(inner)] => inner.name.name.clone(),
+                        _ => return Err("`pkt.at` needs `ptr<Struct>`".into()),
+                    };
+                    let size = btf.and_then(|b| b.struct_size(&sname)).ok_or_else(|| format!("unknown struct `{sname}` (need --btf)"))?;
+                    if o < 0 {
+                        return Err("packet offset must not be negative".into());
+                    }
+                    *max = (*max).max(o as u32 + size);
+                }
                 StmtKind::Let { value, .. } => expr(value, consts, max)?,
                 StmtKind::Assign { target, value } => {
                     expr(target, consts, max)?;
@@ -606,15 +625,15 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, Str
                         Cond::Expr(e) => expr(e, consts, max)?,
                         Cond::Let { value, .. } => expr(value, consts, max)?,
                     }
-                    block(then, consts, max)?;
+                    block(then, consts, max, btf)?;
                     if let Some(o) = otherwise {
-                        block(o, consts, max)?;
+                        block(o, consts, max, btf)?;
                     }
                 }
                 StmtKind::For { start, end, body, .. } => {
                     expr(start, consts, max)?;
                     expr(end, consts, max)?;
-                    block(body, consts, max)?;
+                    block(body, consts, max, btf)?;
                 }
                 StmtKind::Emit { fields, .. } => {
                     for (_, v) in fields {
@@ -628,8 +647,13 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, Str
         Ok(())
     }
     let mut max = 0;
-    block(body, consts, &mut max)?;
+    block(body, consts, &mut max, btf)?;
     Ok(max)
+}
+
+fn is_pkt_at(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::MethodCall { receiver, method, .. }
+        if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") && method.name == "at")
 }
 
 /// Which of R6..R9 this probe may use for locals and temporaries.
@@ -819,6 +843,7 @@ impl Cg<'_> {
                 Ty::Str(n) => n.div_ceil(8) * 8,
                 Ty::Ipv6 => 16,
                 Ty::Mac => 8,
+                Ty::PktPtr(..) => 0,
                 _ => 8,
             };
             self.stack_top -= bytes as i32;
@@ -878,6 +903,22 @@ impl Cg<'_> {
                     let off = self.alloc_bytes(n);
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off, ty: Ty::Str(n), reg: None });
                     return self.read_str_into(off, n, value);
+                }
+                // Packet struct view: `let ip: ptr<iphdr> = pkt.at(14);` — a
+                // compile-time binding, nothing emitted.
+                if let Some(t) = ty
+                    && t.name.name == "ptr"
+                    && is_pkt_at(value)
+                {
+                    let sname = match t.args.as_slice() {
+                        [TypeArg::Type(inner)] => inner.name.name.clone(),
+                        _ => return Err("`pkt.at` needs `ptr<Struct>`".into()),
+                    };
+                    let ExprKind::MethodCall { args, .. } = &value.kind else { unreachable!() };
+                    let [off] = args.as_slice() else { return Err("`pkt.at` takes one constant offset".into()) };
+                    let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktPtr(sname, o), reg: None });
+                    return Ok(());
                 }
                 // Byte blobs: `let a = pkt.ipv6(22);` copies straight from the packet.
                 if let Some((width, off)) = self.pkt_blob(value)? {
@@ -1147,7 +1188,9 @@ impl Cg<'_> {
             ExprKind::Str(_) => Err("string values are not supported in expressions".into()),
             ExprKind::Ident(name) => {
                 if let Some(local) = self.lookup(name).cloned() {
-                    self.load_local(&local);
+                    if !matches!(local.ty, Ty::PktPtr(..)) {
+                        self.load_local(&local);
+                    }
                     return Ok(local.ty);
                 }
                 if let Some(v) = self.const_lookup(name) {
@@ -1220,6 +1263,9 @@ impl Cg<'_> {
             }
             ExprKind::Field { expr, field } => {
                 let base = self.expr(expr)?;
+                if let Ty::PktPtr(sname, poff) = base {
+                    return self.pkt_field(&sname, poff, &field.name);
+                }
                 let Ty::KPtr(sname) = base else {
                     return Err(format!("`.{}` needs a kernel struct pointer", field.name));
                 };
@@ -1248,11 +1294,21 @@ impl Cg<'_> {
                         self.emit_kernel_read(&sname, &field.name, off, 8);
                         Ok(Ty::Uint(8))
                     }
-                    Resolved::Int { bytes, .. } => {
+                    Resolved::Int { bytes, big_endian, .. } => {
                         self.emit_kernel_read(&sname, &field.name, off, bytes);
+                        if big_endian && bytes >= 2 {
+                            self.prog.push(bswap(Reg::R0, (bytes * 8) as u8));
+                        }
                         Ok(Ty::Uint(bytes))
                     }
-                    Resolved::Other => Err(format!("field `{}` has a type honey can't read", field.name)),
+                    // A byte array (task_struct.comm): its address, for read_kernel_str.
+                    Resolved::Array { elem_bytes: 1, .. } => {
+                        let idx = self.prog.len();
+                        self.prog.push(alu64_imm(AluOp::Add, Reg::R0, off));
+                        self.relocs.push((idx, sname.clone(), field.name.clone()));
+                        Ok(Ty::KCharPtr)
+                    }
+                    Resolved::Array { .. } | Resolved::Other => Err(format!("field `{}` has a type honey can't read", field.name)),
                 }
             }
             ExprKind::Index { .. } => Err("indexing is not supported".into()),
@@ -1612,6 +1668,7 @@ impl Cg<'_> {
                 let rate = self.const_eval(n)?;
                 self.emit_sample(rate)
             }
+            ("in_subnet", [a, cidr]) => self.emit_in_subnet(a, cidr),
             ("read_user_str", _) => Err("`read_user_str` may only initialise a `str<N>` local".into()),
             (other, _) => Err(format!("builtin `{other}` does not take arguments here")),
         }
@@ -1807,8 +1864,108 @@ impl Cg<'_> {
         Ok(Ty::Bool)
     }
 
-    /// If `e` is `pkt.ipv6(off)` / `pkt.mac(off)`, return (width, packet offset).
+    /// Read `view.field` from the packet at a constant offset. Scalars are
+    /// plain loads (byte-swapped when the kernel declares the field `__be*`);
+    /// embedded structs are views at a deeper offset; 6/16-byte arrays and
+    /// `in6_addr` are blobs (handled by `pkt_blob` at let/emit sites).
+    fn pkt_field(&mut self, sname: &str, poff: i16, field: &str) -> Result<Ty, String> {
+        let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
+        let member = btf.member(sname, field).ok_or_else(|| format!("struct `{sname}` has no field `{field}`"))?;
+        if member.bitfield {
+            return Err(format!("`{field}` is a bitfield"));
+        }
+        let off = poff + member.offset_bytes as i16;
+        match btf.resolve(member.type_id) {
+            Resolved::Int { bytes, big_endian, .. } => {
+                let size = match bytes {
+                    1 => Size::B,
+                    2 => Size::H,
+                    4 => Size::W,
+                    _ => Size::DW,
+                };
+                self.prog.push(ldx_mem(size, Reg::R0, Reg::R7, off));
+                if big_endian && bytes >= 2 {
+                    self.prog.push(bswap(Reg::R0, (bytes * 8) as u8));
+                }
+                Ok(Ty::Uint(bytes))
+            }
+            Resolved::Struct { name } if name == "in6_addr" => Err("`in6_addr` is a 16-byte value: bind it with `let` or emit it".into()),
+            Resolved::Struct { name } => Ok(Ty::PktPtr(name, off)),
+            Resolved::Array { elem_bytes: 1, len: 6 | 16 } => Err(format!("`{field}` is a byte blob: bind it with `let` or emit it directly")),
+            _ => Err(format!("field `{field}` has a type honey can't read from a packet")),
+        }
+    }
+
+    /// `in_subnet(addr, "cidr")` → R0 = 1 if the address is in the network.
+    fn emit_in_subnet(&mut self, a: &Expr, cidr: &Expr) -> Result<Ty, String> {
+        let ExprKind::Str(lit) = &cidr.kind else { return Err("`in_subnet` takes a CIDR literal".into()) };
+        // ipv6 local?
+        if let ExprKind::Ident(n) = &a.kind
+            && let Some(Local { off, ty: Ty::Ipv6, .. }) = self.lookup(n).cloned()
+        {
+            let (net, len) = addr::parse_cidr6(lit).ok_or_else(|| format!("{lit:?} is not an IPv6 CIDR"))?;
+            let mask = addr::mask6(len);
+            let fail = self.prog.new_label();
+            let end = self.prog.new_label();
+            for chunk in 0..2i16 {
+                let i = (chunk * 8) as usize;
+                let m = u64::from_le_bytes(mask[i..i + 8].try_into().unwrap());
+                if m == 0 {
+                    continue;
+                }
+                let mut nb = [0u8; 8];
+                for k in 0..8 {
+                    nb[k] = net[i + k] & mask[i + k];
+                }
+                let want = u64::from_le_bytes(nb);
+                self.prog.push(ldx_mem(Size::DW, Reg::R1, Reg::R10, off + chunk * 8));
+                self.prog.push(ld_imm64(Reg::R0, m as i64));
+                self.prog.push(alu64_reg(AluOp::And, Reg::R1, Reg::R0));
+                self.prog.push(ld_imm64(Reg::R0, want as i64));
+                self.prog.jmp_reg_to(JmpOp::Ne, Reg::R1, Reg::R0, fail);
+            }
+            self.prog.push(mov64_imm(Reg::R0, 1));
+            self.prog.ja_to(end);
+            self.prog.bind(fail);
+            self.prog.push(mov64_imm(Reg::R0, 0));
+            self.prog.bind(end);
+            return Ok(Ty::Bool);
+        }
+        // u32 address: (addr & mask) == (net & mask)
+        let (net, len) = addr::parse_cidr4(lit).ok_or_else(|| format!("{lit:?} is not an IPv4 CIDR"))?;
+        let mask = addr::mask4(len);
+        self.expr(a)?; // R0 = addr (host order)
+        self.load_imm(Reg::R1, mask as i64);
+        self.prog.push(alu64_reg(AluOp::And, Reg::R0, Reg::R1));
+        self.load_imm(Reg::R1, (net & mask) as i64);
+        let t = self.prog.new_label();
+        let end = self.prog.new_label();
+        self.prog.jmp_reg_to(JmpOp::Eq, Reg::R0, Reg::R1, t);
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.ja_to(end);
+        self.prog.bind(t);
+        self.prog.push(mov64_imm(Reg::R0, 1));
+        self.prog.bind(end);
+        Ok(Ty::Bool)
+    }
+
+    /// If `e` is `pkt.ipv6(off)` / `pkt.mac(off)` — or a blob-typed field of a
+    /// packet view — return (width, packet offset).
     fn pkt_blob(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
+        if let ExprKind::Field { expr, field } = &e.kind
+            && let ExprKind::Ident(n) = &expr.kind
+            && let Some(Local { ty: Ty::PktPtr(sname, poff), .. }) = self.lookup(n).cloned()
+        {
+            let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
+            let member = btf.member(&sname, &field.name).ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
+            let off = poff + member.offset_bytes as i16;
+            return Ok(match btf.resolve(member.type_id) {
+                Resolved::Array { elem_bytes: 1, len: 6 } => Some((6, off)),
+                Resolved::Array { elem_bytes: 1, len: 16 } => Some((16, off)),
+                Resolved::Struct { name } if name == "in6_addr" => Some((16, off)),
+                _ => None,
+            });
+        }
         let ExprKind::MethodCall { receiver, method, args } = &e.kind else { return Ok(None) };
         if !matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt" && self.lookup("pkt").is_none()) {
             return Ok(None);

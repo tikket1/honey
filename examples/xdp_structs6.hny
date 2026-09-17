@@ -1,0 +1,31 @@
+// xdp_structs6.hny — the IPv6 header by name, with an ipv6 subnet test.
+// `ip6.saddr` is a `struct in6_addr`, which honey treats as a 16-byte
+// `ipv6` value.
+
+event Seen6 {
+    next: u8,
+    hops: u8,
+    src: ipv6,
+    dst: ipv6,
+    linklocal: bool,
+    loopback: bool,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x86DD {
+        return;
+    }
+    let ip6: ptr<ipv6hdr> = pkt.at(14);
+    if ip6.nexthdr == 58 {
+        let src = ip6.saddr;
+        emit Seen6 {
+            next: ip6.nexthdr,
+            hops: ip6.hop_limit,
+            src: src,
+            dst: ip6.daddr,
+            linklocal: in_subnet(src, "fe80::/10"),
+            loopback: in_subnet(src, "::1/128"),
+        };
+    }
+}

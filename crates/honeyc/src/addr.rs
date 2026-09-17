@@ -73,9 +73,65 @@ pub fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// `"10.0.0.0/8"` → (network in host order, prefix length). A bare address
+/// is a /32.
+pub fn parse_cidr4(s: &str) -> Option<(u32, u8)> {
+    let (addr, len) = match s.split_once('/') {
+        Some((a, l)) => (a, l.parse::<u8>().ok().filter(|l| *l <= 32)?),
+        None => (s, 32),
+    };
+    Some((parse_ipv4(addr)?, len))
+}
+
+/// `"fe80::/10"` → (network bytes, prefix length). A bare address is a /128.
+pub fn parse_cidr6(s: &str) -> Option<([u8; 16], u8)> {
+    let (addr, len) = match s.split_once('/') {
+        Some((a, l)) => (a, l.parse::<u8>().ok().filter(|l| *l <= 128)?),
+        None => (s, 128),
+    };
+    Some((parse_ipv6(addr)?, len))
+}
+
+/// The netmask for a prefix length, as a host-order u32.
+pub fn mask4(len: u8) -> u32 {
+    if len == 0 { 0 } else { u32::MAX << (32 - len as u32) }
+}
+
+/// The netmask for a prefix length, as 16 wire-order bytes.
+pub fn mask6(len: u8) -> [u8; 16] {
+    let mut m = [0u8; 16];
+    let mut left = len as u32;
+    for b in m.iter_mut() {
+        if left >= 8 {
+            *b = 0xff;
+            left -= 8;
+        } else if left > 0 {
+            *b = (0xffu16 << (8 - left)) as u8;
+            left = 0;
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cidr() {
+        assert_eq!(parse_cidr4("10.0.0.0/8"), Some((0x0a00_0000, 8)));
+        assert_eq!(parse_cidr4("127.0.0.1"), Some((0x7f00_0001, 32)));
+        assert_eq!(parse_cidr4("10.0.0.0/33"), None);
+        assert_eq!(mask4(8), 0xff00_0000);
+        assert_eq!(mask4(0), 0);
+        assert_eq!(mask4(32), u32::MAX);
+        let (net, len) = parse_cidr6("fe80::/10").unwrap();
+        assert_eq!((net[0], net[1], len), (0xfe, 0x80, 10));
+        assert_eq!(mask6(10)[..2], [0xff, 0xc0]);
+        assert_eq!(mask6(10)[2], 0);
+        assert_eq!(mask6(128), [0xff; 16]);
+        assert_eq!(parse_cidr6("::1/129"), None);
+    }
 
     #[test]
     fn ipv4() {

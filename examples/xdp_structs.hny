@@ -1,0 +1,44 @@
+// xdp_structs.hny — read packet headers by field name, not by offset.
+//
+// `pkt.at(off)` bound to a `ptr<Struct>` gives the packet bytes at `off` the
+// shape of a kernel struct from BTF. Then `ip.saddr` means what it says:
+// honey knows the offset, the width, and — because the kernel declares the
+// field `__be32` — that it is network byte order, so it arrives host-order
+// and compares against "127.0.0.1" or a subnet directly. Byte arrays like
+// `eth.h_source` come out as `mac` values. The view's size counts toward the
+// single entry bounds check, so every field read is provably in the packet.
+//
+// `in_subnet(addr, "cidr")` masks and compares; the CIDR is validated at
+// compile time.
+//
+//   ./honey run examples/xdp_structs.hny --json     # exports BTF on first use
+//   ... then `ping -c 1 127.0.0.1` inside the environment.
+
+event Seen {
+    proto: u8,
+    ttl: u8,
+    src: ipv4,
+    dst: ipv4,
+    smac: mac,
+    loopback: bool,
+    private: bool,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol == 1 {
+        emit Seen {
+            proto: ip.protocol,
+            ttl: ip.ttl,
+            src: ip.saddr,
+            dst: ip.daddr,
+            smac: eth.h_source,
+            loopback: in_subnet(ip.saddr, "127.0.0.0/8"),
+            private: in_subnet(ip.saddr, "10.0.0.0/8"),
+        };
+    }
+}

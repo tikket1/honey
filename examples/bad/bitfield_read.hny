@@ -1,0 +1,8 @@
+// error: `ihl` is a bitfield; honey can't read those yet
+
+event E { a: u8 }
+
+probe xdp("lo") {
+    let ip: ptr<iphdr> = pkt.at(14);
+    emit E { a: ip.ihl };
+}

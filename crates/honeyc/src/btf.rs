@@ -50,6 +50,8 @@ struct BtfType {
     /// Signed flag, for INT only.
     int_signed: bool,
     members: Vec<Member>,
+    /// For ARRAY: (element type id, element count).
+    array: Option<(u32, u32)>,
 }
 
 /// A struct/union member, as honey needs it.
@@ -58,6 +60,8 @@ pub struct Member {
     pub name: String,
     pub offset_bytes: u32,
     pub type_id: u32,
+    /// A bitfield member (honey cannot read those).
+    pub bitfield: bool,
 }
 
 type MemberVec = Vec<Member>;
@@ -71,8 +75,12 @@ pub struct Btf {
 /// What a field's type resolves to, after stripping typedef/const/volatile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
-    /// An integer of `bytes` width.
-    Int { bytes: u32, signed: bool },
+    /// An integer of `bytes` width. `big_endian` when the field was declared
+    /// through a `__be16`/`__be32`/`__be64` typedef (network byte order).
+    Int { bytes: u32, signed: bool, big_endian: bool },
+    /// An array of `len` elements of `elem_bytes` each (only byte arrays are
+    /// useful to honey: MACs and raw addresses).
+    Array { elem_bytes: u32, len: u32 },
     /// An embedded struct/union: its address is `base + offset`, no read.
     Struct { name: String },
     /// A pointer to a named struct: read 8 bytes to get that struct's address.
@@ -130,6 +138,7 @@ impl Btf {
             size_or_type: 0,
             int_signed: false,
             members: Vec::new(),
+            array: None,
         }];
         let mut struct_by_name = HashMap::new();
 
@@ -147,6 +156,7 @@ impl Btf {
             let name = name_of(name_off);
             let mut int_signed = false;
             let mut members = Vec::new();
+            let mut array = None;
 
             // Skip or read the kind-specific trailing data.
             match kind {
@@ -166,16 +176,21 @@ impl Btf {
                         // bits are still the bit offset. honey's structs are
                         // byte-aligned, so bit offset / 8 is the byte offset.
                         let bit_off = if kind_flag == 1 { moff & 0xffffff } else { moff };
+                        let bitfield = kind_flag == 1 && (moff >> 24) != 0;
                         members.push(Member {
                             name: name_of(mn),
                             offset_bytes: bit_off / 8,
                             type_id: mt,
+                            bitfield,
                         });
                     }
                 }
                 ENUM => p += vlen * 8,
                 ENUM64 => p += vlen * 12,
-                ARRAY => p += 12,
+                ARRAY => {
+                    array = Some((u32le(p), u32le(p + 8)));
+                    p += 12;
+                }
                 FUNC_PROTO => p += vlen * 8,
                 DATASEC => p += vlen * 12,
                 VAR => p += 4,
@@ -189,7 +204,7 @@ impl Btf {
             if (kind == STRUCT || kind == UNION) && !name.is_empty() {
                 struct_by_name.entry(name.clone()).or_insert(id);
             }
-            types.push(BtfType { name, kind, size_or_type, int_signed, members });
+            types.push(BtfType { name, kind, size_or_type, int_signed, members, array });
         }
 
         Ok(Btf { types, struct_by_name })
@@ -214,9 +229,34 @@ impl Btf {
         Some(self.get(id)?.members.clone())
     }
 
-    /// Find a member by name in a struct.
+    /// Find a member by name in a struct, looking through anonymous
+    /// struct/union members (the kernel wraps `iphdr.saddr`/`daddr` in one).
+    /// The returned offset is relative to the outer struct.
     pub fn member(&self, struct_name: &str, field: &str) -> Option<Member> {
-        self.members(struct_name)?.into_iter().find(|m| m.name == field)
+        let id = self.struct_id(struct_name)?;
+        self.member_in(id, field, 0)
+    }
+
+    fn member_in(&self, type_id: u32, field: &str, base: u32) -> Option<Member> {
+        let t = self.strip(type_id)?;
+        if t.kind != STRUCT && t.kind != UNION {
+            return None;
+        }
+        if let Some(m) = t.members.iter().find(|m| m.name == field) {
+            return Some(Member { offset_bytes: base + m.offset_bytes, ..m.clone() });
+        }
+        for m in t.members.iter().filter(|m| m.name.is_empty()) {
+            if let Some(found) = self.member_in(m.type_id, field, base + m.offset_bytes) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Size in bytes of a named struct.
+    pub fn struct_size(&self, name: &str) -> Option<u32> {
+        let id = self.struct_id(name)?;
+        Some(self.get(id)?.size_or_type)
     }
 
     /// Follow typedef/const/volatile/restrict until a concrete type.
@@ -231,11 +271,39 @@ impl Btf {
         None
     }
 
+    /// Does the typedef chain name a big-endian type (`__be16`, `__be32`, ...)?
+    fn is_big_endian(&self, mut id: u32) -> bool {
+        for _ in 0..32 {
+            let Some(t) = self.get(id) else { return false };
+            match t.kind {
+                TYPEDEF => {
+                    if t.name.starts_with("__be") || t.name.starts_with("be") && t.name.len() <= 4 {
+                        return true;
+                    }
+                    id = t.size_or_type;
+                }
+                CONST | VOLATILE | RESTRICT => id = t.size_or_type,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Resolve a member's type id into honey's field model.
     pub fn resolve(&self, type_id: u32) -> Resolved {
+        let big_endian = self.is_big_endian(type_id);
         let Some(t) = self.strip(type_id) else { return Resolved::Other };
         match t.kind {
-            INT => Resolved::Int { bytes: t.size_or_type.min(8), signed: t.int_signed },
+            INT => Resolved::Int { bytes: t.size_or_type.min(8), signed: t.int_signed, big_endian },
+            ARRAY => {
+                let Some((elem, n)) = t.array else { return Resolved::Other };
+                let Some(et) = self.strip(elem) else { return Resolved::Other };
+                if et.kind == INT {
+                    Resolved::Array { elem_bytes: et.size_or_type, len: n }
+                } else {
+                    Resolved::Other
+                }
+            }
             STRUCT | UNION => Resolved::Struct { name: t.name.clone() },
             PTR => {
                 let Some(pointee) = self.strip(t.size_or_type) else { return Resolved::PtrToOther };
@@ -345,6 +413,8 @@ mod tests {
         let dparent = btf.member("dentry", "d_parent").unwrap();
         assert_eq!(dparent.offset_bytes, 24);
         assert_eq!(btf.resolve(dparent.type_id), Resolved::PtrToStruct { name: "dentry".into() });
+        assert_eq!(btf.struct_size("dentry"), Some(192));
+        assert_eq!(btf.resolve(1), Resolved::Int { bytes: 4, signed: false, big_endian: false });
     }
 
     #[test]
