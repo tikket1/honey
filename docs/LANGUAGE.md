@@ -166,8 +166,35 @@ returns the transport protocol, and leaves the transport header's location
 for `pkt.l4()`. A short packet passes through untouched at any of these
 checks. One runtime view is live at a time.
 
-**Actions and bounds.** `drop()` and `pass()` return immediately; falling off
-the end passes. Every packet read must be provably in bounds or the verifier
+**TCP options.** `tcp.opt(kind)` on a `ptr<tcphdr>` view walks the option
+chain between the fixed header and `doff * 4` (up to ten options, each byte
+checked against the packet end) and gives `Option<u32>`: the option's data
+as a big-endian number (its first 1, 2 or 4 bytes; 0 for a bare
+SACK-permitted) or `None`. Like a map lookup it is only usable through
+`if let`, so an absent option can never read as zero:
+
+```honey
+if let Some(mss) = tcp.opt(2) { ... }        // 2 MSS, 3 wscale, 4 SACK ok, 8 timestamps
+```
+
+**Writing.** Assigning to a view's field stores into the packet:
+
+```honey
+eth.h_dest = eth.h_source;                    // blobs: another field, a local, or a literal
+ip.ttl = 7;                                   // scalars: swapped back if the kernel says __be*
+ip.fix_csum();                                // recompute the IPv4 header checksum (ihl * 4 bytes)
+icmp.checksum = csum_update(icmp.checksum, 0x0800, 0x0000);   // RFC 1624: one 16-bit word changed
+tx();                                         // send the rewritten packet back out
+```
+
+Writes need no extra bounds check: the view already covers its struct.
+Bitfields are read-only (a write would be a silent read-modify-write), an
+embedded struct is written field by field, and widths must match exactly.
+Checksum fields (`__sum16`) are read and written in host order like every
+other multi-byte field, so `csum_update`'s three words share one byte order.
+
+**Actions and bounds.** `drop()`, `pass()` and `tx()` return immediately;
+falling off the end passes. Every packet read must be provably in bounds or the verifier
 rejects the program: honey takes the furthest constant byte the probe
 touches (reads, blobs and `pkt.at` views, at most 256) and checks the packet
 is at least that long once, on entry; runtime views add their own single
@@ -352,10 +379,11 @@ Precedence, lowest to highest: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`,
 | `str<N>`                | Fixed-capacity byte string on the BPF stack, 1 ≤ N ≤ 256. Only `read_user_str` (and `comm()` in an `emit`) can produce one. |
 | `hash<K, V>`, `array<V>`| Map kinds, only in `map` declarations. K and V are integers or bool. |
 | `Option<&V>`            | The result of `map.get`. Not user-writable. Must be matched with `if let Some(v)` / `if let None`. |
+| `Option<u32>`           | The result of `tcp.opt(kind)`. Same rule: only `if let Some(v)` reaches the value. |
 | `&V`                    | A checked pointer, only bound by `if let Some(v)` and only inside that block. `*v` reads it. |
 | `ipv4`                  | A `u32` to the type system, printed by the loader as a dotted quad (`127.0.0.1`). Assign from `pkt.u32(...)`. |
 | `ipv6`, `mac`           | 16- and 6-byte values copied straight from the packet with `pkt.ipv6(off)` / `pkt.mac(off)`. Bind with `let`, compare with `==`/`!=` against a literal (`"::1"`, `"aa:bb:cc:dd:ee:ff"`) or another address of the same kind, emit; printed as addresses. Cannot be reassigned and cannot live in maps. |
-| `ptr<S>`                | A kernel pointer to `struct S` (a real kernel type, checked against BTF). From `let p: ptr<S> = arg(n);`. Read fields with `.` (pointers auto-deref). In an `xdp` probe, `let v: ptr<S> = pkt.at(off)` / `pkt.view(expr)` / `pkt.l4()` is instead a *view* of packet bytes: fields are read by value, never followed. |
+| `ptr<S>`                | A kernel pointer to `struct S` (a real kernel type, checked against BTF). From `let p: ptr<S> = arg(n);`. Read fields with `.` (pointers auto-deref). In an `xdp` probe, `let v: ptr<S> = pkt.at(off)` / `pkt.view(expr)` / `pkt.l4()` is instead a *view* of packet bytes: fields are read by value, never followed, and can be assigned (`v.field = x`). |
 
 Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 
@@ -378,7 +406,9 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
   a rule that never matches. Kinds never mix (`ipv6` vs `mac` is an error).
 - **Stack budget.** Locals are 8 bytes (scalars, pointers) or `N` rounded to 8
   (`str<N>`), summed along each scope path. Peak + 40 bytes reserve ≤ 512.
-- **No pointer writes** in v1: `*p = v` is rejected, use `map.insert`.
+- **No pointer writes** in v1: `*p = v` is rejected, use `map.insert`. Packet
+  views are the exception: `view.field = v` is a store into bytes the view
+  already proved in bounds; bitfields and embedded structs are not writable.
 - **Immutability.** Assignment needs `let mut`.
 
 ## 6. Builtins
@@ -396,7 +426,8 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `m.get(k)` / `m.insert(k, v)` / `m.delete(k)` | `Option<&V>` / `()`    | anywhere           | `bpf_map_lookup/update/delete_elem` |
 | `emit E { … }`                            | statement                  | anywhere           | `bpf_ringbuf_reserve/submit` |
 | `deny()` / `allow()`                      | statement                  | lsm                | return -EPERM / 0 |
-| `drop()` / `pass()`                       | statement                  | xdp                | XDP_DROP / XDP_PASS |
+| `drop()` / `pass()` / `tx()`              | statement                  | xdp                | XDP_DROP / XDP_PASS / XDP_TX |
+| `csum_update(csum, old, new)`             | `u16`                      | anywhere           | RFC 1624 `~(~c + ~old + new)`, folded |
 | `sample(N)`                               | `bool`                     | anywhere           | a hidden per-site counter map |
 | `in_subnet(addr, "cidr")`                 | `bool`                     | anywhere           | mask-and-compare, folded at compile time |
 | `s.starts_with("…")`, `s.byte_at(i)`      | `bool` / `u8`              | anywhere           | unrolled, bounded by `N` |
@@ -405,6 +436,9 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `pkt.ipv6(off)`, `pkt.mac(off)`           | `ipv6`, `mac`              | xdp                | byte copies |
 | `pkt.at(off)`, `pkt.view(expr)`, `pkt.l4()` | `ptr<S>` view (via `let`) | xdp               | struct layouts from BTF |
 | `pkt.ipv6_l4(off)`                        | `u8`                       | xdp                | 4-hop extension-header walk |
+| `tcp.opt(kind)` on a `ptr<tcphdr>`        | `Option<u32>`              | xdp                | 10-hop option walk, every byte checked |
+| `ip.fix_csum()` on a `ptr<iphdr>`         | statement                  | xdp                | zero, sum `ihl * 4` bytes (options checked), fold, store |
+| `view.field = v`                          | statement                  | xdp                | store through the view; `__be*` swapped back; blobs copied |
 
 ## 7. Status
 
@@ -415,11 +449,12 @@ kernel (`examples/*.hny`, each with the evidence in its commit message):
 |-------|----------------------------------------------------------------------|
 | 1     | Lexer                                                                |
 | 2     | Parser → AST, pretty-printer                                         |
-| 3     | Bytecode emitter + disassembler, C loader; every probe kind; CO-RE-style struct reads; packet views; register allocator |
+| 3     | Bytecode emitter + disassembler, C loader; every probe kind; CO-RE-style struct reads; packet views, writes and checksums, TCP options; register allocator |
 | 4     | Verifier-aware type checker: `honeyc check`, every rule an error at the source line, `examples/bad/` one program per rule |
 
-Not done, and not planned for v1: writing packet fields or checksums, more
-than one live runtime view, TCP option parsing, IPv6 in maps, functions.
+Not done, and not planned for v1: more than one live runtime view, ICMP/TCP
+payload checksums from scratch (only the incremental `csum_update`), IPv6 in
+maps, functions.
 
 ## 8. Decisions taken along the way
 

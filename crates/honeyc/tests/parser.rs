@@ -435,3 +435,9 @@ fn pretty_printing_is_a_fixed_point() {
         assert_eq!(once, twice, "examples/{name}.hny is not a fixed point");
     }
 }
+
+#[test]
+fn field_assignment_target() {
+    assert_eq!(stmt("ip.ttl = 7;"), "    ip.ttl = 7;");
+    assert_eq!(stmt("a.b.c = d.e;"), "    a.b.c = d.e;");
+}

@@ -1,0 +1,57 @@
+// xdp_synopts.hny — the TCP options a client offers in its SYN.
+//
+// TCP options live between the fixed header and `doff * 4`, as a chain of
+// (kind, length, data) records with one-byte NOPs for padding. `tcp.opt(k)`
+// walks that chain (bounded to ten options, every byte checked against the
+// packet end) and yields `Option<u32>`: the option's data as a number, or
+// `None` if it is absent. Like a map lookup, it can only be used through
+// `if let`, so a missing option can't be mistaken for a zero.
+//
+// Kinds: 2 = MSS, 3 = window scale, 4 = SACK permitted, 8 = timestamps.
+// The SYN's option set is a well-known fingerprint of the sending stack.
+//
+//   ./honey run examples/xdp_synopts.hny --json
+//   ... then in the environment:  nc -l 2225 &  echo hi | nc 127.0.0.1 2225
+
+event Syn {
+    src: ipv4,
+    sport: u16,
+    dport: u16,
+    mss: u32,
+    wscale: u32,
+    sack_ok: bool,
+    tsval: u32,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 6 {
+        return;
+    }
+    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);
+    if tcp.syn == 0 || tcp.ack == 1 || tcp.dest != 2225 {
+        return;
+    }
+
+    let mut mss: u32 = 0;
+    let mut wscale: u32 = 0;
+    let mut sack_ok = false;
+    let mut tsval: u32 = 0;
+    if let Some(v) = tcp.opt(2) {
+        mss = v;
+    }
+    if let Some(v) = tcp.opt(3) {
+        wscale = v;
+    }
+    if let Some(v) = tcp.opt(4) {
+        sack_ok = v == 0;
+    }
+    if let Some(v) = tcp.opt(8) {
+        tsval = v;
+    }
+    emit Syn { src: ip.saddr, sport: tcp.source, dport: tcp.dest, mss: mss, wscale: wscale, sack_ok: sack_ok, tsval: tsval };
+}

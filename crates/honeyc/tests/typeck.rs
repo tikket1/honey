@@ -133,7 +133,7 @@ fn if_let_none_is_allowed_and_binds_nothing() {
 #[test]
 fn if_let_on_a_non_option_is_rejected() {
     let msg = first_message(&probe("    let x = 1;\n    if let Some(v) = x { }\n    emit E { a: 1, b: true };"));
-    assert!(msg.contains("`if let` needs an `Option<&V>`"), "{msg}");
+    assert!(msg.contains("`if let` needs an `Option` from `map.get` or `tcp.opt`"), "{msg}");
 }
 
 #[test]

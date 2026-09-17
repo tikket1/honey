@@ -1,0 +1,10 @@
+// error: `tx()` is only available in an `xdp` probe
+//
+// Only an XDP program holds a packet to bounce back out of its interface.
+
+event E { p: u64 }
+
+probe kprobe("vfs_open") {
+    tx();
+    emit E { p: arg(0) };
+}

@@ -33,6 +33,8 @@ first and refuse to generate code for anything that fails.
 | unbounded packet pointer arithmetic            | `pkt.view` offsets must be integers and are masked to a known range; the view is checked once for `sizeof(S)`; the IPv6 walk is unrolled to four hops with a check per hop; `pkt.l4()` needs a preceding walk |
 | reading a header field that isn't a value      | a packet view's pointer members are errors; `pkt.at`/`view`/`l4` without a `ptr<S>` is an error |
 | misusing a byte blob as a number               | `ipv6`/`mac` come only from the packet, compare only with `==`/`!=` against the same kind or a valid literal, can't be reassigned or stored in maps |
+| a packet write the verifier can't bound        | writes go through a view's fields only (`view.field = v`), so the bound is the view's; bitfields and embedded structs are not writable; widths must match; a `mac`/`ipv6` field takes another field, a blob local, or a validated literal |
+| a missing TCP option read as zero              | `tcp.opt(kind)` is `Option<u32>`; only `if let Some(v)` reaches the value; the kind must be one byte; `.opt` exists only on a `ptr<tcphdr>` view and `.fix_csum()` only on a `ptr<iphdr>` |
 | a detection rule that can never match          | address literals (`"::1"`, `"aa:bb:..."`, `"10.0.0.1"`) and CIDRs are parsed at compile time; a malformed one is an error; a string literal longer than its `str<N>` is an error |
 
 Everything else is ordinary static typing: `bool` conditions, event fields
@@ -61,7 +63,8 @@ All errors in a file are reported together, not just the first.
 ## Design notes
 
 - **Types.** `u8 u16 u32 u64 bool str<N>`, plus two internal types the user
-  never writes: `Option<&V>` (a lookup result) and `&V` (a checked pointer).
+  never writes: `Option<&V>` (a lookup result), `&V` (a checked pointer)
+  and `Option<u32>` (a TCP option that may be absent).
   `{integer}` is an unsuffixed literal that adapts to the width it meets.
 - **Scopes carry stack.** Each scope records the bytes of its locals; the
   checker tracks the running total and its peak. Sibling scopes reuse stack,

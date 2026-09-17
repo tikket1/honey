@@ -97,7 +97,7 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 252 tests
+cargo test                                  # 262 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
@@ -120,6 +120,12 @@ linux/honey-linux ./linux/run.sh --json build/fop.bin build/fop.json
 # TCP ports through a runtime-offset header (IPv4) or the IPv6 extension chain:
 ./honey run examples/xdp_tcp6.hny --json
 #   -> {"event":"Tcp6","src":"::1","dst":"::1","proto":6,"sport":56218,"dport":2224}
+
+# packet writes: answer pings from XDP (swap MACs/IPs, ttl=7, fix both checksums, tx)
+./honey run examples/xdp_pong.hny --json
+#   -> ping 127.0.0.1 shows "ttl=7"; the SYN options of a loopback connect:
+./honey run examples/xdp_synopts.hny --json
+#   -> {"event":"Syn",...,"mss":65495,"wscale":7,"sack_ok":true,"tsval":3278033550}
 
 # packets: drop ICMP on loopback and watch ping fail
 cargo run -- build examples/icmp_drop.hny -o build/icmp

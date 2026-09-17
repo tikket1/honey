@@ -111,6 +111,10 @@ pub enum ProbeKind {
 
 const XDP_DROP: i32 = 1;
 const XDP_PASS: i32 = 2;
+const XDP_TX: i32 = 3;
+/// How many TCP options `tcp.opt(kind)` walks before giving up: the 40-byte
+/// option space holds at most that many non-NOP options of real width.
+const TCP_OPT_MAX: usize = 10;
 
 /// USDT argument spec, one per probe program, filled in by the loader from
 /// the marker's note. Six args of 16 bytes:
@@ -198,6 +202,8 @@ enum Ty {
     Mac,
     ValuePtr(Box<Ty>),
     OptionPtr(Box<Ty>),
+    /// `tcp.opt(kind)`: R0 = value, R1 = 1 if the option was present.
+    OptionVal(Box<Ty>),
     /// Kernel pointer to a named struct (an address).
     KPtr(String),
     /// Kernel pointer to char (a string address).
@@ -207,7 +213,7 @@ enum Ty {
     PktPtr(String, i16),
     /// A packet struct view at a runtime offset: the verified packet pointer
     /// lives in R9 (reserved for it); reads are `[R9 + field]`.
-    PktDyn(String),
+    PktDyn(String, i16),
 }
 
 impl Ty {
@@ -234,8 +240,8 @@ impl Ty {
             Ty::Str(n) => *n,
             Ty::Ipv6 => 16,
             Ty::Mac => 6,
-            Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::KPtr(_) | Ty::KCharPtr => 8,
-            Ty::PktPtr(..) | Ty::PktDyn(_) => 0,
+            Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::OptionVal(_) | Ty::KPtr(_) | Ty::KCharPtr => 8,
+            Ty::PktPtr(..) | Ty::PktDyn(..) => 0,
         }
     }
 
@@ -898,7 +904,7 @@ impl Cg<'_> {
                 Ty::Str(n) => n.div_ceil(8) * 8,
                 Ty::Ipv6 => 16,
                 Ty::Mac => 8,
-                Ty::PktPtr(..) | Ty::PktDyn(_) => 0,
+                Ty::PktPtr(..) | Ty::PktDyn(..) => 0,
                 _ => 8,
             };
             self.stack_top -= bytes as i32;
@@ -1000,7 +1006,7 @@ impl Cg<'_> {
                     self.prog.push(mov64_reg(Reg::R2, Reg::R9));
                     self.prog.push(alu64_imm(AluOp::Add, Reg::R2, size as i32));
                     self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, self.exit_label);
-                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktDyn(sname), reg: None });
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktDyn(sname, 0), reg: None });
                     return Ok(());
                 }
                 // Byte blobs: `let a = pkt.ipv6(22);` copies straight from the packet.
@@ -1027,20 +1033,29 @@ impl Cg<'_> {
                 self.store_local(&local);
                 Ok(())
             }
-            StmtKind::Assign { target, value } => {
-                self.expr(value)?;
-                match &target.kind {
-                    ExprKind::Ident(n) => {
-                        let local = self
-                            .lookup(n)
-                            .cloned()
-                            .ok_or_else(|| format!("assignment to unknown variable `{n}`"))?;
-                        self.store_local(&local);
-                        Ok(())
-                    }
-                    _ => Err("unsupported assignment target".into()),
+            StmtKind::Assign { target, value } => match &target.kind {
+                ExprKind::Ident(n) => {
+                    self.expr(value)?;
+                    let local = self
+                        .lookup(n)
+                        .cloned()
+                        .ok_or_else(|| format!("assignment to unknown variable `{n}`"))?;
+                    self.store_local(&local);
+                    Ok(())
                 }
-            }
+                // `view.field = value`: a store into the packet. The view is
+                // already bounds-checked for its whole struct, so the store
+                // needs no check of its own.
+                ExprKind::Field { expr: view, field } => {
+                    let (sname, base, poff) = match self.expr(view)? {
+                        Ty::PktPtr(s, o) => (s, Reg::R7, o),
+                        Ty::PktDyn(s, o) => (s, Reg::R9, o),
+                        _ => return Err("only packet views can be written through".into()),
+                    };
+                    self.pkt_write(&sname, base, poff, &field.name, value)
+                }
+                _ => Err("unsupported assignment target".into()),
+            },
             StmtKind::If { cond, then, otherwise } => {
                 let else_label = self.prog.new_label();
                 let end_label = self.prog.new_label();
@@ -1109,8 +1124,25 @@ impl Cg<'_> {
     /// whether a binding scope was pushed (the caller pops it).
     fn if_let_prelude(&mut self, pattern: &Pattern, value: &Expr, else_label: Label) -> Result<bool, String> {
         let ty = self.expr(value)?; // R0 = ptr or 0
+        if let Ty::OptionVal(inner) = ty {
+            // R0 = value, R1 = present. Park the value, branch on the flag.
+            return match (pattern.name.name.as_str(), &pattern.binding) {
+                ("Some", Some(bind)) => {
+                    self.push_scope();
+                    let local = self.declare(&bind.name, *inner);
+                    self.store_local(&local);
+                    self.prog.jmp_imm_to(JmpOp::Eq, Reg::R1, 0, else_label);
+                    Ok(true)
+                }
+                ("None", None) => {
+                    self.prog.jmp_imm_to(JmpOp::Ne, Reg::R1, 0, else_label);
+                    Ok(false)
+                }
+                _ => Err("pattern must be `Some(name)` or `None`".into()),
+            };
+        }
         let Ty::OptionPtr(inner) = ty else {
-            return Err("`if let` only works on the result of `map.get(...)`".into());
+            return Err("`if let` only works on the result of `map.get(...)` or `tcp.opt(...)`".into());
         };
         match (pattern.name.name.as_str(), &pattern.binding) {
             ("Some", Some(bind)) => {
@@ -1285,7 +1317,7 @@ impl Cg<'_> {
             ExprKind::Str(_) => Err("string values are not supported in expressions".into()),
             ExprKind::Ident(name) => {
                 if let Some(local) = self.lookup(name).cloned() {
-                    if !matches!(local.ty, Ty::PktPtr(..) | Ty::PktDyn(_)) {
+                    if !matches!(local.ty, Ty::PktPtr(..) | Ty::PktDyn(..)) {
                         self.load_local(&local);
                     }
                     return Ok(local.ty);
@@ -1352,6 +1384,27 @@ impl Cg<'_> {
                     {
                         return self.str_method(local.off, cap, &method.name, args);
                     }
+                    if let Some(local) = self.lookup(n).cloned()
+                        && let Ty::PktPtr(..) | Ty::PktDyn(..) = local.ty
+                    {
+                        let (sname, base, poff) = match local.ty {
+                            Ty::PktPtr(s, o) => (s, Reg::R7, o),
+                            Ty::PktDyn(s, o) => (s, Reg::R9, o),
+                            _ => unreachable!(),
+                        };
+                        return match (method.name.as_str(), args.as_slice()) {
+                            ("opt", [kind]) if sname == "tcphdr" => {
+                                let k = self.const_eval(kind)?;
+                                self.emit_tcp_opt(base, poff, k as i32)?;
+                                Ok(Ty::OptionVal(Box::new(Ty::Uint(4))))
+                            }
+                            ("fix_csum", []) if sname == "iphdr" => {
+                                self.emit_ip_csum(base, poff)?;
+                                Ok(Ty::Uint(8))
+                            }
+                            (m, _) => Err(format!("`ptr<{sname}>` has no method `{m}`")),
+                        };
+                    }
                     if self.sh.map_index.contains_key(n) {
                         return self.map_method(n, &method.name, args);
                     }
@@ -1363,8 +1416,8 @@ impl Cg<'_> {
                 if let Ty::PktPtr(sname, poff) = base {
                     return self.pkt_field(&sname, Reg::R7, poff, &field.name);
                 }
-                if let Ty::PktDyn(sname) = base {
-                    return self.pkt_field(&sname, Reg::R9, 0, &field.name);
+                if let Ty::PktDyn(sname, poff) = base {
+                    return self.pkt_field(&sname, Reg::R9, poff, &field.name);
                 }
                 let Ty::KPtr(sname) = base else {
                     return Err(format!("`.{}` needs a kernel struct pointer", field.name));
@@ -1716,6 +1769,11 @@ impl Cg<'_> {
                 self.prog.push(bpf::exit());
                 Ok(Ty::Uint(8))
             }
+            "tx" => {
+                self.prog.push(mov64_imm(Reg::R0, XDP_TX));
+                self.prog.push(bpf::exit());
+                Ok(Ty::Uint(8))
+            }
             "allow" => {
                 // return 0 (allow) immediately.
                 self.prog.push(mov64_imm(Reg::R0, 0));
@@ -1778,6 +1836,7 @@ impl Cg<'_> {
                 self.emit_sample(rate)
             }
             ("in_subnet", [a, cidr]) => self.emit_in_subnet(a, cidr),
+            ("csum_update", [c, old, new]) => self.emit_csum_update(c, old, new),
             ("read_user_str", _) => Err("`read_user_str` may only initialise a `str<N>` local".into()),
             (other, _) => Err(format!("builtin `{other}` does not take arguments here")),
         }
@@ -2020,6 +2079,8 @@ impl Cg<'_> {
                 Ok(Ty::Uint(bytes))
             }
             Resolved::Struct { name } if name == "in6_addr" => Err("`in6_addr` is a 16-byte value: bind it with `let` or emit it".into()),
+            // an embedded struct: a view at a deeper offset from the same base
+            Resolved::Struct { name } if base == Reg::R9 => Ok(Ty::PktDyn(name, off)),
             Resolved::Struct { name } => Ok(Ty::PktPtr(name, off)),
             Resolved::Array { elem_bytes: 1, len: 6 | 16 } => Err(format!("`{field}` is a byte blob: bind it with `let` or emit it directly")),
             _ => Err(format!("field `{field}` has a type honey can't read from a packet")),
@@ -2143,11 +2204,11 @@ impl Cg<'_> {
     fn pkt_blob_with_base(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
         if let ExprKind::Field { expr, field } = &e.kind
             && let ExprKind::Ident(n) = &expr.kind
-            && let Some(Local { ty: Ty::PktDyn(sname), .. }) = self.lookup(n).cloned()
+            && let Some(Local { ty: Ty::PktDyn(sname, poff), .. }) = self.lookup(n).cloned()
         {
             let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
             let member = btf.member(&sname, &field.name).ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
-            let off = member.offset_bytes as i16;
+            let off = poff + member.offset_bytes as i16;
             return Ok(match btf.resolve(member.type_id) {
                 Resolved::Array { elem_bytes: 1, len: 6 } => Some((6, off)),
                 Resolved::Array { elem_bytes: 1, len: 16 } => Some((16, off)),
@@ -2195,6 +2256,257 @@ impl Cg<'_> {
     /// Copy `n` bytes from `[src + soff]` to `[dst + doff]` in 8/4/2/1-byte
     /// chunks through R0. Sources may be the packet (R7) or the stack (R10);
     /// destinations the stack or the ring-buffer record (R6).
+    /// `view.field = value`: store a scalar (swapped back to network order
+    /// when the kernel declares it `__be*`) or copy a 6/16-byte blob into
+    /// the packet at `[base + poff + field]`.
+    fn pkt_write(&mut self, sname: &str, base: Reg, poff: i16, field: &str, value: &Expr) -> Result<(), String> {
+        let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
+        let member = btf.member(sname, field).ok_or_else(|| format!("struct `{sname}` has no field `{field}`"))?;
+        if member.bitfield() {
+            return Err(format!("cannot write the bitfield `{field}`"));
+        }
+        let off = poff + member.offset_bytes as i16;
+        let blob = match btf.resolve(member.type_id) {
+            Resolved::Int { bytes, big_endian, .. } => {
+                self.expr(value)?;
+                if big_endian && bytes >= 2 {
+                    self.prog.push(bswap(Reg::R0, (bytes * 8) as u8));
+                }
+                let size = match bytes {
+                    1 => Size::B,
+                    2 => Size::H,
+                    4 => Size::W,
+                    _ => Size::DW,
+                };
+                self.prog.push(stx_mem(size, base, off, Reg::R0));
+                return Ok(());
+            }
+            Resolved::Array { elem_bytes: 1, len: n @ (6 | 16) } => n,
+            Resolved::Struct { name } if name == "in6_addr" => 16,
+            _ => return Err(format!("field `{field}` has a type honey can't write to a packet")),
+        };
+        // A blob: from a literal, a blob local, or another packet field.
+        if let ExprKind::Str(lit) = &value.kind {
+            let bytes: Vec<u8> = if blob == 6 {
+                addr::parse_mac(lit).ok_or_else(|| format!("{lit:?} is not a mac literal"))?.to_vec()
+            } else {
+                addr::parse_ipv6(lit).ok_or_else(|| format!("{lit:?} is not an ipv6 literal"))?.to_vec()
+            };
+            self.store_bytes_imm(base, off, &bytes);
+            return Ok(());
+        }
+        if let ExprKind::Ident(n) = &value.kind
+            && let Some(Local { off: soff, ty: Ty::Mac | Ty::Ipv6, .. }) = self.lookup(n).cloned()
+        {
+            self.copy_bytes(Reg::R10, soff, base, off, blob);
+            return Ok(());
+        }
+        if let Some((width, soff)) = self.pkt_blob_with_base(value)? {
+            if width != blob {
+                return Err(format!("cannot write a {width}-byte value into the {blob}-byte field `{field}`"));
+            }
+            self.copy_bytes(Reg::R9, soff, base, off, blob);
+            return Ok(());
+        }
+        if let Some((width, soff)) = self.pkt_blob_static(value)? {
+            if width != blob {
+                return Err(format!("cannot write a {width}-byte value into the {blob}-byte field `{field}`"));
+            }
+            self.copy_bytes(Reg::R7, soff, base, off, blob);
+            return Ok(());
+        }
+        Err(format!("`{field}` is a byte blob: write it from the packet, a blob local, or a literal"))
+    }
+
+    /// Store constant bytes at `[dst + doff]`, widest chunks first.
+    fn store_bytes_imm(&mut self, dst: Reg, doff: i16, bytes: &[u8]) {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let left = bytes.len() - done;
+            let (size, w) = if left >= 8 {
+                (Size::DW, 8)
+            } else if left >= 4 {
+                (Size::W, 4)
+            } else if left >= 2 {
+                (Size::H, 2)
+            } else {
+                (Size::B, 1)
+            };
+            let mut chunk = [0u8; 8];
+            chunk[..w].copy_from_slice(&bytes[done..done + w]);
+            self.load_imm(Reg::R0, u64::from_le_bytes(chunk) as i64);
+            self.prog.push(stx_mem(size, dst, doff + done as i16, Reg::R0));
+            done += w;
+        }
+    }
+
+    /// `tcp.opt(kind)`: walk the TCP options between the fixed header and
+    /// `doff * 4`, up to `TCP_OPT_MAX` of them. Ends with R0 = the option's
+    /// data as a big-endian number (its first 1, 2 or 4 bytes; 0 when it has
+    /// none) and R1 = 1 if found, else R1 = 0. Each byte read is checked
+    /// against data_end; a truncated packet is passed. Scratch: R1 = offset
+    /// from the header, R2 = header length, R3 = pointer, R4 = option
+    /// length, R5 = option kind / temporary.
+    fn emit_tcp_opt(&mut self, base: Reg, poff: i16, kind: i32) -> Result<(), String> {
+        let found = self.prog.new_label();
+        let none = self.prog.new_label();
+        let done = self.prog.new_label();
+        // R2 = doff * 4 (the bitfield read leaves doff in R0)
+        self.pkt_field("tcphdr", base, poff, "doff")?;
+        self.prog.push(mov64_reg(Reg::R2, Reg::R0));
+        self.prog.push(alu64_imm(AluOp::Lsh, Reg::R2, 2));
+        self.prog.push(mov64_imm(Reg::R1, 20));
+        for _ in 0..TCP_OPT_MAX {
+            let next = self.prog.new_label();
+            let not_nop = self.prog.new_label();
+            let other = self.prog.new_label();
+            // past the header?
+            self.prog.jmp_reg_to(JmpOp::Ge, Reg::R1, Reg::R2, none);
+            // R3 = base + poff + R1; need one byte
+            self.prog.push(mov64_reg(Reg::R3, base));
+            if poff != 0 {
+                self.prog.push(alu64_imm(AluOp::Add, Reg::R3, poff as i32));
+            }
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R3, Reg::R1));
+            self.prog.push(mov64_reg(Reg::R5, Reg::R3));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R5, 1));
+            self.prog.jmp_reg_to(JmpOp::Gt, Reg::R5, Reg::R8, self.exit_label);
+            self.prog.push(ldx_mem(Size::B, Reg::R5, Reg::R3, 0));
+            self.prog.jmp_imm_to(JmpOp::Eq, Reg::R5, 0, none); // end of options
+            self.prog.jmp_imm_to(JmpOp::Ne, Reg::R5, 1, not_nop);
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R1, 1)); // NOP: one byte
+            self.prog.ja_to(next);
+            // R4 = length (second byte)
+            self.prog.bind(not_nop);
+            self.prog.push(mov64_reg(Reg::R4, Reg::R3));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R4, 2));
+            self.prog.jmp_reg_to(JmpOp::Gt, Reg::R4, Reg::R8, self.exit_label);
+            self.prog.push(ldx_mem(Size::B, Reg::R4, Reg::R3, 1));
+            self.prog.jmp_imm_to(JmpOp::Lt, Reg::R4, 2, none); // malformed
+            // the option must end inside the header
+            self.prog.push(mov64_reg(Reg::R0, Reg::R1));
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R0, Reg::R4));
+            self.prog.jmp_reg_to(JmpOp::Gt, Reg::R0, Reg::R2, none);
+            self.prog.jmp_imm_to(JmpOp::Ne, Reg::R5, kind, other);
+            // found: R0 = data, sized by length
+            let one = self.prog.new_label();
+            let two = self.prog.new_label();
+            let four = self.prog.new_label();
+            self.prog.push(mov64_imm(Reg::R0, 0));
+            self.prog.jmp_imm_to(JmpOp::Eq, Reg::R4, 2, found);
+            self.prog.jmp_imm_to(JmpOp::Eq, Reg::R4, 3, one);
+            self.prog.jmp_imm_to(JmpOp::Le, Reg::R4, 5, two);
+            self.prog.ja_to(four);
+            self.prog.bind(one);
+            self.prog.push(mov64_reg(Reg::R5, Reg::R3));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R5, 3));
+            self.prog.jmp_reg_to(JmpOp::Gt, Reg::R5, Reg::R8, self.exit_label);
+            self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R3, 2));
+            self.prog.ja_to(found);
+            self.prog.bind(two);
+            self.prog.push(mov64_reg(Reg::R5, Reg::R3));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R5, 4));
+            self.prog.jmp_reg_to(JmpOp::Gt, Reg::R5, Reg::R8, self.exit_label);
+            self.prog.push(ldx_mem(Size::H, Reg::R0, Reg::R3, 2));
+            self.prog.push(bswap(Reg::R0, 16));
+            self.prog.ja_to(found);
+            self.prog.bind(four);
+            self.prog.push(mov64_reg(Reg::R5, Reg::R3));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R5, 6));
+            self.prog.jmp_reg_to(JmpOp::Gt, Reg::R5, Reg::R8, self.exit_label);
+            self.prog.push(ldx_mem(Size::W, Reg::R0, Reg::R3, 2));
+            self.prog.push(bswap(Reg::R0, 32));
+            self.prog.ja_to(found);
+            // some other option: skip it
+            self.prog.bind(other);
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R1, Reg::R4));
+            self.prog.bind(next);
+        }
+        self.prog.ja_to(none);
+        self.prog.bind(found);
+        self.prog.push(mov64_imm(Reg::R1, 1));
+        self.prog.ja_to(done);
+        self.prog.bind(none);
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.push(mov64_imm(Reg::R1, 0));
+        self.prog.bind(done);
+        Ok(())
+    }
+
+    /// `ip.fix_csum()`: recompute the IPv4 header checksum over `ihl * 4`
+    /// bytes and store it. The first 20 bytes are covered by the view's
+    /// bound; each option word beyond is checked against data_end. The
+    /// ones'-complement sum is byte-order independent, so the words are
+    /// summed and stored as they sit on the wire. Scratch: R1 = sum,
+    /// R2 = header length, R3 = pointer, R4 = temporary.
+    fn emit_ip_csum(&mut self, base: Reg, poff: i16) -> Result<(), String> {
+        let fold = self.prog.new_label();
+        self.pkt_field("iphdr", base, poff, "ihl")?;
+        self.prog.push(mov64_reg(Reg::R2, Reg::R0));
+        self.prog.push(alu64_imm(AluOp::Lsh, Reg::R2, 2));
+        self.prog.push(mov64_reg(Reg::R3, base));
+        if poff != 0 {
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R3, poff as i32));
+        }
+        // check = 0, then sum
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.push(stx_mem(Size::H, Reg::R3, 10, Reg::R0));
+        self.prog.push(mov64_imm(Reg::R1, 0));
+        for word in 0..30i16 {
+            let at = word * 2;
+            if word >= 10 {
+                // options: only while inside the header and the packet
+                self.prog.jmp_imm_to(JmpOp::Le, Reg::R2, at as i32, fold);
+                self.prog.push(mov64_reg(Reg::R4, Reg::R3));
+                self.prog.push(alu64_imm(AluOp::Add, Reg::R4, at as i32 + 2));
+                self.prog.jmp_reg_to(JmpOp::Gt, Reg::R4, Reg::R8, self.exit_label);
+            }
+            self.prog.push(ldx_mem(Size::H, Reg::R0, Reg::R3, at));
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R1, Reg::R0));
+        }
+        self.prog.bind(fold);
+        for _ in 0..2 {
+            self.prog.push(mov64_reg(Reg::R0, Reg::R1));
+            self.prog.push(alu64_imm(AluOp::Rsh, Reg::R0, 16));
+            self.prog.push(alu64_imm(AluOp::And, Reg::R1, 0xffff));
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R1, Reg::R0));
+        }
+        self.prog.push(alu64_imm(AluOp::Xor, Reg::R1, 0xffff));
+        self.prog.push(alu64_imm(AluOp::And, Reg::R1, 0xffff));
+        self.prog.push(stx_mem(Size::H, Reg::R3, 10, Reg::R1));
+        Ok(())
+    }
+
+    /// `csum_update(csum, old, new)` (RFC 1624): `~(~csum + ~old + new)`
+    /// folded to 16 bits. Result in R0.
+    fn emit_csum_update(&mut self, c: &Expr, old: &Expr, new: &Expr) -> Result<Ty, String> {
+        let a = self.alloc_slot();
+        let b = self.alloc_slot();
+        self.expr(c)?;
+        self.prog.push(stx_mem(Size::DW, Reg::R10, a, Reg::R0));
+        self.expr(old)?;
+        self.prog.push(stx_mem(Size::DW, Reg::R10, b, Reg::R0));
+        self.expr(new)?;
+        self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xffff));
+        for slot in [a, b] {
+            self.prog.push(ldx_mem(Size::DW, Reg::R1, Reg::R10, slot));
+            self.prog.push(alu64_imm(AluOp::And, Reg::R1, 0xffff));
+            self.prog.push(alu64_imm(AluOp::Xor, Reg::R1, 0xffff)); // ~x, 16 bits
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R0, Reg::R1));
+        }
+        self.free_slot();
+        self.free_slot();
+        for _ in 0..2 {
+            self.prog.push(mov64_reg(Reg::R1, Reg::R0));
+            self.prog.push(alu64_imm(AluOp::Rsh, Reg::R1, 16));
+            self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xffff));
+            self.prog.push(alu64_reg(AluOp::Add, Reg::R0, Reg::R1));
+        }
+        self.prog.push(alu64_imm(AluOp::Xor, Reg::R0, 0xffff));
+        self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xffff));
+        Ok(Ty::Uint(2))
+    }
+
     fn copy_bytes(&mut self, src: Reg, soff: i16, dst: Reg, doff: i16, n: u32) {
         let mut done: u32 = 0;
         while done < n {

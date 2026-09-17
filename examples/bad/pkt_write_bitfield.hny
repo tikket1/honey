@@ -1,0 +1,12 @@
+// error: cannot write the bitfield `ihl`
+//
+// Packet writes store whole fields. A bitfield write would need a
+// read-modify-write of its container; honey doesn't do that silently.
+
+event E { a: u8 }
+
+probe xdp("lo") {
+    let ip: ptr<iphdr> = pkt.at(14);
+    ip.ihl = 5;
+    emit E { a: ip.ttl };
+}

@@ -52,6 +52,8 @@ pub enum Ty {
     Mac,
     /// The result of `map.get`: maybe a pointer, must be checked.
     Option(Box<Ty>),
+    /// The result of `tcp.opt(kind)`: maybe a value, must be checked.
+    OptionVal(Box<Ty>),
     /// A checked pointer into a map value.
     Ref(Box<Ty>),
     /// A kernel pointer to a named struct (from `arg(n)` typed `ptr<S>`).
@@ -134,6 +136,7 @@ impl std::fmt::Display for Ty {
             Ty::Ipv6 => write!(f, "ipv6"),
             Ty::Mac => write!(f, "mac"),
             Ty::Option(inner) => write!(f, "Option<&{inner}>"),
+            Ty::OptionVal(inner) => write!(f, "Option<{inner}>"),
             Ty::Ref(inner) => write!(f, "&{inner}"),
             Ty::KPtr(name) => write!(f, "ptr<{name}>"),
             Ty::KCharPtr => write!(f, "ptr<char>"),
@@ -511,22 +514,31 @@ impl Checker<'_> {
                     Cond::Let { pattern, value } => {
                         let t = self.expr(value);
                         self.push_scope();
-                        match t {
-                            Ty::Option(inner) => match (pattern.name.name.as_str(), &pattern.binding) {
+                        // What `Some(x)` binds: a checked pointer for a map
+                        // lookup, the value itself for a TCP option.
+                        let bound = match t {
+                            Ty::Option(inner) => Some(Ty::Ref(inner)),
+                            Ty::OptionVal(inner) => Some(*inner),
+                            other => {
+                                self.error_help(
+                                    value.span,
+                                    format!("`if let` needs an `Option` from `map.get` or `tcp.opt`, found `{other}`"),
+                                    "only map lookups and TCP option walks can be `None`",
+                                );
+                                None
+                            }
+                        };
+                        if let Some(bound) = bound {
+                            match (pattern.name.name.as_str(), &pattern.binding) {
                                 ("Some", Some(b)) => {
-                                    // The checked pointer exists only inside this block.
-                                    self.declare(&b.name, Ty::Ref(inner), false, None);
+                                    // The binding exists only inside this block.
+                                    self.declare(&b.name, bound, false, None);
                                 }
                                 ("None", None) => {}
                                 ("Some", None) => self.error(pattern.span, "`Some` needs a binding: `Some(name)`"),
                                 ("None", Some(_)) => self.error(pattern.span, "`None` takes no binding"),
                                 (other, _) => self.error(pattern.span, format!("unknown pattern `{other}`; use `Some(x)` or `None`")),
-                            },
-                            other => self.error_help(
-                                value.span,
-                                format!("`if let` needs an `Option<&V>` from `map.get`, found `{other}`"),
-                                "only map lookups can be `None`",
-                            ),
+                            }
                         }
                         self.block(then);
                         self.pop_scope();
@@ -731,6 +743,62 @@ impl Checker<'_> {
                     "use `map.insert(key, value)` to update the map",
                 );
                 self.expr(value);
+            }
+            // `view.field = value`: a packet write through a bounded view.
+            ExprKind::Field { expr: view, field } => {
+                let base = self.expr(view);
+                let Ty::PktPtr(sname) = base else {
+                    if base != Ty::Unit {
+                        self.error_help(
+                            target.span,
+                            format!("cannot assign to a field of `{base}`"),
+                            "only packet views (`ptr<Struct>` from `pkt.at`/`pkt.view`) can be written through",
+                        );
+                    }
+                    self.expr(value);
+                    return;
+                };
+                let ft = self.pkt_field_type(&sname, field);
+                if let Some(btf) = self.btf
+                    && let Some(m) = btf.member(&sname, &field.name)
+                    && m.bitfield()
+                {
+                    self.error_help(field.span, format!("cannot write the bitfield `{}`", field.name), "honey writes whole fields only");
+                    self.expr(value);
+                    return;
+                }
+                match ft {
+                    // Byte blobs come from the packet, a blob local, or a literal.
+                    Ty::Mac | Ty::Ipv6 => match &value.kind {
+                        ExprKind::Str(lit) => {
+                            let ok = if ft == Ty::Mac { addr::parse_mac(lit).is_some() } else { addr::parse_ipv6(lit).is_some() };
+                            if !ok {
+                                self.error(value.span, format!("{lit:?} is not a `{ft}` literal"));
+                            }
+                        }
+                        ExprKind::Field { .. } | ExprKind::Ident(_) => {
+                            let vt = self.expr(value);
+                            self.expect(&ft, &vt, value.span);
+                        }
+                        _ => self.error_help(
+                            value.span,
+                            format!("a `{ft}` can only be written from the packet, a `{ft}` local, or a literal"),
+                            format!("e.g. `eth.h_dest = eth.h_source;` or `eth.h_dest = \"{}\";`", if ft == Ty::Mac { "aa:bb:cc:dd:ee:ff" } else { "fe80::1" }),
+                        ),
+                    },
+                    Ty::PktPtr(_) => {
+                        self.error_help(target.span, format!("cannot assign the embedded struct `{}`", field.name), "write its fields one by one");
+                        self.expr(value);
+                    }
+                    Ty::Unit => {
+                        self.expr(value);
+                    }
+                    _ => {
+                        let vt = self.expr(value);
+                        self.expect(&ft, &vt, value.span);
+                        self.literal_fits(&ft, value);
+                    }
+                }
             }
             _ => self.error(target.span, "invalid assignment target"),
         }
@@ -1259,7 +1327,25 @@ impl Checker<'_> {
                 self.error_help(span, format!("`{name}` must initialise a bounded string"), format!("write `let s: str<N> = {name}(ptr);`"));
                 Ty::Unit
             }
-            ("drop" | "pass", []) => {
+            ("csum_update", [c, old, new]) => {
+                // RFC 1624 incremental update: all three are 16-bit words in
+                // the same byte order as the header fields honey reads.
+                for a in [c, old, new] {
+                    let t = self.expr(a);
+                    if !t.is_int() && t != Ty::Unit {
+                        self.error(a.span, format!("`csum_update` takes integers, found `{t}`"));
+                    }
+                }
+                Ty::U16
+            }
+            ("csum_update", _) => {
+                self.error_help(span, "`csum_update` takes three arguments", "`csum_update(old_csum, old_word, new_word)`");
+                for a in args {
+                    self.expr(a);
+                }
+                Ty::Unit
+            }
+            ("drop" | "pass" | "tx", []) => {
                 if self.probe_kind != Some(ProbeKind::Xdp) {
                     self.error_help(
                         span,
@@ -1269,7 +1355,7 @@ impl Checker<'_> {
                 }
                 Ty::Unit
             }
-            ("drop" | "pass", _) => {
+            ("drop" | "pass" | "tx", _) => {
                 self.error(span, format!("`{name}()` takes no arguments"));
                 Ty::Unit
             }
@@ -1370,6 +1456,52 @@ impl Checker<'_> {
                 }
                 (m, _) => {
                     self.error(method.span, format!("`pkt` has no method `{m}`; use `u8/u16/u32(off)`, `ipv6(off)`, `mac(off)`, `at(off)`, `view(expr)`, `ipv6_l4(off)`, `l4()`, or `len()`"));
+                    Ty::Unit
+                }
+            };
+        }
+
+        // Packet views: `tcp.opt(kind)`, `ip.fix_csum()`.
+        if let Some(Var { ty: Ty::PktPtr(sname), .. }) = self.lookup(rname).cloned() {
+            return match (method.name.as_str(), args) {
+                ("opt", [kind]) => {
+                    if sname != "tcphdr" {
+                        self.error_help(
+                            span,
+                            format!("`.opt(kind)` walks TCP options, but `{rname}` is a `ptr<{sname}>`"),
+                            "bind the TCP header first: `let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);`",
+                        );
+                    }
+                    if let Some(k) = self.const_eval(kind)
+                        && !(0..=255).contains(&k)
+                    {
+                        self.error(kind.span, "a TCP option kind is one byte (0..=255)");
+                    }
+                    Ty::OptionVal(Box::new(Ty::U32))
+                }
+                ("opt", _) => {
+                    self.error_help(span, "`.opt(kind)` takes one constant option kind", "e.g. `tcp.opt(2)` for MSS, `tcp.opt(3)` for window scale");
+                    Ty::Unit
+                }
+                ("fix_csum", []) => {
+                    if sname != "iphdr" {
+                        self.error_help(
+                            span,
+                            format!("`.fix_csum()` recomputes an IPv4 header checksum, but `{rname}` is a `ptr<{sname}>`"),
+                            "call it on the `ptr<iphdr>` view you wrote to",
+                        );
+                    }
+                    Ty::Unit
+                }
+                ("fix_csum", _) => {
+                    self.error(span, "`.fix_csum()` takes no arguments");
+                    Ty::Unit
+                }
+                (m, _) => {
+                    self.error_help(method.span, format!("packet view has no method `{m}`"), "views have `opt(kind)` on a `ptr<tcphdr>` and `fix_csum()` on a `ptr<iphdr>`");
+                    for a in args {
+                        self.expr(a);
+                    }
                     Ty::Unit
                 }
             };

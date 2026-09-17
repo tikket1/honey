@@ -286,7 +286,14 @@ impl Btf {
             let Some(t) = self.get(id) else { return false };
             match t.kind {
                 TYPEDEF => {
-                    if t.name.starts_with("__be") || t.name.starts_with("be") && t.name.len() <= 4 {
+                    // `__sum16`/`__wsum` are checksums stored as they sit on
+                    // the wire; reading them swapped keeps checksum arithmetic
+                    // in the same byte order as every other header field.
+                    if t.name.starts_with("__be")
+                        || t.name.starts_with("be") && t.name.len() <= 4
+                        || t.name == "__sum16"
+                        || t.name == "__wsum"
+                    {
                         return true;
                     }
                     id = t.size_or_type;

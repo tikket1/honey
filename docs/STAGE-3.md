@@ -81,6 +81,8 @@ commit that added it:
 | `examples/xdp_structs6.hny`    | `ptr<ipv6hdr>` view, `in6_addr` as `ipv6`, IPv6 `in_subnet`                   |
 | `examples/xdp_tcp4.hny`        | `ip.ihl` bitfield + `pkt.view(14 + ihl*4)` runtime-offset view of `tcphdr`   |
 | `examples/xdp_tcp6.hny`        | `pkt.ipv6_l4` extension-header walk + `pkt.l4()` (extension branches verifier-checked; test traffic has none) |
+| `examples/xdp_synopts.hny`     | `tcp.opt(kind)` through `if let`: MSS 65495, wscale 7, SACK ok, tsval from a loopback SYN |
+| `examples/xdp_pong.hny`        | packet writes (`eth.h_dest = eth.h_source`, `ip.ttl = 7`), `ip.fix_csum()`, `csum_update`, `tx()`: ping answered from XDP with `ttl=7`; without `fix_csum` the stack drops every reply |
 
 Supported: `const`; `map` (`hash<K, V>`, `array<V>`) with `.get`, `.insert`,
 `.delete`; `let`, assignment, `if`/`else`, `if let Some(x) = map.get(k)`,
@@ -90,12 +92,13 @@ sample in_subnet read_user_str read_kernel_str`); `*ptr`; unsigned and
 `i64` arithmetic/bitwise/comparison; `&&`/`||`/`!`; `str<N>` with
 `starts_with`, `byte_at`, `==`/`!=`; `ipv4`/`ipv6`/`mac` with `==`/`!=`;
 kernel struct reads via `ptr<S>`; packet views, bitfields, runtime views,
-the IPv6 walk.
+the IPv6 walk; packet writes through views, `fix_csum`, `csum_update`,
+`tcp.opt`, `tx`.
 
 Not supported (clear errors, never unverifiable bytecode): `as` casts,
 signed widths other than `i64`, `return <value>`, writing through map
 pointers, dynamic loop bounds, functions, more than one live runtime view,
-writing packet bytes.
+writing bitfields or raw packet offsets (writes go through a view's fields).
 
 ### Probe kinds and multiple probes
 

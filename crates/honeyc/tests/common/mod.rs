@@ -49,6 +49,12 @@ pub fn kernel_btf() -> Btf {
     let s_saddr = s("saddr", &mut strs);
     let s_daddr = s("daddr", &mut strs);
     let s_tcphdr = s("tcphdr", &mut strs);
+    let s_check = s("check", &mut strs);
+    let s_doff = s("doff", &mut strs);
+    let s_sum16 = s("__sum16", &mut strs);
+    let s_frame = s("frame", &mut strs);
+    let s_eth = s("eth", &mut strs);
+    let s_ip = s("ip", &mut strs);
     let s_source = s("source", &mut strs);
     let s_dest = s("dest", &mut strs);
     let s_path = s("path", &mut strs);
@@ -87,7 +93,7 @@ pub fn kernel_btf() -> Btf {
     // [13] INT u8 (1) named __u8-ish; [14] ARRAY of [13] x 6
     // [15] struct ethhdr { h_dest: [14]@0, h_source: [14]@6, h_proto: be16 @12 } size 14
     // [16] anonymous struct { saddr: be32 @0, daddr: be32 @4 } size 8
-    // [17] struct iphdr (kind_flag) { ihl: bitfield 4 bits @0, ttl: u8 @8, protocol: u8 @9, <anon>: [16] @12 } size 20
+    // [17] struct iphdr (kind_flag) { ihl: bitfield 4 bits @0, ttl: u8 @8, protocol: u8 @9, check: __sum16 @10, <anon>: [16] @12 } size 20
     const TYPEDEF: u32 = 8;
     const ARRAY: u32 = 3;
     push(&mut types, 0, info(INT, 0), 2);
@@ -109,18 +115,29 @@ pub fn kernel_btf() -> Btf {
     member(&mut types, s_daddr, 12, 4);
     // [17] iphdr with kind_flag: member offsets are (bitfield_size << 24) | bit_offset
     let kflag_info = |kind: u32, vlen: u32| (1u32 << 31) | (kind << 24) | vlen;
-    push(&mut types, s_iphdr, kflag_info(STRUCT, 4), 20);
+    push(&mut types, s_iphdr, kflag_info(STRUCT, 5), 20);
     // ihl: 4-bit bitfield at bit 0
     types.extend_from_slice(&s_ihl.to_le_bytes());
     types.extend_from_slice(&13u32.to_le_bytes());
     types.extend_from_slice(&(4u32 << 24).to_le_bytes());
     member(&mut types, s_ttl, 13, 8);
     member(&mut types, s_protocol, 13, 9);
+    member(&mut types, s_check, 19, 10);
     member(&mut types, 0, 16, 12); // anonymous union/struct holding saddr/daddr
-    // [18] struct tcphdr { source: be16 @0, dest: be16 @2 } size 20
-    push(&mut types, s_tcphdr, info(STRUCT, 2), 20);
+    // [18] struct tcphdr (kind_flag) { source: be16 @0, dest: be16 @2, doff: 4 bits @ bit 100, check: __sum16 @16 } size 20
+    push(&mut types, s_tcphdr, kflag_info(STRUCT, 4), 20);
     member(&mut types, s_source, 11, 0);
     member(&mut types, s_dest, 11, 2);
+    types.extend_from_slice(&s_doff.to_le_bytes());
+    types.extend_from_slice(&10u32.to_le_bytes());
+    types.extend_from_slice(&((4u32 << 24) | 100).to_le_bytes());
+    member(&mut types, s_check, 19, 16);
+    // [19] TYPEDEF __sum16 -> 10: a checksum, read swapped like __be16
+    push(&mut types, s_sum16, info(TYPEDEF, 0), 10);
+    // [20] struct frame { eth: ethhdr @0, ip: iphdr @14 } size 34: named embedded structs
+    push(&mut types, s_frame, info(STRUCT, 2), 34);
+    member(&mut types, s_eth, 15, 0);
+    member(&mut types, s_ip, 17, 14);
 
     let hdr_len = 24u32;
     let type_len = types.len() as u32;

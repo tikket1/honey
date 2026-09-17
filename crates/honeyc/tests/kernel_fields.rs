@@ -334,3 +334,129 @@ fn ipv6_walk_then_l4_view() {
     let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.l4();\n    emit E { a: 1, m: pkt.mac(0), b: tcp.dest == 22 };"));
     assert!(msg.contains("needs a preceding `pkt.ipv6_l4"), "{msg}");
 }
+
+// ---------------------------------------------------------- packet writes
+
+#[test]
+fn packet_writes_store_through_the_view() {
+    let text = asm_xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ttl = 7;\n    ip.saddr = 1;\n    eth.h_dest = eth.h_source;\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    // ttl: a plain byte store at 14 + 8
+    assert!(text.contains("stx8 [r7 +22], r0"), "{text}");
+    // saddr is __be32: swapped back to network order, then stored at 14 + 12
+    let lines: Vec<&str> = text.lines().collect();
+    let i = lines.iter().position(|l| l.contains("stx32 [r7 +26], r0")).expect("saddr store");
+    assert!(lines[i - 1].contains("bswap32 r0"), "{text}");
+    // h_dest = h_source: a 6-byte copy from offset 6 to offset 0
+    assert!(text.contains("ldx32 r0, [r7 +6]") && text.contains("stx32 [r7 +0], r0"), "{text}");
+    assert!(text.contains("ldx16 r0, [r7 +10]") && text.contains("stx16 [r7 +4], r0"), "{text}");
+}
+
+#[test]
+fn a_mac_literal_is_stored_as_immediates() {
+    let text = asm_xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = \"01:02:03:04:05:06\";\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    // 04030201 little-endian = 0x04030201 = 67305985, then 0x0605 = 1541
+    assert!(text.contains("67305985") && text.contains("stx32 [r7 +0], r0"), "{text}");
+    assert!(text.contains("1541") && text.contains("stx16 [r7 +4], r0"), "{text}");
+}
+
+#[test]
+fn packet_write_type_rules() {
+    // scalar width must match the field
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let x: u16 = 1;\n    ip.ttl = x;\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("expected `u8`, found `u16`"), "{msg}");
+    // bitfields are read-only
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ihl = 5;\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("cannot write the bitfield `ihl`"), "{msg}");
+    // blobs come from the packet, a blob local, or a literal
+    let msg = first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = 1;\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("a `mac` can only be written from the packet"), "{msg}");
+    let msg = first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = \"not a mac\";\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("is not a `mac` literal"), "{msg}");
+    // only packet views are writable
+    let msg = first("event E { a: u32 } probe kprobe(\"vfs_open\") { let f: ptr<file> = arg(1); f.f_flags = 1; emit E { a: 1 }; }");
+    assert!(msg.contains("cannot assign to a field of `ptr<file>`"), "{msg}");
+    // a literal that doesn't fit
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ttl = 300;\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("300 does not fit in `u8`"), "{msg}");
+}
+
+#[test]
+fn tx_is_an_xdp_verdict() {
+    let text = asm_xdp("    tx();");
+    assert!(text.contains("mov r0, 3"), "{text}");
+    let msg = first("event E { a: u32 } probe kprobe(\"f\") { tx(); emit E { a: 1 }; }");
+    assert!(msg.contains("`tx()` is only available in an `xdp` probe"), "{msg}");
+}
+
+#[test]
+fn embedded_structs_in_a_runtime_view_stay_relative_to_r9() {
+    let text = asm_xdp("    let f: ptr<frame> = pkt.view(0);\n    f.ip.ttl = 1;\n    emit E { a: f.ip.saddr, m: pkt.mac(6), b: f.eth.h_proto == 0x0800 };");
+    assert!(text.contains("stx8 [r9 +22], r0"), "{text}");
+    assert!(text.contains("ldx32 r0, [r9 +26]"), "{text}");
+    assert!(text.contains("ldx16 r0, [r9 +12]"), "{text}");
+    // only the raw pkt.mac read is relative to r7
+    assert_eq!(text.matches("[r7 +").count(), 2, "{text}");
+}
+
+// ------------------------------------------------------------- checksums
+
+#[test]
+fn fix_csum_zeroes_sums_and_stores_the_check_field() {
+    let text = asm_xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ttl = 7;\n    ip.fix_csum();\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    // r3 = r7 + 14; check (offset 10) is zeroed, then written from the folded sum
+    assert!(text.contains("add r3, 14"), "{text}");
+    assert!(text.contains("stx16 [r3 +10], r0") && text.contains("stx16 [r3 +10], r1"), "{text}");
+    // ten unconditional words, then twenty guarded option words
+    assert_eq!(text.matches("ldx16 r0, [r3 +").count(), 30, "{text}");
+    assert_eq!(text.matches("if r4 > r8 goto").count(), 20, "{text}");
+    let msg = first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.fix_csum();\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("`eth` is a `ptr<ethhdr>`"), "{msg}");
+}
+
+#[test]
+fn csum_update_is_a_u16_from_three_integers() {
+    check_ok(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 0x4000, 0x0700);\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 1);\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("takes three arguments"), "{msg}");
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let a: u32 = csum_update(ip.check, 1, 2);\n    emit E { a: a, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("expected `u32`, found `u16`"), "{msg}");
+    // the check field is __sum16: read and written swapped, like __be16
+    let text = asm_xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 1, 2);\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    assert!(text.contains("ldx16 r0, [r7 +24]"), "{text}");
+    assert!(text.contains("stx16 [r7 +24], r0"), "{text}");
+    assert_eq!(text.matches("bswap16 r0").count(), 2, "{text}");
+}
+
+// ----------------------------------------------------------- tcp options
+
+#[test]
+fn tcp_opt_is_an_option_value_bound_by_if_let() {
+    check_ok(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: mss, m: pkt.mac(0), b: true };\n    }"));
+    // the binding is a value, not a pointer
+    let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: *mss, m: pkt.mac(0), b: true };\n    }"));
+    assert!(msg.contains("cannot dereference `u32`"), "{msg}");
+    // it can't be used unchecked
+    let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    emit E { a: tcp.opt(2), m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("expected `u32`, found `Option<u32>`"), "{msg}");
+    // only on a tcphdr view, with a one-byte kind
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    if let Some(v) = ip.opt(2) { emit E { a: v, m: pkt.mac(0), b: true }; }"));
+    assert!(msg.contains("`ip` is a `ptr<iphdr>`"), "{msg}");
+    let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(v) = tcp.opt(256) { emit E { a: v, m: pkt.mac(0), b: true }; }"));
+    assert!(msg.contains("one byte (0..=255)"), "{msg}");
+}
+
+#[test]
+fn tcp_opt_walks_ten_bounded_hops() {
+    let text = asm_xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: mss, m: pkt.mac(0), b: true };\n    }");
+    // doff: the byte at 34 + 12, shifted by 4 and masked to 4 bits, times 4
+    assert!(text.contains("ldx8 r0, [r7 +46]") && text.contains("rsh r0, 4") && text.contains("and r0, 15"), "{text}");
+    assert!(text.contains("lsh r2, 2"), "{text}");
+    // one kind byte read per hop, each after a data_end check
+    assert_eq!(text.matches("ldx8 r5, [r3 +0]").count(), 10, "{text}");
+    assert_eq!(text.matches("if r5 > r8 goto").count(), 40, "{text}");
+    // the wanted kind, and the three data widths
+    assert_eq!(text.matches("if r5 != 2 goto").count(), 10, "{text}");
+    assert!(text.contains("ldx8 r0, [r3 +2]") && text.contains("ldx16 r0, [r3 +2]") && text.contains("ldx32 r0, [r3 +2]"), "{text}");
+    // the binding is stored, then the found flag decides the branch
+    assert!(text.contains("if r1 == 0 goto"), "{text}");
+}

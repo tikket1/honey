@@ -1,0 +1,11 @@
+// error: expected `u32`, found `Option<u32>`
+//
+// `tcp.opt(kind)` may find nothing. Like a map lookup it must go through
+// `if let Some(v) = ...`, so an absent option can never read as zero.
+
+event E { mss: u32 }
+
+probe xdp("lo") {
+    let tcp: ptr<tcphdr> = pkt.at(34);
+    emit E { mss: tcp.opt(2) };
+}

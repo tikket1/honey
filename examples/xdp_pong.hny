@@ -1,0 +1,57 @@
+// xdp_pong.hny — answer ICMP echo requests from XDP, without the kernel's
+// network stack ever seeing them.
+//
+// The first program that writes to the packet. Field assignment through a
+// view stores into the packet: scalars are swapped back to network order
+// when the kernel declares them `__be*`, MAC/IPv6 blobs are copied. Two
+// checksums have to be kept honest: `ip.fix_csum()` recomputes the IPv4
+// header checksum over `ihl * 4` bytes, and `csum_update` is the RFC 1624
+// incremental fix for the one 16-bit word of the ICMP header that changed
+// (type 8 -> 0). `tx()` bounces the rewritten packet out of the same
+// interface.
+//
+//   ./honey run examples/xdp_pong.hny --json
+//   ... then in the environment:  ping -c 3 127.0.0.1
+//
+// Replies show `ttl=7`: the reply came from this program, not from the
+// kernel. Drop the `ip.fix_csum()` line and the replies stop (the stack
+// discards the bad header), which is the checksum doing its job.
+
+event Pong {
+    src: ipv4,
+    dst: ipv4,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 1 {
+        return;
+    }
+    let icmp: ptr<icmphdr> = pkt.view(14 + ip.ihl * 4);
+    if icmp.type != 8 {
+        return;
+    }
+
+    // Ethernet: swap the addresses.
+    let mac = eth.h_dest;
+    eth.h_dest = eth.h_source;
+    eth.h_source = mac;
+
+    // IPv4: swap the addresses, stamp a TTL nobody else uses, recompute.
+    let src = ip.saddr;
+    ip.saddr = ip.daddr;
+    ip.daddr = src;
+    ip.ttl = 7;
+    ip.fix_csum();
+
+    // ICMP: echo request becomes echo reply; patch the checksum for it.
+    icmp.type = 0;
+    icmp.checksum = csum_update(icmp.checksum, 0x0800, 0x0000);
+
+    emit Pong { src: src, dst: ip.saddr };
+    tx();
+}

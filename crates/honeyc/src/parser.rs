@@ -417,7 +417,7 @@ impl Parser {
         let e = self.expr()?;
         if self.eat(&TokenKind::Eq) {
             if !is_place(&e) {
-                return self.error("invalid assignment target: expected a name or `*name`", e.span);
+                return self.error("invalid assignment target: expected a name, `*name`, or `view.field`", e.span);
             }
             let value = self.expr()?;
             self.expect(TokenKind::Semi, "`;`")?;
@@ -583,6 +583,8 @@ fn is_place(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Ident(_) => true,
         ExprKind::Unary { op: UnaryOp::Deref, expr } => matches!(expr.kind, ExprKind::Ident(_)),
+        // `view.field = v` (the type checker decides whether the view is writable)
+        ExprKind::Field { expr, .. } => matches!(expr.kind, ExprKind::Ident(_) | ExprKind::Field { .. }),
         _ => false,
     }
 }
