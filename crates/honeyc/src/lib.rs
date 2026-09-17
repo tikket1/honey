@@ -1,16 +1,20 @@
 //! honeyc — the honey compiler.
 //!
-//! Pipeline (one module per stage, added as each stage is built):
+//!   source text ─lexer→ tokens ─parser→ AST ─codegen→ BPF bytecode
 //!
-//!   source text ──lexer──▶ tokens ──parser──▶ AST ──typeck──▶ typed AST ──codegen──▶ BPF bytecode
-//!
-//! - `token`  : the token vocabulary (lexer ⇄ parser contract)
-//! - `lexer`  : stage 1, text → tokens
-//! - `ast`    : the tree shape (parser ⇄ later stages contract)
-//! - `parser` : stage 2, tokens → AST
-//! - `pretty` : AST → text, for debugging and round-trip tests
+//! - `token`   : token vocabulary (lexer ⇄ parser contract)
+//! - `lexer`   : stage 1, text → tokens
+//! - `ast`     : the tree shape (parser ⇄ later stages contract)
+//! - `parser`  : stage 2, tokens → AST
+//! - `pretty`  : AST → text, for debugging and round-trip tests
+//! - `bpf`     : eBPF instruction encoding + disassembly (the machine)
+//! - `layout`  : event record byte layout
+//! - `codegen` : stage 3, AST → BPF bytecode (first slice)
 
 pub mod ast;
+pub mod bpf;
+pub mod codegen;
+pub mod layout;
 pub mod lexer;
 pub mod parser;
 pub mod pretty;

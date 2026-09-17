@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run a command inside the honey Linux environment (a privileged container on
+# Docker Desktop's kernel), with the repo mounted at /work and tracefs +
+# debugfs available so BPF programs can attach to tracepoints.
+#
+#   linux/honey-linux                 # interactive shell
+#   linux/honey-linux make -C linux   # build the loader
+#   linux/honey-linux ./linux/run.sh exec.bin exec.json
+#
+# Requires Docker Desktop running. Builds the image on first use.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE=honey-linux:latest
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "building $IMAGE (first run only)..." >&2
+    docker build -t "$IMAGE" "$REPO/linux"
+fi
+
+exec docker run --rm -it \
+    --privileged \
+    --pid=host \
+    -v "$REPO:/work" \
+    -w /work \
+    "$IMAGE" \
+    bash -c 'mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null || true; mount -t debugfs nodev /sys/kernel/debug 2>/dev/null || true; exec "$0" "$@"' "${@:-bash}"
