@@ -17,7 +17,11 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker build -t "$IMAGE" "$REPO/linux"
 fi
 
-exec docker run --rm -it \
+# Interactive only when we actually have a terminal (so scripts and CI work).
+TTY_FLAGS="-i"
+[ -t 0 ] && [ -t 1 ] && TTY_FLAGS="-it"
+
+exec docker run --rm $TTY_FLAGS \
     --privileged \
     --pid=host \
     -v "$REPO:/work" \

@@ -111,6 +111,19 @@ pub enum ProbeKind {
 const XDP_DROP: i32 = 1;
 const XDP_PASS: i32 = 2;
 
+/// USDT argument spec, one per probe program, filled in by the loader from
+/// the marker's note. Six args of 16 bytes:
+///   +0 kind (0 none, 1 register, 2 memory via register, 3 constant)
+///   +1 signed (0/1)          +2 shift (64 - 8*size, to extract the low bytes)
+///   +4 reg_off (u16, byte offset of the register in pt_regs)
+///   +8 val (i64: memory offset for kind 2, the value for kind 3)
+pub const USDT_ARG_SIZE: u32 = 16;
+pub const USDT_MAX_ARGS: u32 = 6;
+pub const USDT_SPEC_SIZE: u32 = USDT_ARG_SIZE * USDT_MAX_ARGS;
+const USDT_KIND_NONE: i32 = 0;
+const USDT_KIND_MEM: i32 = 2;
+const USDT_KIND_CONST: i32 = 3;
+
 /// A field-offset relocation: instruction slot `slot` carries the byte
 /// offset of `struct_name.field`, resolved at compile time from BTF. The
 /// loader re-resolves it against the running kernel and rewrites the imm.
@@ -241,6 +254,8 @@ struct Shared<'a> {
     btf: Option<&'a Btf>,
     /// Map index of the hidden sampling counter array, if any `sample()` used.
     sample_map: Option<i32>,
+    /// Map index of the hidden USDT argument-spec array, if any usdt probe.
+    usdt_map: Option<i32>,
 }
 
 
@@ -259,6 +274,8 @@ struct Cg<'a> {
     relocs: Vec<(usize, String, String)>,
     /// Running counter that assigns each `sample()` site its map slot.
     sample_next: &'a mut u32,
+    /// This program's index in the manifest (key into the USDT spec map).
+    prog_index: u32,
 }
 
 // -------------------------------------------------------------------- entry
@@ -278,6 +295,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
         arch,
         btf,
         sample_map: None,
+        usdt_map: None,
     };
     let mut probes = Vec::new();
 
@@ -319,9 +337,23 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
         });
     }
 
+    // USDT: one argument spec per program (keyed by program index), filled
+    // in by the loader from the marker's note.
+    if probes.iter().any(|p| p.kind.name == "usdt") {
+        let idx = (sh.maps.len() as i32) + 1;
+        sh.usdt_map = Some(idx);
+        sh.maps.push(MapSpec {
+            name: "__honey_usdt".into(),
+            kind: MapKind::Array,
+            key_size: 4,
+            value_size: USDT_SPEC_SIZE,
+            max_entries: probes.len() as u32,
+        });
+    }
+
     let mut programs = Vec::new();
     let mut sample_next: u32 = 0;
-    for p in probes {
+    for (prog_index, p) in probes.into_iter().enumerate() {
         let kind = match (p.kind.name.as_str(), p.args.as_slice()) {
             ("tracepoint", [c, n]) => ProbeKind::Tracepoint { category: c.clone(), name: n.clone() },
             ("kprobe", [f]) => ProbeKind::Kprobe { function: f.clone() },
@@ -343,7 +375,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ProbeKind::Uretprobe { target } => format!("uretprobe:{target}"),
             ProbeKind::Usdt { target } => format!("usdt:{target}"),
         };
-        let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p, &mut sample_next)?;
+        let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p, &mut sample_next, prog_index as u32)?;
         programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs });
     }
 
@@ -359,7 +391,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
     })
 }
 
-fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut u32) -> Result<(Vec<u8>, u32, Vec<Reloc>), String> {
+fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut u32, prog_index: u32) -> Result<(Vec<u8>, u32, Vec<Reloc>), String> {
     let mut prog = Prog::new();
     let exit_label = prog.new_label();
     let mut cg = Cg {
@@ -374,6 +406,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut
         ctx_slot: 0,
         relocs: Vec::new(),
         sample_next,
+        prog_index,
     };
 
     // Prologue: save the context pointer (R1) for `arg` / `retval`.
@@ -1359,7 +1392,10 @@ impl Cg<'_> {
                         return Err("`arg()` is not available in an xdp probe".into());
                     }
                     ProbeKind::Usdt { .. } => {
-                        return Err("`arg()` is not available in a usdt probe yet".into());
+                        if !(0..USDT_MAX_ARGS as i64).contains(&n) {
+                            return Err(format!("usdt arg index {n} out of range (0..{})", USDT_MAX_ARGS - 1));
+                        }
+                        return self.emit_usdt_arg(n as u32);
                     }
                 };
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot));
@@ -1450,6 +1486,82 @@ impl Cg<'_> {
             }
             (m, a) => Err(format!("`pkt` has no method `{m}` taking {} argument(s)", a.len())),
         }
+    }
+
+    /// `arg(n)` in a usdt probe: a generic read driven by the per-probe spec
+    /// the loader filled in (see `USDT_SPEC_SIZE`). At runtime: fetch the
+    /// spec, and depending on the arg's kind read a register out of pt_regs
+    /// (via probe_read_kernel on ctx + reg_off), optionally dereference it
+    /// in user memory, then shift to extract the sized value with the right
+    /// signedness. Mirrors libbpf's usdt.bpf.h. Result in R0 as a u64.
+    fn emit_usdt_arg(&mut self, n: u32) -> Result<Ty, String> {
+        let map_idx = self.sh.usdt_map.ok_or("internal: usdt spec map not reserved")?;
+        let base = (USDT_ARG_SIZE * n) as i16;
+        let zero = self.prog.new_label();
+        let done = self.prog.new_label();
+        let notconst = self.prog.new_label();
+        let shift = self.prog.new_label();
+        let unsigned = self.prog.new_label();
+
+        // r0 = spec = lookup(usdt_map, &prog_index)
+        let kslot = self.alloc_slot();
+        self.prog.push(st_mem(Size::W, Reg::R10, kslot, self.prog_index as i32));
+        self.prog.push(ld_map_fd(Reg::R1, map_idx));
+        self.prog.push(mov64_reg(Reg::R2, Reg::R10));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R2, kslot as i32));
+        self.prog.push(call(Helper::MapLookupElem));
+        self.free_slot();
+        self.prog.jmp_imm_to(JmpOp::Eq, Reg::R0, 0, zero);
+        // r9 = spec (callee-saved: survives the helper calls below)
+        self.prog.push(mov64_reg(Reg::R9, Reg::R0));
+
+        // kind
+        self.prog.push(ldx_mem(Size::B, Reg::R1, Reg::R9, base));
+        self.prog.jmp_imm_to(JmpOp::Eq, Reg::R1, USDT_KIND_NONE, zero);
+        self.prog.jmp_imm_to(JmpOp::Ne, Reg::R1, USDT_KIND_CONST, notconst);
+        self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R9, base + 8)); // constant value
+        self.prog.ja_to(done);
+
+        // register: probe_read_kernel(&tmp, 8, ctx + reg_off)
+        self.prog.bind(notconst);
+        let tmp = self.alloc_slot();
+        self.prog.push(ldx_mem(Size::H, Reg::R2, Reg::R9, base + 4));
+        self.prog.push(ldx_mem(Size::DW, Reg::R3, Reg::R10, self.ctx_slot));
+        self.prog.push(alu64_reg(AluOp::Add, Reg::R3, Reg::R2));
+        self.prog.push(mov64_reg(Reg::R1, Reg::R10));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R1, tmp as i32));
+        self.prog.push(mov64_imm(Reg::R2, 8));
+        self.prog.push(call(Helper::ProbeReadKernel));
+        self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, tmp));
+
+        // memory: probe_read_user(&tmp, 8, reg + val)
+        self.prog.push(ldx_mem(Size::B, Reg::R1, Reg::R9, base));
+        self.prog.jmp_imm_to(JmpOp::Ne, Reg::R1, USDT_KIND_MEM, shift);
+        self.prog.push(ldx_mem(Size::DW, Reg::R3, Reg::R9, base + 8));
+        self.prog.push(alu64_reg(AluOp::Add, Reg::R3, Reg::R0));
+        self.prog.push(mov64_reg(Reg::R1, Reg::R10));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R1, tmp as i32));
+        self.prog.push(mov64_imm(Reg::R2, 8));
+        self.prog.push(call(Helper::ProbeReadUser));
+        self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, tmp));
+
+        // extract the sized value: val <<= shift; signed ? arsh : rsh
+        self.prog.bind(shift);
+        self.free_slot();
+        self.prog.push(ldx_mem(Size::B, Reg::R4, Reg::R9, base + 2));
+        self.prog.push(alu64_reg(AluOp::Lsh, Reg::R0, Reg::R4));
+        self.prog.push(ldx_mem(Size::B, Reg::R1, Reg::R9, base + 1));
+        self.prog.jmp_imm_to(JmpOp::Eq, Reg::R1, 0, unsigned);
+        self.prog.push(alu64_reg(AluOp::Arsh, Reg::R0, Reg::R4));
+        self.prog.ja_to(done);
+        self.prog.bind(unsigned);
+        self.prog.push(alu64_reg(AluOp::Rsh, Reg::R0, Reg::R4));
+        self.prog.ja_to(done);
+
+        self.prog.bind(zero);
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.bind(done);
+        Ok(Ty::Uint(8))
     }
 
     /// `sample(N)`: true on 1 of every N calls. Backed by a per-site counter

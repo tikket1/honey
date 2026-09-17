@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# honey — the one-shot front end.
+#
+#   ./honey run   probe.hny [--json] [--arch X]   compile, then load & run it
+#                                                  against the Linux environment
+#   ./honey check probe.hny                        type-check only
+#   ./honey build probe.hny [-o out] [--arch X]    compile to build/<name>.{bin,json}
+#   ./honey asm   probe.hny [--arch X]             show the BPF assembly
+#
+# If the probe reads kernel struct fields (`ptr<...>`), the kernel's BTF is
+# needed; `run`/`build`/`check` pass build/vmlinux.btf automatically and
+# export it first if it is missing (needs Docker Desktop).
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO"
+
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 2 ] || usage
+cmd="$1"; file="$2"; shift 2
+[ -f "$file" ] || { echo "honey: no such file: $file" >&2; exit 1; }
+
+json=""; extra=()
+for a in "$@"; do
+    case "$a" in
+        --json) json="--json" ;;
+        *) extra+=("$a") ;;
+    esac
+done
+
+btf_flag=()
+needs_btf() { grep -qE 'ptr<' "$file"; }
+ensure_btf() {
+    if needs_btf; then
+        if [ ! -f build/vmlinux.btf ]; then
+            echo "honey: exporting the kernel's BTF (build/vmlinux.btf)..." >&2
+            linux/export-btf >/dev/null
+        fi
+        btf_flag=(--btf build/vmlinux.btf)
+    fi
+}
+
+name="$(basename "${file%.*}")"
+out="build/$name"
+mkdir -p build
+
+case "$cmd" in
+    check)
+        ensure_btf
+        exec cargo run -q -- check "$file" ${btf_flag[@]+"${btf_flag[@]}"} ${extra[@]+"${extra[@]}"}
+        ;;
+    build)
+        ensure_btf
+        exec cargo run -q -- build "$file" -o "$out" ${btf_flag[@]+"${btf_flag[@]}"} ${extra[@]+"${extra[@]}"}
+        ;;
+    asm)
+        ensure_btf
+        exec cargo run -q -- --asm "$file" ${btf_flag[@]+"${btf_flag[@]}"} ${extra[@]+"${extra[@]}"}
+        ;;
+    run)
+        ensure_btf
+        cargo run -q -- build "$file" -o "$out" ${btf_flag[@]+"${btf_flag[@]}"} ${extra[@]+"${extra[@]}"}
+        echo "honey: loading $out into the kernel (Ctrl-C to stop)" >&2
+        exec linux/honey-linux ./linux/run.sh $json "$out.bin" "$out.json"
+        ;;
+    *) usage ;;
+esac

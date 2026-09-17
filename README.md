@@ -13,9 +13,9 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 ```
 
 Status: **v1 complete: tracepoints, kprobes (with kernel struct-field reads),
-uprobes and USDT markers, LSM enforcement, XDP packet filtering, sampling,
-string equality, multi-probe programs, and JSON output with typed fields
-(`ipv4` prints as a dotted quad).** Every example
+uprobes and USDT markers with their arguments, LSM enforcement, XDP packet
+filtering, sampling, string equality, multi-probe programs, JSON output with
+typed fields (`ipv4` prints as a dotted quad), and a `./honey run` one-shot.** Every example
 compiles to eBPF bytecode the kernel verifier accepts and the loader prints live
 events (text, or `--json` for a log pipeline). The stage 4 type checker turns every verifier rule into an error
 at your source line; `examples/bad/` holds one program per rule, each rejected with a
@@ -29,6 +29,15 @@ reports only the opens of `/etc/shadow` that *succeeded*. `examples/lsm_block_ui
 structs from a kprobe argument (`path -> dentry -> d_name -> name`) to print the
 filename of every open, with offsets resolved from BTF so the probe survives a
 kernel upgrade.
+
+## Try it
+
+```bash
+./honey run examples/exec_shell.hny --json     # compile, load, print events; Ctrl-C to stop
+./honey check examples/bad/unchecked_map.hny   # see a verifier rule caught at the source line
+```
+
+Needs Rust and Docker Desktop (its Linux kernel is what the probes run in).
 
 ## The idea in one screen
 
@@ -52,6 +61,7 @@ budgeted at compile time, and integer widths never convert silently.
 ## Layout
 
 ```
+honey                the one-shot front end: ./honey run|check|build|asm <file>
 crates/honeyc/        the compiler (Rust, no dependencies)
   src/token.rs       token vocabulary — the lexer/parser contract
   src/lexer.rs       stage 1, done
@@ -66,7 +76,7 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (42)
+  tests/codegen.rs   stage 3 acceptance tests (44)
   tests/typeck.rs    stage 4 acceptance tests (53)
   tests/kernel_fields.rs  struct-field read tests (10, synthetic BTF)
 linux/               the Linux side (build + run against a real kernel)
@@ -83,7 +93,7 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 218 tests
+cargo test                                  # 220 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
@@ -125,8 +135,9 @@ buffers.
    budget, bounded reads: illegal-to-verify becomes illegal-to-typecheck.
 
 All four stages are in place, plus kprobes/kretprobes and multi-probe programs.
-The v1 feature list is done. Natural next steps: USDT argument access, IPv6
-and MAC field types, and a `honey run` one-shot command that builds and loads.
+The v1 feature list is done, including USDT arguments and the `./honey run`
+one-shot. Natural next steps: IPv6 and MAC field types, and struct-field
+reads in XDP.
 
 ## Prior art
 

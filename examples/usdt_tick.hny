@@ -1,21 +1,26 @@
-// usdt_tick.hny — fire on a USDT marker compiled into a user program.
+// usdt_tick.hny — fire on a USDT marker compiled into a user program, and
+// read its arguments.
 //
 // Applications like Python, PostgreSQL and node ship static markers
 // (`provider:name`) at interesting points, recorded in the binary's ELF
-// notes. A `usdt` probe attaches to one by name; the loader finds the
-// marker's address in the notes and, if the program declared a semaphore,
-// the kernel increments it so the program knows a probe is attached.
+// notes along with where each argument lives (a register or a stack slot).
+// A `usdt` probe attaches to one by name; the loader reads the note, turns
+// the argument locations into a spec, and `arg(n)` reads them at runtime.
+// If the program declared a semaphore, the kernel increments it so the
+// program knows a probe is attached.
 //
 //   linux/honey-linux make -C linux usdt_demo          # the demo program
-//   honeyc build examples/usdt_tick.hny -o build/usdt
-//   linux/honey-linux ./linux/run.sh --json build/usdt.bin build/usdt.json
+//   ./honey run examples/usdt_tick.hny --json
 //   ... and in another shell in the environment: ./linux/usdt_demo
 
 event Tick {
     pid: u32,
     comm: str<16>,
+    n: u64,
+    msg: str<16>,
 }
 
 probe usdt("/work/linux/usdt_demo:honey:tick") {
-    emit Tick { pid: pid(), comm: comm() };
+    let msg: str<16> = read_user_str(arg(1));
+    emit Tick { pid: pid(), comm: comm(), n: arg(0), msg: msg };
 }

@@ -1,7 +1,0 @@
-// error: `arg()` is not available in a `usdt` probe yet
-
-event E { a: u64 }
-
-probe usdt("/usr/bin/python3:python:function__entry") {
-    emit E { a: arg(0) };
-}

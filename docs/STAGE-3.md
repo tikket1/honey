@@ -122,6 +122,18 @@ attr's `config` bits 32..63 (`ref_ctr_offset`) and the kernel increments the
 counter in every process running the binary while the probe is attached —
 `linux/usdt_demo.c` prints "probe enabled" exactly then.
 
+**USDT arguments** are the one place codegen cannot know the answer at
+compile time: the note's argument string (`-4@x19 8@x24` on aarch64,
+`-4@%eax 8@-8(%rbp)` on x86_64) is per binary and per build. honey follows
+libbpf's design. Codegen emits a *generic* read for `arg(n)`: look up this
+program's 96-byte spec in the hidden `__honey_usdt` array map (keyed by
+program index), and per the arg's kind either take a constant, read a
+register out of `pt_regs` (`bpf_probe_read_kernel` of `ctx + reg_off`),
+or read a register and dereference it in user memory
+(`bpf_probe_read_user`), then shift left and right to extract the sized,
+correctly signed value. The loader parses the note's operands per
+architecture into that spec and writes it to the map before attaching.
+
 The loader prints `ipv4` fields as dotted quads; honey byte-swapped the value
 on read, so the high byte is the first octet.
 

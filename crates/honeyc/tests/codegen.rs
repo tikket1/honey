@@ -552,3 +552,37 @@ fn ipv4_field_is_four_bytes_stored_as_a_word() {
     let text = disasm_bytes(&c.programs[0].bytecode);
     assert!(text.contains("stx32 [r6 +8], r0"), "ipv4 stored as a 32-bit word past the header\n{text}");
 }
+
+// ------------------------------------------------------------- usdt args
+
+#[test]
+fn usdt_reserves_one_arg_spec_per_program() {
+    let src = "event E { a: u64 } probe usdt(\"/b:p:n\") { emit E { a: arg(0) }; } probe kprobe(\"f\") { emit E { a: arg(0) }; }";
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    let m = c.maps.iter().find(|m| m.name == "__honey_usdt").expect("hidden usdt spec map");
+    assert_eq!(m.kind, honeyc::codegen::MapKind::Array);
+    assert_eq!(m.value_size, honeyc::codegen::USDT_SPEC_SIZE);
+    assert_eq!(m.max_entries, 2, "keyed by program index, so one per program");
+    // no spec map when there is no usdt probe
+    let c2 = compile(&parse(EXEC).unwrap(), Arch::Aarch64).unwrap();
+    assert!(!c2.maps.iter().any(|m| m.name == "__honey_usdt"));
+}
+
+#[test]
+fn usdt_arg_is_a_spec_driven_read() {
+    let src = "event E { a: u64 } probe usdt(\"/b:p:n\") { emit E { a: arg(2) }; }";
+    let text = asm_helper(src);
+    // spec lookup keyed by this program's index (0), kept in r9
+    assert!(text.contains("st32 [r10 -"), "{text}");
+    assert!(text.contains("call 1"), "map_lookup_elem\n{text}");
+    assert!(text.contains("mov r9, r0"), "{text}");
+    // arg 2's spec lives 32 bytes in: kind at +32, signed +33, shift +34, reg_off +36, val +40
+    assert!(text.contains("ldx8 r1, [r9 +32]"), "kind\n{text}");
+    assert!(text.contains("ldx16 r2, [r9 +36]"), "reg_off\n{text}");
+    assert!(text.contains("ldx64 r0, [r9 +40]"), "const value\n{text}");
+    // register read from ctx, then optional user deref, then sized extract
+    assert!(text.contains("call 113"), "probe_read_kernel of the register\n{text}");
+    assert!(text.contains("call 112"), "probe_read_user for memory operands\n{text}");
+    assert!(text.contains("lsh r0, r4") && text.contains("arsh r0, r4") && text.contains("rsh r0, r4"), "{text}");
+}

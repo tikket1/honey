@@ -1019,13 +1019,6 @@ impl Checker<'_> {
                 Ty::Str(16)
             }
             ("arg", [idx]) => {
-                if self.probe_kind == Some(ProbeKind::Usdt) {
-                    self.error_help(
-                        span,
-                        "`arg()` is not available in a `usdt` probe yet",
-                        "USDT arguments live in registers or stack slots described per probe; honey v1 gives you the marker plus process context (`pid()`, `comm()`, `sample()`)",
-                    );
-                }
                 if matches!(self.probe_kind, Some(ProbeKind::Kretprobe) | Some(ProbeKind::Uretprobe)) {
                     self.error_help(
                         span,

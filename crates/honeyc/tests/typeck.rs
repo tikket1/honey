@@ -541,9 +541,10 @@ fn usdt_target_shape_and_context() {
     ok("event E { p: u32, c: str<16> } probe usdt(\"/usr/bin/python3:python:function__entry\") { emit E { p: pid(), c: comm() }; }");
     let msg = first_message("event E { p: u32 } probe usdt(\"/usr/bin/python3:function__entry\") { emit E { p: pid() }; }");
     assert!(msg.contains("usdt target must be `path:provider:name`"), "{msg}");
-    let ds = diags("event E { a: u64 } probe usdt(\"/b:p:n\") { emit E { a: arg(0) }; }");
-    assert!(ds[0].message.contains("`arg()` is not available in a `usdt` probe yet"), "{ds:#?}");
-    assert!(ds[0].help.as_deref().unwrap().contains("process context"));
+    // arguments come from the marker's note, via a runtime spec
+    ok("event E { a: u64, s: str<16> } probe usdt(\"/b:p:n\") { let s: str<16> = read_user_str(arg(1)); emit E { a: arg(0), s: s }; }");
+    let msg = first_message("event E { a: u64 } probe usdt(\"/b:p:n\") { emit E { a: arg(6) }; }");
+    assert!(msg.contains("arguments 0 to 5"), "{msg}");
     ok("event E { p: u32 } probe usdt(\"/b:p:n\") { if sample(10) { emit E { p: pid() }; } }");
 }
 

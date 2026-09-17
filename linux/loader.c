@@ -304,6 +304,7 @@ static int attach_uprobe(const char *target, int retprobe, int prog_fd) {
 // is how the program knows to prepare the marker's arguments.
 struct usdt_note {
     uint64_t pc, base, sema;
+    char args[256];
 };
 
 static int elf_find_usdt(const char *path, const char *provider, const char *name, struct usdt_note *out) {
@@ -336,7 +337,12 @@ static int elf_find_usdt(const char *path, const char *provider, const char *nam
             memcpy(&n.pc, d, 8); memcpy(&n.base, d + 8, 8); memcpy(&n.sema, d + 16, 8);
             const char *prov = (const char *)d + 24;
             const char *nm = prov + strlen(prov) + 1;
-            if (strcmp(prov, provider) == 0 && strcmp(nm, name) == 0) { *out = n; found = 1; }
+            if (strcmp(prov, provider) == 0 && strcmp(nm, name) == 0) {
+                const char *args = nm + strlen(nm) + 1;
+                *out = n;
+                snprintf(out->args, sizeof out->args, "%s", args);
+                found = 1;
+            }
         }
     }
     // Prelink correction: if .stapsdt.base moved, the marker moved with it.
@@ -371,7 +377,120 @@ static long elf_vaddr_to_offset(const char *path, uint64_t vaddr) {
     return off;
 }
 
-static int attach_usdt(const char *target, int prog_fd) {
+// ---- USDT argument specs ------------------------------------------------
+//
+// The note describes each argument as `[-]N@operand`: N is the size in
+// bytes, a leading '-' means signed, and the operand is a register, a memory
+// reference through a register, or a constant, in the architecture's
+// assembler syntax. We translate each into the 16-byte spec honey's codegen
+// expects (see codegen.rs USDT_SPEC_SIZE) and write one spec per program
+// into the hidden __honey_usdt map.
+
+#define USDT_ARG_SIZE 16
+#define USDT_MAX_ARGS 6
+#define USDT_SPEC_SIZE (USDT_ARG_SIZE * USDT_MAX_ARGS)
+enum { USDT_NONE = 0, USDT_REG = 1, USDT_MEM = 2, USDT_CONST = 3 };
+
+struct usdt_arg_spec {
+    uint8_t kind, is_signed, shift, pad;
+    uint16_t reg_off, pad2;
+    int64_t val;
+};
+
+// Byte offset of a named register in struct pt_regs for this machine.
+static int reg_offset(const char *arch, const char *reg) {
+    if (strcmp(arch, "aarch64") == 0) {
+        // x0..x30 / w0..w30 -> regs[n] at 8n; sp -> after regs[31]
+        if ((reg[0] == 'x' || reg[0] == 'w') && reg[1] >= '0' && reg[1] <= '9') return 8 * atoi(reg + 1);
+        if (strcmp(reg, "sp") == 0) return 8 * 31;
+        return -1;
+    }
+    // x86_64: strip a leading '%', map full and sub-registers to their slot
+    if (reg[0] == '%') reg++;
+    static const struct { const char *n; int off; } t[] = {
+        {"r15",0},{"r14",8},{"r13",16},{"r12",24},{"rbp",32},{"rbx",40},{"r11",48},{"r10",56},
+        {"r9",64},{"r8",72},{"rax",80},{"rcx",88},{"rdx",96},{"rsi",104},{"rdi",112},{"rsp",152},
+        {"eax",80},{"ebx",40},{"ecx",88},{"edx",96},{"esi",104},{"edi",112},{"ebp",32},{"esp",152},
+        {"ax",80},{"bx",40},{"cx",88},{"dx",96},{"si",104},{"di",112},{"al",80},{"bl",40},{"cl",88},{"dl",96},
+        {"r8d",72},{"r9d",64},{"r10d",56},{"r11d",48},{"r12d",24},{"r13d",16},{"r14d",8},{"r15d",0},
+        {"r8w",72},{"r9w",64},{"r10w",56},{"r11w",48},{"r12w",24},{"r13w",16},{"r14w",8},{"r15w",0},
+        {"r8b",72},{"r9b",64},{"r10b",56},{"r11b",48},{"r12b",24},{"r13b",16},{"r14b",8},{"r15b",0},
+    };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) if (strcmp(t[i].n, reg) == 0) return t[i].off;
+    return -1;
+}
+
+// Parse one operand into a spec. Returns 0 on success.
+static int parse_operand(const char *arch, const char *op, struct usdt_arg_spec *sp) {
+    char reg[16];
+    long off = 0;
+    if (strcmp(arch, "aarch64") == 0) {
+        // [xN], [xN, off], [sp, off]
+        if (op[0] == '[') {
+            const char *p = op + 1;
+            size_t k = 0;
+            while (*p && *p != ']' && *p != ',' && k + 1 < sizeof reg) reg[k++] = *p++;
+            reg[k] = 0;
+            if (*p == ',') off = strtol(p + 1, NULL, 0);
+            int ro = reg_offset(arch, reg);
+            if (ro < 0) return -1;
+            sp->kind = USDT_MEM; sp->reg_off = ro; sp->val = off;
+            return 0;
+        }
+        if (op[0] == '#') { sp->kind = USDT_CONST; sp->val = strtoll(op + 1, NULL, 0); return 0; }
+        if ((op[0] >= '0' && op[0] <= '9') || op[0] == '-') { sp->kind = USDT_CONST; sp->val = strtoll(op, NULL, 0); return 0; }
+        int ro = reg_offset(arch, op);
+        if (ro < 0) return -1;
+        sp->kind = USDT_REG; sp->reg_off = ro;
+        return 0;
+    }
+    // x86_64: $const, %reg, off(%reg), (%reg)
+    if (op[0] == '$') { sp->kind = USDT_CONST; sp->val = strtoll(op + 1, NULL, 0); return 0; }
+    const char *paren = strchr(op, '(');
+    if (paren) {
+        off = (paren == op) ? 0 : strtol(op, NULL, 0);
+        const char *p = paren + 1;
+        size_t k = 0;
+        while (*p && *p != ')' && k + 1 < sizeof reg) reg[k++] = *p++;
+        reg[k] = 0;
+        int ro = reg_offset(arch, reg);
+        if (ro < 0) return -1;
+        sp->kind = USDT_MEM; sp->reg_off = ro; sp->val = off;
+        return 0;
+    }
+    int ro = reg_offset(arch, op);
+    if (ro < 0) return -1;
+    sp->kind = USDT_REG; sp->reg_off = ro;
+    return 0;
+}
+
+// Parse the whole args string into a spec block. Unparseable args are left
+// as kind NONE (arg(n) then reads 0) with a warning, rather than failing.
+static void build_usdt_spec(const char *arch, const char *args, uint8_t *spec) {
+    memset(spec, 0, USDT_SPEC_SIZE);
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", args);
+    int n = 0;
+    for (char *tok = strtok(buf, " \t"); tok && n < USDT_MAX_ARGS; tok = strtok(NULL, " \t"), n++) {
+        struct usdt_arg_spec sp = {0};
+        const char *p = tok;
+        if (*p == '-') { sp.is_signed = 1; p++; }
+        int size = atoi(p);
+        const char *at = strchr(p, '@');
+        if (!at || (size != 1 && size != 2 && size != 4 && size != 8)) {
+            fprintf(stderr, "usdt: cannot parse arg %d `%s`\n", n, tok);
+            continue;
+        }
+        sp.shift = (uint8_t)(64 - 8 * size);
+        if (parse_operand(arch, at + 1, &sp) < 0) {
+            fprintf(stderr, "usdt: unsupported operand for arg %d: `%s`\n", n, at + 1);
+            continue;
+        }
+        memcpy(spec + n * USDT_ARG_SIZE, &sp, USDT_ARG_SIZE);
+    }
+}
+
+static int attach_usdt(const char *target, int prog_fd, int usdt_map_fd, uint32_t prog_index, const char *arch) {
     // target is "path:provider:name"
     char buf[256];
     snprintf(buf, sizeof buf, "%s", target);
@@ -385,6 +504,14 @@ static int attach_usdt(const char *target, int prog_fd) {
 
     struct usdt_note n = {0};
     if (elf_find_usdt(path, provider, name, &n) < 0) return -1;
+    if (usdt_map_fd >= 0) {
+        uint8_t spec[USDT_SPEC_SIZE];
+        build_usdt_spec(arch, n.args, spec);
+        if (bpf_map_update_elem(usdt_map_fd, &prog_index, spec, 0) < 0)
+            fprintf(stderr, "usdt: writing arg spec failed: %s\n", strerror(errno));
+        else
+            fprintf(stderr, "  args: %s\n", n.args[0] ? n.args : "(none)");
+    }
     long pc_off = elf_vaddr_to_offset(path, n.pc);
     if (pc_off < 0) { fprintf(stderr, "usdt: marker address %#llx is not in a loadable segment\n", (unsigned long long)n.pc); return -1; }
     long sema_off = n.sema ? elf_vaddr_to_offset(path, n.sema) : 0;
@@ -722,6 +849,7 @@ int main(int argc, char **argv) {
     // ---- 1. maps
     int fds[MAX_MAPS];
     int nfds = 0;
+    int usdt_map_fd = -1;
     int rb_fd = bpf_map_create(BPF_MAP_TYPE_RINGBUF, "events", 0, 0, ringbuf_bytes, NULL);
     if (rb_fd < 0) { fprintf(stderr, "bpf_map_create(ringbuf): %s\n", strerror(-rb_fd)); return 1; }
     fds[nfds++] = rb_fd;
@@ -738,6 +866,7 @@ int main(int argc, char **argv) {
         int fd = bpf_map_create(t, mname, ks, vs, me, NULL);
         if (fd < 0) { fprintf(stderr, "bpf_map_create(%s): %s\n", mname, strerror(-fd)); return 1; }
         fprintf(stderr, "map %d: %s (%s, key %ld, value %ld, max %ld) fd %d\n", nfds, mname, mkind, ks, vs, me, fd);
+        if (strcmp(mname, "__honey_usdt") == 0) usdt_map_fd = fd;
         fds[nfds++] = fd;
         p = (next && next < events_sec) ? next : NULL;
     }
@@ -785,7 +914,7 @@ int main(int argc, char **argv) {
         }
         int pfd;
         if (is_usdt)
-            pfd = attach_usdt(pr->target, prog_fd);
+            pfd = attach_usdt(pr->target, prog_fd, usdt_map_fd, (uint32_t)i, un.machine);
         else if (is_uprobe)
             pfd = attach_uprobe(pr->target, strcmp(pr->type, "uretprobe") == 0, prog_fd);
         else if (is_kprobe)
