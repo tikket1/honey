@@ -84,6 +84,7 @@ commit that added it:
 | `examples/xdp_synopts.hny`     | `tcp.opt(kind)` through `if let`: MSS 65495, wscale 7, SACK ok, tsval from a loopback SYN |
 | `examples/xdp_http.hny`        | `tcp.payload()` view: `starts_with("GET ")`, `len()`, `let line: str<32> = body.str()` — the request line arrives in the event |
 | `examples/xdp_udp_syslog.hny`  | `udp.payload()` + `body.contains("Failed password", 96)`: the failed-login line is reported, the accepted one is not |
+| `examples/xdp_dns.hny`         | `body.dns()`: `name()` decodes `honey.test`, `qtype()` 1; `rate_limit(ip.saddr, 5, 1000)`: five queries pass, the rest of the burst is `Flood`, a later one passes again |
 | `examples/xdp_redirect.hny`    | `redirect("veth0")` from `lo`; a second probe on `veth1` reports each packet arriving there |
 | `examples/xdp_pong.hny`        | packet writes (`eth.h_dest = eth.h_source`, `ip.ttl = 7`), `ip.fix_csum()`, `csum_update`, `tx()`: ping answered from XDP with `ttl=7`; without `fix_csum` the stack drops every reply |
 
@@ -97,7 +98,14 @@ sample in_subnet read_user_str read_kernel_str`); `*ptr`; unsigned and
 kernel struct reads via `ptr<S>`; packet views, bitfields, runtime views,
 the IPv6 walk; packet writes through views, `fix_csum`, `csum_update`,
 `tcp.opt`, `tx`; payload views with bounded reads, a windowed `contains`
-and `str` copies; `redirect` with the interface name resolved by the loader.
+and `str` copies; a DNS view with a bounded name walk; `rate_limit` per site
+or per key; `redirect` with the interface name resolved by the loader.
+
+An early exit taken *inside* an `emit` — a payload or DNS read that runs
+off the packet while the ring-buffer record is reserved — goes through a
+discard block (`bpf_ringbuf_discard`) before leaving, or the verifier
+reports an unreleased reference. The block is only emitted when some field
+read can reach it: unreachable code is itself rejected.
 
 The loader loads each program without a verifier log first and only asks
 for one (into a 64 MB buffer) when the load fails: a log that outgrows its

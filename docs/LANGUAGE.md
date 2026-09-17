@@ -192,6 +192,21 @@ if body.contains("Failed password", 96) {}    // every start inside the first 96
 let line: str<32> = body.str();               // at most 31 bytes, stops at the packet end
 ```
 
+**DNS.** `body.dns()` lays a DNS message over a payload:
+
+```honey
+let dns = body.dns();                         // takes the pointer from `body`
+if dns.is_response() { return; }              // id() flags() qdcount() ancount() opcode() rcode()
+let q: str<64> = dns.name();                  // the question name, dotted, bounded by N
+emit Query { name: q, qtype: dns.qtype() };   // qtype()/qclass() need name() first
+```
+
+`name()` walks the length-prefixed labels from offset 12 (one packet-end
+check per byte, a label over 63 bytes ends the walk) and records where the
+name stopped; `qtype()` and `qclass()` read there, so the checker requires
+`name()` before them. On a truncated or malformed name they pass the packet
+rather than misread it.
+
 `contains(needle, window)` is a search with a bound the verifier can see:
 it tries every start position inside the window, each with its own
 packet-end check, so a 15-byte needle in a 96-byte window is 82 unrolled
@@ -232,6 +247,20 @@ check. Constant offsets must be literals or `const`s.
 **Subnets.** `in_subnet(addr, "10.0.0.0/8")` for a `u32` address,
 `in_subnet(a6, "fe80::/10")` for an `ipv6`; the CIDR is validated at compile
 time.
+
+### Rate limiting
+
+`rate_limit(N, window_ms)` is true while this call site has been reached at
+most N times in the current window; `rate_limit(key, N, window_ms)` keeps a
+window per integer key (a uid, a pid, an `ipv4` address):
+
+```honey
+if !rate_limit(ip.saddr, 20, 1000) { emit Flood { src: ip.saddr }; return; }
+```
+
+Fixed windows, `{start, count}` per site in a hidden array or per key in a
+hidden hash map of 4096 keys (a key the full map cannot hold is allowed).
+Combine with `sample()` when the over-limit path itself would be noisy.
 
 ### Sampling
 
@@ -459,6 +488,7 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `redirect("iface")`                       | statement                  | xdp                | `bpf_redirect(ifindex, 0)`; ifindex patched by the loader |
 | `csum_update(csum, old, new)`             | `u16`                      | anywhere           | RFC 1624 `~(~c + ~old + new)`, folded |
 | `sample(N)`                               | `bool`                     | anywhere           | a hidden per-site counter map |
+| `rate_limit(N, ms)` / `rate_limit(key, N, ms)` | `bool`                | anywhere           | `{start, count}` per site (array) or per key (hash, 4096); `bpf_ktime_get_ns` |
 | `in_subnet(addr, "cidr")`                 | `bool`                     | anywhere           | mask-and-compare, folded at compile time |
 | `s.starts_with("…")`, `s.byte_at(i)`      | `bool` / `u8`              | anywhere           | unrolled, bounded by `N` |
 | `s == "…"`, `s != t`, `a == "::1"`, `ip == "1.2.3.4"` | `bool`         | anywhere           | unrolled equality; literals validated |
@@ -471,6 +501,7 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `view.field = v`                          | statement                  | xdp                | store through the view; `__be*` swapped back; blobs copied |
 | `tcp.payload()` / `udp.payload()`         | payload view (via `let`)   | xdp                | R9 = header + `doff * 4` / 8 |
 | `body.len()`, `body.u8/u16/u32(off)`, `body.starts_with("…")`, `body.contains("…", window)`, `let s: str<N> = body.str()` | `u32`, ints, `bool`, `bool`, `str<N>` | xdp | each read checked against data_end; `contains` unrolled over the window |
+| `body.dns()`; `dns.id/flags/qdcount/ancount()`, `is_response()`, `opcode()/rcode()`, `let q: str<N> = dns.name()`, `qtype()/qclass()` | dns view; `u16`, `bool`, `u8`, `str<N>`, `u16` | xdp | header loads; an unrolled label walk that records the name's end |
 
 ## 7. Status
 
@@ -481,7 +512,7 @@ kernel (`examples/*.hny`, each with the evidence in its commit message):
 |-------|----------------------------------------------------------------------|
 | 1     | Lexer                                                                |
 | 2     | Parser → AST, pretty-printer                                         |
-| 3     | Bytecode emitter + disassembler, C loader; every probe kind; CO-RE-style struct reads; packet views, writes and checksums, TCP options and payloads, redirect; register allocator |
+| 3     | Bytecode emitter + disassembler, C loader; every probe kind; CO-RE-style struct reads; packet views, writes and checksums, TCP options, payloads and DNS, redirect, rate limiting; register allocator |
 | 4     | Verifier-aware type checker: `honeyc check`, every rule an error at the source line, `examples/bad/` one program per rule |
 
 Not done, and not planned for v1: more than one live runtime view, payload

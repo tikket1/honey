@@ -36,6 +36,8 @@ first and refuse to generate code for anything that fails.
 | a packet write the verifier can't bound        | writes go through a view's fields only (`view.field = v`), so the bound is the view's; bitfields and embedded structs are not writable; widths must match; a `mac`/`ipv6` field takes another field, a blob local, or a validated literal |
 | a missing TCP option read as zero              | `tcp.opt(kind)` is `Option<u32>`; only `if let Some(v)` reaches the value; the kind must be one byte; `.opt` exists only on a `ptr<tcphdr>` view and `.fix_csum()` only on a `ptr<iphdr>` |
 | reading through a replaced packet pointer      | one runtime view is live at a time: binding `pkt.view`/`pkt.l4()`/`.payload()` invalidates the previous one, and any later read of it is an error naming the view that replaced it |
+| a DNS type read before the name is decoded     | `dns.qtype()`/`qclass()` sit after the variable-length name; they are errors until `let q: str<N> = dns.name();` has run in the probe |
+| a rate limit that means nothing                | `rate_limit` needs a limit ≥ 1, a window of 1..=86400000 ms, and an integer key if keyed |
 | an unbounded payload read                      | payload methods take constant offsets within 256 bytes; `body.str()` must initialise a `str<N>`; `starts_with` takes a non-empty literal; `contains` needs a window (1..=256, no shorter than the needle) |
 | a detection rule that can never match          | address literals (`"::1"`, `"aa:bb:..."`, `"10.0.0.1"`) and CIDRs are parsed at compile time; a malformed one is an error; a string literal longer than its `str<N>` is an error |
 

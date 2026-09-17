@@ -394,6 +394,12 @@ impl Prog {
     }
 
     /// Bind a label to the current position (the next instruction emitted).
+    /// Has any jump targeted `label` so far? (A block nothing jumps to
+    /// must not be emitted: the verifier rejects unreachable code.)
+    pub fn label_used(&self, label: Label) -> bool {
+        self.fixups.iter().any(|(_, l)| *l == label.0)
+    }
+
     pub fn bind(&mut self, label: Label) {
         self.labels[label.0 as usize] = Some(self.insns.len());
     }

@@ -1,0 +1,11 @@
+// error: `rate_limit`: the limit must be at least 1
+//
+// A limit of zero would never allow anything through; that is `false`.
+
+event E { pid: u32 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    if rate_limit(0, 1000) {
+        emit E { pid: pid() };
+    }
+}

@@ -66,6 +66,8 @@ pub enum Ty {
     /// The bytes after a transport header (`let body = tcp.payload();`):
     /// a runtime-length view read with bounded methods.
     PktBytes,
+    /// A DNS message laid over a payload (`let dns = body.dns();`).
+    Dns,
     /// Statements-as-expressions (`map.insert`) produce this.
     Unit,
     /// An integer literal that has not yet picked a width.
@@ -108,7 +110,7 @@ impl Ty {
             Ty::Str(n) => n.div_ceil(8) * 8,
             Ty::Ipv6 => 16,
             Ty::Mac => 8,
-            Ty::PktPtr(..) | Ty::PktBytes | Ty::Unit => 0,
+            Ty::PktPtr(..) | Ty::PktBytes | Ty::Dns | Ty::Unit => 0,
             _ => 8,
         }
     }
@@ -145,6 +147,7 @@ impl std::fmt::Display for Ty {
             Ty::KCharPtr => write!(f, "ptr<char>"),
             Ty::PktPtr(_, name) => write!(f, "ptr<{name}> (packet)"),
             Ty::PktBytes => write!(f, "payload (packet)"),
+            Ty::Dns => write!(f, "dns (packet)"),
             Ty::Unit => write!(f, "()"),
             Ty::Int => write!(f, "{{integer}}"),
         }
@@ -237,6 +240,9 @@ struct Checker<'a> {
     /// replaces it, and the previous one must not be read again.
     dyn_owner: Option<String>,
     dead_views: Vec<(String, String)>,
+    /// Whether `dns.name()` has run in this probe (so `qtype()`/`qclass()`
+    /// know where the question name ended).
+    dns_named: bool,
 }
 
 pub fn check(program: &Program) -> Result<Checked, Vec<Diag>> {
@@ -257,6 +263,7 @@ pub fn check_with_btf(program: &Program, btf: Option<&Btf>) -> Result<Checked, V
         l4_ready: false,
         dyn_owner: None,
         dead_views: Vec::new(),
+        dns_named: false,
     };
     let peak = c.program(program);
     if c.diags.is_empty() {
@@ -500,6 +507,7 @@ impl Checker<'_> {
         self.l4_ready = false;
         self.dyn_owner = None;
         self.dead_views.clear();
+        self.dns_named = false;
         self.push_scope();
         self.block(&p.body);
         self.pop_scope();
@@ -598,21 +606,25 @@ impl Checker<'_> {
     fn let_stmt(&mut self, mutable: bool, name: &Ident, ty: Option<&Type>, value: &Expr) {
         // Strings: `let s: str<N> = read_user_str(p);` / `read_kernel_str(p);`
         // — the annotation *is* the read bound, which is why it is mandatory.
-        // `let s: str<N> = body.str();` copies from the packet the same way.
+        // `let s: str<N> = body.str();` copies from the packet the same way,
+        // and `let q: str<N> = dns.name();` decodes the question name.
         if let ExprKind::MethodCall { receiver, method, args } = &value.kind
-            && method.name == "str"
             && let ExprKind::Ident(r) = &receiver.kind
-            && matches!(self.lookup(r), Some(Var { ty: Ty::PktBytes, .. }))
+            && ((method.name == "str" && matches!(self.lookup(r), Some(Var { ty: Ty::PktBytes, .. })))
+                || (method.name == "name" && matches!(self.lookup(r), Some(Var { ty: Ty::Dns, .. }))))
         {
             self.check_live(r, receiver.span);
             if !args.is_empty() {
-                self.error(value.span, "`.str()` takes no arguments; the `str<N>` annotation is the bound");
+                self.error(value.span, format!("`.{}()` takes no arguments; the `str<N>` annotation is the bound", method.name));
+            }
+            if method.name == "name" {
+                self.dns_named = true;
             }
             let declared = ty.map(Ty::from_ast);
             match declared {
                 Some(Ok(t @ Ty::Str(_))) => self.declare(&name.name, t, mutable, None),
                 Some(Ok(other)) => {
-                    self.error(ty.unwrap().span, format!("`.str()` produces a `str<N>`, not `{other}`"));
+                    self.error(ty.unwrap().span, format!("`.{}()` produces a `str<N>`, not `{other}`", method.name));
                     self.declare(&name.name, Ty::Unit, mutable, None);
                 }
                 Some(Err(m)) => {
@@ -622,8 +634,8 @@ impl Checker<'_> {
                 None => {
                     self.error_help(
                         value.span,
-                        "`.str()` needs a bounded destination",
-                        format!("write `let {}: str<N> = {r}.str();` so the copy has a known length", name.name),
+                        format!("`.{}()` needs a bounded destination", method.name),
+                        format!("write `let {}: str<N> = {r}.{}();` so the copy has a known length", name.name, method.name),
                     );
                     self.declare(&name.name, Ty::Unit, mutable, None);
                 }
@@ -751,11 +763,14 @@ impl Checker<'_> {
         let before = self.diags.len();
         let actual = self.expr(value);
         let value_had_errors = self.diags.len() > before;
-        if actual == Ty::PktBytes {
+        if actual == Ty::PktBytes || actual == Ty::Dns {
             if let Some(t) = ty {
-                self.error(t.span, "a payload view takes no type annotation");
+                self.error(t.span, "a packet view takes no type annotation");
             }
             self.take_dyn(&name.name);
+            if actual == Ty::Dns {
+                self.dns_named = false;
+            }
         }
         let ty = match ty {
             Some(t) => match Ty::from_ast(t) {
@@ -1104,7 +1119,7 @@ impl Checker<'_> {
             ExprKind::Ident(name) => {
                 if let Some(v) = self.lookup(name) {
                     let t = v.ty.clone();
-                    if matches!(t, Ty::PktPtr(..) | Ty::PktBytes) {
+                    if matches!(t, Ty::PktPtr(..) | Ty::PktBytes | Ty::Dns) {
                         self.check_live(name, e.span);
                     }
                     return t;
@@ -1408,6 +1423,30 @@ impl Checker<'_> {
                 self.error(span, "`sample(N)` takes one constant rate");
                 Ty::Unit
             }
+            ("rate_limit", [n, ms]) | ("rate_limit", [_, n, ms]) => {
+                if let [key, _, _] = args {
+                    let kt = self.expr(key);
+                    if !kt.is_int() && kt != Ty::Unit {
+                        self.error(key.span, format!("`rate_limit` keys by an integer (a uid, a pid, an `ipv4` address), found `{kt}`"));
+                    }
+                }
+                match self.const_eval(n) {
+                    Some(v) if v < 1 => self.error(n.span, "`rate_limit`: the limit must be at least 1"),
+                    _ => {}
+                }
+                match self.const_eval(ms) {
+                    Some(v) if !(1..=86_400_000).contains(&v) => self.error(ms.span, "`rate_limit`: the window is in milliseconds, 1..=86400000"),
+                    _ => {}
+                }
+                Ty::Bool
+            }
+            ("rate_limit", _) => {
+                self.error_help(span, "`rate_limit` takes `(N, window_ms)` or `(key, N, window_ms)`", "e.g. `rate_limit(ip.saddr, 20, 1000)`: true while that source has sent at most 20 in the current second");
+                for a in args {
+                    self.expr(a);
+                }
+                Ty::Unit
+            }
             ("read_user_str" | "read_kernel_str", _) => {
                 self.error_help(span, format!("`{name}` must initialise a bounded string"), format!("write `let s: str<N> = {name}(ptr);`"));
                 Ty::Unit
@@ -1561,10 +1600,46 @@ impl Checker<'_> {
             };
         }
 
+        // A DNS message over the payload.
+        if let Some(Var { ty: Ty::Dns, .. }) = self.lookup(rname) {
+            self.check_live(rname, receiver.span);
+            return match (method.name.as_str(), args) {
+                ("id" | "flags" | "qdcount" | "ancount", []) => Ty::U16,
+                ("is_response", []) => Ty::Bool,
+                ("opcode" | "rcode", []) => Ty::U8,
+                ("qtype" | "qclass", []) => {
+                    if !self.dns_named {
+                        self.error_help(
+                            span,
+                            format!("`{rname}.{}()` needs the question name first", method.name),
+                            format!("the type follows the name, whose length is only known once it is decoded: `let q: str<64> = {rname}.name();`"),
+                        );
+                    }
+                    Ty::U16
+                }
+                ("name", _) => {
+                    self.error_help(span, "`.name()` must initialise a bounded string", format!("write `let q: str<N> = {rname}.name();`"));
+                    Ty::Unit
+                }
+                (m, _) => {
+                    self.error_help(method.span, format!("dns has no method `{m}`"), "use `id() flags() qdcount() ancount() is_response() opcode() rcode()`, `let q: str<N> = dns.name();`, then `qtype()`/`qclass()`");
+                    for a in args {
+                        self.expr(a);
+                    }
+                    Ty::Unit
+                }
+            };
+        }
+
         // The payload view: `body.len()`, `body.u8(i)`, `body.starts_with("..")`.
         if let Some(Var { ty: Ty::PktBytes, .. }) = self.lookup(rname) {
             self.check_live(rname, receiver.span);
             return match (method.name.as_str(), args) {
+                ("dns", []) => Ty::Dns,
+                ("dns", _) => {
+                    self.error(span, "`.dns()` takes no arguments");
+                    Ty::Unit
+                }
                 ("len", []) => Ty::U32,
                 ("u8" | "u16" | "u32", [off]) => {
                     let width: u32 = match method.name.as_str() {
@@ -1629,7 +1704,7 @@ impl Checker<'_> {
                     Ty::Unit
                 }
                 (m, _) => {
-                    self.error_help(method.span, format!("payload has no method `{m}`"), "use `len()`, `u8/u16/u32(off)`, `starts_with(\"...\")`, `contains(\"...\", window)`, or `let s: str<N> = body.str();`");
+                    self.error_help(method.span, format!("payload has no method `{m}`"), "use `len()`, `u8/u16/u32(off)`, `starts_with(\"...\")`, `contains(\"...\", window)`, `let s: str<N> = body.str();`, or `let dns = body.dns();`");
                     for a in args {
                         self.expr(a);
                     }

@@ -14,9 +14,9 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 
 Eight probe kinds (tracepoint, kprobe/kretprobe, uprobe/uretprobe, USDT,
 LSM, XDP), kernel struct reads with CO-RE-style relocation, packet headers
-by name including bitfields, writes, checksums, TCP options and payloads,
-LSM enforcement, sampling, string and address matching, multi-probe
-programs, JSON output. ~8k lines of dependency-free Rust plus a C loader.
+by name including bitfields, writes, checksums, TCP options, payloads and
+DNS, LSM enforcement, sampling and rate limiting, string and address
+matching, multi-probe programs, JSON output. ~8k lines of dependency-free Rust plus a C loader.
 
 ## Quick start
 
@@ -49,7 +49,7 @@ Without `--then` the loader keeps running and printing until Ctrl-C.
 | compile for an x86_64 box              | `./honey build probe.hny --arch x86_64` |
 | export the kernel's BTF by hand        | `linux/export-btf` (done automatically when a probe uses `ptr<...>`) |
 | load a build without recompiling       | `linux/honey-linux ./linux/run.sh --json build/x.bin build/x.json` |
-| tests / lint                           | `cargo test` (268) · `cargo clippy --all-targets` |
+| tests / lint                           | `cargo test` (273) · `cargo clippy --all-targets` |
 | see a verifier rule caught at the line | `./honey check examples/bad/unchecked_map.hny` |
 
 ## Every example, as one line
@@ -117,6 +117,8 @@ Each line was run as written; the output shown is what it printed.
 #  {"event":"Http","src":"127.0.0.1","sport":52134,"len":23,"line":"GET /admin HTTP/1.0\r\n\r\n"}
 ./honey run examples/xdp_udp_syslog.hny --json --then "printf '<38>sshd[812]: Failed password for root from 10.0.0.9' | nc -u -q1 127.0.0.1 5140"
 #  {"event":"AuthFail","src":"127.0.0.1","sport":36589,"line":"<38>sshd[812]: Failed password for root from 10.0.0.9"}
+./honey run examples/xdp_dns.hny --json --then "for i in 1 2 3 4 5 6 7; do printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05honey\x04test\x00\x00\x01\x00\x01' | nc -u -q0 127.0.0.1 53; done"
+#  {"event":"Query","src":"127.0.0.1","id":4660,"name":"honey.test","qtype":1}  x5, then {"event":"Flood","src":"127.0.0.1"} x2
 ./honey run examples/xdp_pong.hny --json --then 'ping -c 3 127.0.0.1'
 #  {"event":"Pong","src":"127.0.0.1","dst":"127.0.0.1","seq":1}   and ping shows ttl=7: XDP answered, not the kernel
 ./honey run examples/xdp_redirect.hny --json --prep 'ip link add veth0 type veth peer name veth1 && ip link set veth0 up && ip link set veth1 up' --then 'ping -c 3 -W 1 127.0.0.1'
@@ -138,7 +140,8 @@ examples/bad/unchecked_map.hny:12:13: error: cannot dereference `Option<&u64>`: 
 ```
 
 The verifier's rules, as honey enforces them: loops have constant bounds, map
-lookups and TCP options are `Option`s that must be matched, checked pointers
+lookups and TCP options are `Option`s that must be matched, DNS types are
+read only after the name, checked pointers
 cannot leave their `if`, every packet read carries its bound, one runtime
 packet view is live at a time, string reads carry their bound in the type,
 the 512-byte stack is budgeted at compile time, and integer widths never
@@ -173,7 +176,7 @@ crates/honeyc/src/    the compiler (Rust, no dependencies)
   btf.rs              kernel BTF reader (struct layouts, bitfields, anonymous members)
   layout.rs addr.rs   event record layout; ipv4/ipv6/mac/CIDR literals
   main.rs             honeyc check | --asm | build -o, --btf, --arch
-crates/honeyc/tests/  268 tests (lexer, parser, codegen, typeck, kernel_fields with a synthetic BTF)
+crates/honeyc/tests/  273 tests (lexer, parser, codegen, typeck, kernel_fields with a synthetic BTF)
 linux/                loader.c (attach every kind, relocate, print events), Dockerfile, honey-linux, run.sh, export-btf, usdt_demo.c
 docs/LANGUAGE.md      the language reference     docs/STAGE-{1,3,4}.md  design notes per stage
 examples/*.hny        the programs above          examples/bad/*.hny     one rejected program per rule

@@ -1,0 +1,51 @@
+// xdp_dns.hny — DNS queries by name, with a per-source rate limit.
+//
+// `body.dns()` lays the DNS message over a UDP payload: fixed header
+// fields (`id`, `flags`, `is_response`, `qdcount`, ...), then
+// `let q: str<N> = dns.name();` decodes the question's length-prefixed
+// labels into a dotted name (bounded by N and by the packet end) and
+// remembers where the name stopped, which is what `dns.qtype()` needs.
+//
+// `rate_limit(key, N, window_ms)` is true while `key` has been seen at
+// most N times in the current window; here each source address gets five
+// queries a second before the rest are reported as a flood instead.
+// Without a key it limits the call site itself.
+//
+//   ./honey run examples/xdp_dns.hny --json --then "for i in 1 2 3 4 5 6 7; do printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05honey\x04test\x00\x00\x01\x00\x01' | nc -u -q0 127.0.0.1 53; done"
+
+event Query {
+    src: ipv4,
+    id: u16,
+    name: str<64>,
+    qtype: u16,
+}
+
+event Flood {
+    src: ipv4,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 17 {
+        return;
+    }
+    let udp: ptr<udphdr> = pkt.view(14 + ip.ihl * 4);
+    if udp.dest != 53 {
+        return;
+    }
+    let body = udp.payload();
+    let dns = body.dns();
+    if dns.is_response() {
+        return;
+    }
+    if !rate_limit(ip.saddr, 5, 1000) {
+        emit Flood { src: ip.saddr };
+        return;
+    }
+    let name: str<64> = dns.name();
+    emit Query { src: ip.saddr, id: dns.id(), name: name, qtype: dns.qtype() };
+}

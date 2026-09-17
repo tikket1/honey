@@ -1,0 +1,13 @@
+// error: `dns.qtype()` needs the question name first
+//
+// The type follows the name, and the name's length is only known once it
+// has been decoded. `let q: str<N> = dns.name();` first.
+
+event E { qtype: u16 }
+
+probe xdp("lo") {
+    let udp: ptr<udphdr> = pkt.at(34);
+    let body = udp.payload();
+    let dns = body.dns();
+    emit E { qtype: dns.qtype() };
+}

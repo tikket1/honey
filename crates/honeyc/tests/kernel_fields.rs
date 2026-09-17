@@ -567,3 +567,75 @@ fn contains_is_a_bounded_window_search() {
     // udp payload starts 8 bytes after the header
     assert!(text.contains("add r9, 42"), "{text}");
 }
+
+// ---------------------------------------------------------- dns + rate limit
+
+const DNS: &str = "    let udp: ptr<udphdr> = pkt.at(34);\n    let body = udp.payload();\n    let dns = body.dns();\n";
+
+#[test]
+fn dns_view_types_its_methods_and_orders_name_before_qtype() {
+    check_ok(&xdp(&format!("{DNS}    let q: str<32> = dns.name();\n    let sum: u16 = dns.id() + dns.flags() + dns.qdcount() + dns.qtype() + dns.qclass();\n    emit E {{ a: 1, m: pkt.mac(0), b: dns.is_response() && dns.rcode() == 0 && sum == 0 }};")));
+    let msg = first(&xdp(&format!("{DNS}    emit E {{ a: dns.qtype(), m: pkt.mac(0), b: true }};")));
+    assert!(msg.contains("`dns.qtype()` needs the question name first"), "{msg}");
+    let msg = first(&xdp(&format!("{DNS}    let q = dns.name();\n    emit E {{ a: 1, m: pkt.mac(0), b: true }};")));
+    assert!(msg.contains("`.name()` needs a bounded destination"), "{msg}");
+    // binding the dns view takes the packet pointer from the payload
+    let msg = first(&xdp(&format!("{DNS}    emit E {{ a: body.len(), m: pkt.mac(0), b: true }};")));
+    assert!(msg.contains("`body` is no longer a valid view: `dns` took the packet pointer"), "{msg}");
+}
+
+#[test]
+fn dns_name_is_an_unrolled_label_walk_that_records_its_end() {
+    let text = asm_xdp(&format!("{DNS}    let q: str<16> = dns.name();\n    emit E {{ a: dns.qtype(), m: pkt.mac(0), b: true }};"));
+    // 15 positions, each: a packet-end check, a length-byte test, a 64 test
+    assert_eq!(text.matches("if r0 >= 64 goto").count(), 15, "{text}");
+    // (+1: the ringbuf reserve null check in the emit)
+    assert_eq!(text.matches("if r0 == 0 goto").count(), 15 + 1, "{text}");
+    // the first byte is always a length: no data path for position 0
+    assert_eq!(text.matches("if r3 != 0 goto").count(), 14, "{text}");
+    // dots are written, the end offset stored (12 + i + 1 for the first position = 13)
+    assert!(text.contains("mov r1, 46") && text.contains("mov r1, 13"), "{text}");
+    // qtype: the recorded end, masked, added to the payload pointer, checked
+    assert!(text.contains("and r4, 511") && text.contains("add r3, r4"), "{text}");
+}
+
+#[test]
+fn rate_limit_forms_and_rules() {
+    check_ok("event E { a: u32 } probe kprobe(\"f\") { if rate_limit(10, 1000) { emit E { a: 1 }; } }");
+    check_ok("event E { a: u32 } probe kprobe(\"f\") { if rate_limit(uid(), 10, 1000) { emit E { a: 1 }; } }");
+    let msg = first("event E { a: u32 } probe kprobe(\"f\") { if rate_limit(0, 1000) { emit E { a: 1 }; } }");
+    assert!(msg.contains("the limit must be at least 1"), "{msg}");
+    let msg = first("event E { a: u32 } probe kprobe(\"f\") { if rate_limit(5, 0) { emit E { a: 1 }; } }");
+    assert!(msg.contains("window is in milliseconds"), "{msg}");
+    let msg = first("event E { a: u32 } probe kprobe(\"f\") { if rate_limit(5) { emit E { a: 1 }; } }");
+    assert!(msg.contains("takes `(N, window_ms)` or `(key, N, window_ms)`"), "{msg}");
+    let msg = first(&xdp("    let m = pkt.mac(0);\n    emit E { a: 1, m: m, b: rate_limit(m, 5, 1000) };"));
+    assert!(msg.contains("keys by an integer"), "{msg}");
+}
+
+#[test]
+fn rate_limit_reserves_maps_and_uses_ktime() {
+    let src = "event E { a: u32 }\nprobe kprobe(\"f\") {\n    if rate_limit(10, 1000) && rate_limit(uid(), 3, 500) { emit E { a: 1 }; }\n    if rate_limit(pid(), 1, 1) { emit E { a: 2 }; }\n}";
+    let btf = kernel_btf();
+    let c = compile_with_btf(&parse(src).unwrap(), Arch::Aarch64, Some(&btf)).unwrap();
+    let names: Vec<&str> = c.maps.iter().map(|m| m.name.as_str()).collect();
+    assert!(names.contains(&"__honey_rate") && names.contains(&"__honey_ratek0") && names.contains(&"__honey_ratek1"), "{names:?}");
+    let rate = c.maps.iter().find(|m| m.name == "__honey_rate").unwrap();
+    assert_eq!((rate.value_size, rate.max_entries), (16, 1));
+    let keyed = c.maps.iter().find(|m| m.name == "__honey_ratek0").unwrap();
+    assert_eq!((keyed.key_size, keyed.value_size), (8, 16));
+    let text = asm(src);
+    assert_eq!(text.matches("call 5").count(), 3, "one ktime per site\n{text}");
+    assert_eq!(text.matches("call 2").count(), 2, "keyed sites insert on first sight\n{text}");
+    assert!(text.contains("1000000000") && text.contains("500000000"), "windows in ns\n{text}");
+}
+
+#[test]
+fn an_early_exit_inside_emit_discards_the_reservation() {
+    // a payload read in a field can run off the packet: that exit must
+    // discard the reserved record (helper 133), and only then exist
+    let with = asm_xdp(&format!("{DNS}    emit E {{ a: dns.id(), m: pkt.mac(0), b: true }};"));
+    assert_eq!(with.matches("call 133").count(), 1, "{with}");
+    let without = asm_xdp("    emit E { a: pkt.u32(26), m: pkt.mac(0), b: true };");
+    assert_eq!(without.matches("call 133").count(), 0, "no unreachable discard block\n{without}");
+}

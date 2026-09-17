@@ -115,6 +115,10 @@ const XDP_TX: i32 = 3;
 /// How many TCP options `tcp.opt(kind)` walks before giving up: the 40-byte
 /// option space holds at most that many non-NOP options of real width.
 const TCP_OPT_MAX: usize = 10;
+/// DNS: the question section starts after the 12-byte header.
+const DNS_QUESTION: i16 = 12;
+/// "no question name decoded yet" (an offset no packet read will pass).
+const DNS_NO_END: i32 = 0x1ff;
 
 /// USDT argument spec, one per probe program, filled in by the loader from
 /// the marker's note. Six args of 16 bytes:
@@ -230,6 +234,9 @@ enum Ty {
     /// The payload after a transport header: R9 points at it, its length is
     /// `data_end - R9`, and every read checks against data_end.
     PktBytes,
+    /// A DNS message over the payload (R9). `end` is the stack slot holding
+    /// the offset just past the question name once `name()` has decoded it.
+    Dns { end: i16 },
 }
 
 impl Ty {
@@ -257,7 +264,7 @@ impl Ty {
             Ty::Ipv6 => 16,
             Ty::Mac => 6,
             Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::OptionVal(_) | Ty::KPtr { .. } | Ty::KCharPtr => 8,
-            Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes => 0,
+            Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes | Ty::Dns { .. } => 0,
         }
     }
 
@@ -294,6 +301,10 @@ struct Shared<'a> {
     btf: Option<&'a Btf>,
     /// Map index of the hidden sampling counter array, if any `sample()` used.
     sample_map: Option<i32>,
+    /// Map index of the hidden per-site rate-limit array ({window start, count}).
+    rate_map: Option<i32>,
+    /// One hidden hash map per keyed `rate_limit(key, ..)` site, in order.
+    rate_key_maps: Vec<i32>,
     /// Map index of the hidden USDT argument-spec array, if any usdt probe.
     usdt_map: Option<i32>,
 }
@@ -315,7 +326,7 @@ struct Cg<'a> {
     /// (instruction index of the LD_IMM64, interface name) for `redirect`.
     ifaces: Vec<(usize, String)>,
     /// Running counter that assigns each `sample()` site its map slot.
-    sample_next: &'a mut u32,
+    sites: &'a mut Sites,
     /// This program's index in the manifest (key into the USDT spec map).
     prog_index: u32,
     /// Callee-saved registers free for locals and temporaries. R6 is
@@ -342,6 +353,8 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
         arch,
         btf,
         sample_map: None,
+        rate_map: None,
+        rate_key_maps: Vec::new(),
         usdt_map: None,
     };
     let mut probes = Vec::new();
@@ -384,6 +397,21 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
         });
     }
 
+    // Rate limiting: a {window start, count} pair per unkeyed site in one
+    // array; a hash map per keyed site (key u64 -> the same pair).
+    let rate_sites: u32 = probes.iter().map(|p| count_calls(&p.body, &|n, a| n == "rate_limit" && a == 2)).sum();
+    if rate_sites > 0 {
+        let idx = (sh.maps.len() as i32) + 1;
+        sh.rate_map = Some(idx);
+        sh.maps.push(MapSpec { name: "__honey_rate".into(), kind: MapKind::Array, key_size: 4, value_size: 16, max_entries: rate_sites });
+    }
+    let keyed_sites: u32 = probes.iter().map(|p| count_calls(&p.body, &|n, a| n == "rate_limit" && a == 3)).sum();
+    for i in 0..keyed_sites {
+        let idx = (sh.maps.len() as i32) + 1;
+        sh.rate_key_maps.push(idx);
+        sh.maps.push(MapSpec { name: format!("__honey_ratek{i}"), kind: MapKind::Hash, key_size: 8, value_size: 16, max_entries: RATE_KEYS });
+    }
+
     // USDT: one argument spec per program (keyed by program index), filled
     // in by the loader from the marker's note.
     if probes.iter().any(|p| p.kind.name == "usdt") {
@@ -399,7 +427,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
     }
 
     let mut programs = Vec::new();
-    let mut sample_next: u32 = 0;
+    let mut sites = Sites::default();
     for (prog_index, p) in probes.into_iter().enumerate() {
         let kind = match (p.kind.name.as_str(), p.args.as_slice()) {
             ("tracepoint", [c, n]) => ProbeKind::Tracepoint { category: c.clone(), name: n.clone() },
@@ -422,7 +450,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ProbeKind::Uretprobe { target } => format!("uretprobe:{target}"),
             ProbeKind::Usdt { target } => format!("usdt:{target}"),
         };
-        let (bytecode, stack_bytes, relocs, ifaces) = compile_probe(&sh, &kind, p, &mut sample_next, prog_index as u32)?;
+        let (bytecode, stack_bytes, relocs, ifaces) = compile_probe(&sh, &kind, p, &mut sites, prog_index as u32)?;
         programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs, ifaces });
     }
 
@@ -440,7 +468,19 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
 
 type ProbeOutput = (Vec<u8>, u32, Vec<Reloc>, Vec<IfaceReloc>);
 
-fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut u32, prog_index: u32) -> Result<ProbeOutput, String> {
+/// Per-call-site counters, numbered across the whole program.
+#[derive(Default)]
+struct Sites {
+    sample: u32,
+    rate: u32,
+    rate_keyed: u32,
+}
+
+/// How many keys a keyed `rate_limit` remembers; the hash map's capacity.
+/// When it is full, an unseen key is allowed through.
+const RATE_KEYS: u32 = 4096;
+
+fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sites: &mut Sites, prog_index: u32) -> Result<ProbeOutput, String> {
     let mut prog = Prog::new();
     let exit_label = prog.new_label();
     let mut cg = Cg {
@@ -455,7 +495,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut
         ctx_slot: 0,
         relocs: Vec::new(),
         ifaces: Vec::new(),
-        sample_next,
+        sites,
         prog_index,
         free_regs: free_callee_saved(kind, &p.body),
     };
@@ -767,59 +807,65 @@ fn body_has_emit(body: &Block) -> bool {
 
 /// Count `sample()` call sites in a probe body (for sizing the hidden map).
 fn count_samples(body: &Block) -> u32 {
-    fn expr(e: &Expr, n: &mut u32) {
+    count_calls(body, &|n, _| n == "sample")
+}
+
+/// How many calls in `body` satisfy `pred(name, argc)`: the number of
+/// hidden per-site map entries a builtin needs.
+fn count_calls(body: &Block, pred: &dyn Fn(&str, usize) -> bool) -> u32 {
+    fn expr(e: &Expr, n: &mut u32, pred: &dyn Fn(&str, usize) -> bool) {
         match &e.kind {
             ExprKind::Call { callee, args } => {
-                if matches!(&callee.kind, ExprKind::Ident(name) if name == "sample") {
+                if matches!(&callee.kind, ExprKind::Ident(name) if pred(name, args.len())) {
                     *n += 1;
                 }
                 for a in args {
-                    expr(a, n);
+                    expr(a, n, pred);
                 }
             }
             ExprKind::MethodCall { receiver, args, .. } => {
-                expr(receiver, n);
+                expr(receiver, n, pred);
                 for a in args {
-                    expr(a, n);
+                    expr(a, n, pred);
                 }
             }
             ExprKind::Binary { lhs, rhs, .. } => {
-                expr(lhs, n);
-                expr(rhs, n);
+                expr(lhs, n, pred);
+                expr(rhs, n, pred);
             }
-            ExprKind::Unary { expr: i, .. } | ExprKind::Cast { expr: i, .. } | ExprKind::Field { expr: i, .. } => expr(i, n),
+            ExprKind::Unary { expr: i, .. } | ExprKind::Cast { expr: i, .. } | ExprKind::Field { expr: i, .. } => expr(i, n, pred),
             ExprKind::Index { expr: i, index } => {
-                expr(i, n);
-                expr(index, n);
+                expr(i, n, pred);
+                expr(index, n, pred);
             }
             _ => {}
         }
     }
-    fn block(b: &Block, n: &mut u32) {
+    fn block(b: &Block, n: &mut u32, pred: &dyn Fn(&str, usize) -> bool) {
         for s in &b.stmts {
             match &s.kind {
-                StmtKind::Let { value, .. } | StmtKind::Return(Some(value)) | StmtKind::Expr(value) => expr(value, n),
+                StmtKind::Let { value, .. } | StmtKind::Return(Some(value)) | StmtKind::Expr(value) => expr(value, n, pred),
                 StmtKind::Assign { target, value } => {
-                    expr(target, n);
-                    expr(value, n);
+                    expr(target, n, pred);
+                    expr(value, n, pred);
                 }
                 StmtKind::If { cond, then, otherwise } => {
                     match cond {
-                        Cond::Expr(e) | Cond::Let { value: e, .. } => expr(e, n),
+                        Cond::Expr(e) | Cond::Let { value: e, .. } => expr(e, n, pred),
                     }
-                    block(then, n);
+                    block(then, n, pred);
                     if let Some(o) = otherwise {
-                        block(o, n);
+                        block(o, n, pred);
                     }
                 }
                 StmtKind::For { start, end, body, .. } => {
-                    expr(start, n);
-                    expr(end, n);
-                    block(body, n);
+                    expr(start, n, pred);
+                    expr(end, n, pred);
+                    block(body, n, pred);
                 }
                 StmtKind::Emit { fields, .. } => {
                     for (_, v) in fields {
-                        expr(v, n);
+                        expr(v, n, pred);
                     }
                 }
                 StmtKind::Return(None) => {}
@@ -827,7 +873,7 @@ fn count_samples(body: &Block) -> u32 {
         }
     }
     let mut n = 0;
-    block(body, &mut n);
+    block(body, &mut n, pred);
     n
 }
 
@@ -928,7 +974,7 @@ impl Cg<'_> {
                 Ty::Str(n) => n.div_ceil(8) * 8,
                 Ty::Ipv6 => 16,
                 Ty::Mac => 8,
-                Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes => 0,
+                Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes | Ty::Dns { .. } => 0,
                 _ => 8,
             };
             self.stack_top -= bytes as i32;
@@ -997,6 +1043,14 @@ impl Cg<'_> {
                         self.payload_str(off, n);
                         return Ok(());
                     }
+                    if let ExprKind::MethodCall { receiver, method, .. } = &value.kind
+                        && method.name == "name"
+                        && let ExprKind::Ident(r) = &receiver.kind
+                        && let Some(Ty::Dns { end }) = self.lookup(r).map(|l| l.ty.clone())
+                    {
+                        self.dns_name(off, n, end);
+                        return Ok(());
+                    }
                     return self.read_str_into(off, n, value);
                 }
                 // Packet struct view: `let ip: ptr<iphdr> = pkt.at(14);` — a
@@ -1043,6 +1097,19 @@ impl Cg<'_> {
                     self.prog.push(alu64_imm(AluOp::Add, Reg::R2, size as i32));
                     self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, self.exit_label);
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktDyn(id, 0), reg: None });
+                    return Ok(());
+                }
+                // `let dns = body.dns();` — a view over the payload; only the
+                // slot for the end of the question name is allocated.
+                if let ExprKind::MethodCall { receiver, method, .. } = &value.kind
+                    && method.name == "dns"
+                    && let ExprKind::Ident(r) = &receiver.kind
+                    && matches!(self.lookup(r).map(|l| &l.ty), Some(Ty::PktBytes))
+                {
+                    let end = self.alloc_slot();
+                    self.prog.push(mov64_imm(Reg::R0, DNS_NO_END));
+                    self.prog.push(stx_mem(Size::DW, Reg::R10, end, Reg::R0));
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::Dns { end }, reg: None });
                     return Ok(());
                 }
                 // `let body = tcp.payload();` — R9 = header + its length.
@@ -1291,6 +1358,14 @@ impl Cg<'_> {
         self.prog.push(st_mem(Size::W, Reg::R6, 0, id as i32));
         self.prog.push(st_mem(Size::W, Reg::R6, 4, 0));
 
+        // A field read that runs off the packet exits early. With a record
+        // reserved, that exit must discard it first or the verifier reports
+        // an unreleased reference: route every early exit inside the field
+        // evaluation through a discard block.
+        let outer_exit = self.exit_label;
+        let discard = self.prog.new_label();
+        self.exit_label = discard;
+
         for (fname, value) in fields {
             let fl = layout
                 .fields
@@ -1353,10 +1428,21 @@ impl Cg<'_> {
             self.prog.push(stx_mem(size, Reg::R6, off, Reg::R0));
         }
 
+        self.exit_label = outer_exit;
         // bpf_ringbuf_submit(r6, 0)
         self.prog.push(mov64_reg(Reg::R1, Reg::R6));
         self.prog.push(mov64_imm(Reg::R2, 0));
         self.prog.push(call(Helper::RingbufSubmit));
+        // early exit while reserved: bpf_ringbuf_discard(r6, 0), then leave
+        // (only if some field read can take it: unreachable code is rejected)
+        if self.prog.label_used(discard) {
+            self.prog.ja_to(skip);
+            self.prog.bind(discard);
+            self.prog.push(mov64_reg(Reg::R1, Reg::R6));
+            self.prog.push(mov64_imm(Reg::R2, 0));
+            self.prog.push(call(Helper::RingbufDiscard));
+            self.prog.ja_to(outer_exit);
+        }
         self.prog.bind(skip);
         Ok(())
     }
@@ -1376,7 +1462,7 @@ impl Cg<'_> {
             ExprKind::Str(_) => Err("string values are not supported in expressions".into()),
             ExprKind::Ident(name) => {
                 if let Some(local) = self.lookup(name).cloned() {
-                    if !matches!(local.ty, Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes) {
+                    if !matches!(local.ty, Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes | Ty::Dns { .. }) {
                         self.load_local(&local);
                     }
                     return Ok(local.ty);
@@ -1445,6 +1531,9 @@ impl Cg<'_> {
                     }
                     if let Some(Local { ty: Ty::PktBytes, .. }) = self.lookup(n) {
                         return self.payload_method(&method.name, args);
+                    }
+                    if let Some(Ty::Dns { end }) = self.lookup(n).map(|l| l.ty.clone()) {
+                        return self.dns_method(end, &method.name, args);
                     }
                     if let Some(local) = self.lookup(n).cloned()
                         && let Ty::PktPtr(..) | Ty::PktDyn(..) = local.ty
@@ -1897,6 +1986,14 @@ impl Cg<'_> {
                 let rate = self.const_eval(n)?;
                 self.emit_sample(rate)
             }
+            ("rate_limit", [n, ms]) => {
+                let (n, ms) = (self.const_eval(n)?, self.const_eval(ms)?);
+                self.emit_rate_limit(None, n, ms)
+            }
+            ("rate_limit", [key, n, ms]) => {
+                let (n, ms) = (self.const_eval(n)?, self.const_eval(ms)?);
+                self.emit_rate_limit(Some(key), n, ms)
+            }
             ("in_subnet", [a, cidr]) => self.emit_in_subnet(a, cidr),
             ("csum_update", [c, old, new]) => self.emit_csum_update(c, old, new),
             ("redirect", [iface]) => {
@@ -2080,8 +2177,8 @@ impl Cg<'_> {
     /// in the hidden `__honey_sample` array map. Result (0/1) lands in R0.
     fn emit_sample(&mut self, rate: i64) -> Result<Ty, String> {
         let map_idx = self.sh.sample_map.ok_or("internal: sample map not reserved")?;
-        let site = *self.sample_next as i32;
-        *self.sample_next += 1;
+        let site = self.sites.sample as i32;
+        self.sites.sample += 1;
 
         let miss = self.prog.new_label();
         let end = self.prog.new_label();
@@ -2584,6 +2681,207 @@ impl Cg<'_> {
         self.prog.push(alu64_imm(AluOp::Xor, Reg::R0, 0xffff));
         self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xffff));
         Ok(Ty::Uint(2))
+    }
+
+    /// `rate_limit(N, ms)` / `rate_limit(key, N, ms)`: true while the site
+    /// (or the key) has been seen at most N times in the current window.
+    /// Fixed windows: a {start_ns, count} pair per site in a hidden array,
+    /// or per key in a hidden hash map; a new window resets the count. A
+    /// key the full map cannot hold is allowed. Result (0/1) in R0.
+    fn emit_rate_limit(&mut self, key: Option<&Expr>, n: i64, ms: i64) -> Result<Ty, String> {
+        let window_ns = ms.checked_mul(1_000_000).ok_or("rate_limit window too large")?;
+        let allow = self.prog.new_label();
+        let have = self.prog.new_label();
+        let same = self.prog.new_label();
+        let end = self.prog.new_label();
+
+        let kslot = self.alloc_slot();
+        let nslot = self.alloc_slot();
+        let pslot = self.alloc_slot();
+        let vslot = self.alloc_bytes(16);
+        let map_idx = match key {
+            None => {
+                let idx = self.sh.rate_map.ok_or("internal: rate map not reserved")?;
+                self.prog.push(st_mem(Size::W, Reg::R10, kslot, self.sites.rate as i32));
+                self.sites.rate += 1;
+                idx
+            }
+            Some(k) => {
+                let i = self.sites.rate_keyed as usize;
+                self.sites.rate_keyed += 1;
+                let idx = *self.sh.rate_key_maps.get(i).ok_or("internal: keyed rate map not reserved")?;
+                self.expr(k)?;
+                self.prog.push(stx_mem(Size::DW, Reg::R10, kslot, Reg::R0));
+                idx
+            }
+        };
+        // now -> nslot; r0 = lookup(map, &key)
+        self.prog.push(call(Helper::KtimeGetNs));
+        self.prog.push(stx_mem(Size::DW, Reg::R10, nslot, Reg::R0));
+        self.prog.push(ld_map_fd(Reg::R1, map_idx));
+        self.prog.push(mov64_reg(Reg::R2, Reg::R10));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R2, kslot as i32));
+        self.prog.push(call(Helper::MapLookupElem));
+        self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, 0, have);
+        if key.is_some() {
+            // first sight of this key: insert {now, 1}, allow
+            self.prog.push(ldx_mem(Size::DW, Reg::R1, Reg::R10, nslot));
+            self.prog.push(stx_mem(Size::DW, Reg::R10, vslot, Reg::R1));
+            self.prog.push(mov64_imm(Reg::R1, 1));
+            self.prog.push(stx_mem(Size::DW, Reg::R10, vslot + 8, Reg::R1));
+            self.prog.push(ld_map_fd(Reg::R1, map_idx));
+            self.prog.push(mov64_reg(Reg::R2, Reg::R10));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R2, kslot as i32));
+            self.prog.push(mov64_reg(Reg::R3, Reg::R10));
+            self.prog.push(alu64_imm(AluOp::Add, Reg::R3, vslot as i32));
+            self.prog.push(mov64_imm(Reg::R4, 0)); // BPF_ANY
+            self.prog.push(call(Helper::MapUpdateElem));
+        }
+        self.prog.ja_to(allow);
+
+        // have: r1 = entry, r0 = now; new window if now - start > window
+        self.prog.bind(have);
+        self.prog.push(mov64_reg(Reg::R1, Reg::R0));
+        self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, nslot));
+        self.prog.push(ldx_mem(Size::DW, Reg::R2, Reg::R1, 0));
+        self.prog.push(mov64_reg(Reg::R3, Reg::R0));
+        self.prog.push(alu64_reg(AluOp::Sub, Reg::R3, Reg::R2));
+        self.prog.push(ld_imm64(Reg::R4, window_ns));
+        self.prog.jmp_reg_to(JmpOp::Le, Reg::R3, Reg::R4, same);
+        self.prog.push(stx_mem(Size::DW, Reg::R1, 0, Reg::R0));
+        self.prog.push(mov64_imm(Reg::R2, 0));
+        self.prog.push(stx_mem(Size::DW, Reg::R1, 8, Reg::R2));
+        // same window: count += 1; allowed while count <= N
+        self.prog.bind(same);
+        self.prog.push(ldx_mem(Size::DW, Reg::R2, Reg::R1, 8));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R2, 1));
+        self.prog.push(stx_mem(Size::DW, Reg::R1, 8, Reg::R2));
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.push(ld_imm64(Reg::R3, n));
+        self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R3, end);
+        self.prog.bind(allow);
+        self.prog.push(mov64_imm(Reg::R0, 1));
+        self.prog.bind(end);
+        let _ = pslot;
+        self.free_slot();
+        self.free_slot();
+        self.free_slot();
+        self.stack_top -= 16;
+        Ok(Ty::Bool)
+    }
+
+    /// Fixed-offset DNS header fields, plus the type/class that follow the
+    /// question name (at the offset `name()` recorded).
+    fn dns_method(&mut self, end: i16, method: &str, args: &[Expr]) -> Result<Ty, String> {
+        let header16 = |cg: &mut Self, off: i16| {
+            cg.payload_check(off as i32 + 2, cg.exit_label);
+            cg.prog.push(ldx_mem(Size::H, Reg::R0, Reg::R9, off));
+            cg.prog.push(bswap(Reg::R0, 16));
+        };
+        match (method, args) {
+            ("id", []) => {
+                header16(self, 0);
+                Ok(Ty::Uint(2))
+            }
+            ("flags", []) => {
+                header16(self, 2);
+                Ok(Ty::Uint(2))
+            }
+            ("qdcount", []) => {
+                header16(self, 4);
+                Ok(Ty::Uint(2))
+            }
+            ("ancount", []) => {
+                header16(self, 6);
+                Ok(Ty::Uint(2))
+            }
+            ("is_response", []) => {
+                header16(self, 2);
+                self.prog.push(alu64_imm(AluOp::Rsh, Reg::R0, 15));
+                Ok(Ty::Bool)
+            }
+            ("opcode", []) => {
+                header16(self, 2);
+                self.prog.push(alu64_imm(AluOp::Rsh, Reg::R0, 11));
+                self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xf));
+                Ok(Ty::Uint(1))
+            }
+            ("rcode", []) => {
+                header16(self, 2);
+                self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xf));
+                Ok(Ty::Uint(1))
+            }
+            ("qtype" | "qclass", []) => {
+                // r3 = payload + end (+2 for class); bounded, then checked
+                let extra = if method == "qtype" { 0 } else { 2 };
+                self.prog.push(ldx_mem(Size::DW, Reg::R4, Reg::R10, end));
+                self.prog.push(alu64_imm(AluOp::And, Reg::R4, 0x1ff));
+                self.prog.push(mov64_reg(Reg::R3, Reg::R9));
+                self.prog.push(alu64_reg(AluOp::Add, Reg::R3, Reg::R4));
+                self.prog.push(mov64_reg(Reg::R2, Reg::R3));
+                self.prog.push(alu64_imm(AluOp::Add, Reg::R2, extra + 2));
+                self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, self.exit_label);
+                self.prog.push(ldx_mem(Size::H, Reg::R0, Reg::R3, extra as i16));
+                self.prog.push(bswap(Reg::R0, 16));
+                Ok(Ty::Uint(2))
+            }
+            ("name", _) => Err("`.name()` must initialise a `str<N>` local".into()),
+            (m, a) => Err(format!("dns has no method `{m}` taking {} argument(s)", a.len())),
+        }
+    }
+
+    /// Decode the question name (length-prefixed labels from payload offset
+    /// 12) into a dotted string at `dst`, at most `n - 1` bytes, and record
+    /// the offset just past its terminating zero in `end`. Unrolled over
+    /// packet positions; R3 counts the bytes left in the current label.
+    /// A label over 63 bytes (a compression pointer, or garbage), a short
+    /// packet, or a name longer than the buffer leaves `end` at
+    /// `DNS_NO_END`, so `qtype()` on it passes the packet instead of
+    /// misreading it.
+    fn dns_name(&mut self, dst: i16, n: u32, end: i16) {
+        let done = self.prog.new_label();
+        let bad = self.prog.new_label();
+        let mut i = 0i16;
+        while (i as u32) < n {
+            self.prog.push(mov64_imm(Reg::R0, 0));
+            self.prog.push(stx_mem(Size::DW, Reg::R10, dst + i, Reg::R0));
+            i += 8;
+        }
+        self.prog.push(mov64_imm(Reg::R3, 0));
+        for i in 0..(n as i16 - 1) {
+            let data = self.prog.new_label();
+            let next = self.prog.new_label();
+            let term = self.prog.new_label();
+            let at = DNS_QUESTION + i;
+            self.payload_check(at as i32 + 1, bad);
+            self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R9, at));
+            if i > 0 {
+                self.prog.jmp_imm_to(JmpOp::Ne, Reg::R3, 0, data);
+            }
+            // a length byte
+            self.prog.jmp_imm_to(JmpOp::Eq, Reg::R0, 0, term);
+            self.prog.jmp_imm_to(JmpOp::Ge, Reg::R0, 64, bad);
+            self.prog.push(mov64_reg(Reg::R3, Reg::R0));
+            if i > 0 {
+                self.prog.push(mov64_imm(Reg::R1, b'.' as i32));
+                self.prog.push(stx_mem(Size::B, Reg::R10, dst + i - 1, Reg::R1));
+                self.prog.ja_to(next);
+                // a name byte
+                self.prog.bind(data);
+                self.prog.push(stx_mem(Size::B, Reg::R10, dst + i - 1, Reg::R0));
+                self.prog.push(alu64_imm(AluOp::Sub, Reg::R3, 1));
+            }
+            self.prog.ja_to(next);
+            self.prog.bind(term);
+            self.prog.push(mov64_imm(Reg::R1, at as i32 + 1));
+            self.prog.push(stx_mem(Size::DW, Reg::R10, end, Reg::R1));
+            self.prog.ja_to(done);
+            self.prog.bind(next);
+        }
+        self.prog.bind(bad);
+        self.prog.push(mov64_imm(Reg::R1, DNS_NO_END));
+        self.prog.push(stx_mem(Size::DW, Reg::R10, end, Reg::R1));
+        self.prog.bind(done);
     }
 
     /// `if R9 + need > data_end goto label`, through R2.
