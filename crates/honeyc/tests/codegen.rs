@@ -371,3 +371,55 @@ fn lsm_arg_reads_the_context_array_directly() {
     let asm = disasm_bytes(&compile(&parse(src).unwrap(), Arch::Aarch64).unwrap().programs[0].bytecode);
     assert!(asm.contains("ldx64 r0, [r0 +16]"), "arg(2) at ctx+16\n{asm}");
 }
+
+// --------------------------------------------------------------------- xdp
+
+const ICMP: &str = include_str!("../../../examples/icmp_drop.hny");
+
+#[test]
+fn xdp_prologue_loads_packet_bounds_and_checks_once() {
+    let text = asm(ICMP);
+    // data/data_end from the xdp_md context into callee-saved r7/r8.
+    assert!(text.contains("ldx32 r7, [r1 +0]"), "{text}");
+    assert!(text.contains("ldx32 r8, [r1 +4]"), "{text}");
+    // one entry check: r2 = r7 + 34 (u32 at offset 30); if r2 > r8 -> pass
+    assert!(text.contains("mov r2, r7"), "{text}");
+    assert!(text.contains("add r2, 34"), "{text}");
+    assert!(text.contains("if r2 > r8 goto"), "{text}");
+    assert_eq!(text.matches("if r2 > r8 goto").count(), 1, "exactly one bounds check\n{text}");
+}
+
+#[test]
+fn xdp_reads_are_plain_loads_with_byte_swaps() {
+    let text = asm(ICMP);
+    assert!(text.contains("ldx16 r0, [r7 +12]"), "{text}");
+    assert!(text.contains("bswap16 r0"), "{text}");
+    assert!(text.contains("ldx32 r0, [r7 +26]"), "{text}");
+    assert!(text.contains("bswap32 r0"), "{text}");
+    assert!(text.contains("ldx8 r0, [r7 +23]"), "{text}");
+    // no swap after a u8 load
+    let after_u8 = text.split("ldx8 r0, [r7 +23]").nth(1).unwrap();
+    assert!(!after_u8.lines().nth(1).unwrap().contains("bswap"), "{text}");
+}
+
+#[test]
+fn xdp_returns_drop_and_defaults_to_pass() {
+    let text = asm(ICMP);
+    assert!(text.contains("mov r0, 1\n"), "drop = XDP_DROP (1)\n{text}");
+    // the epilogue (last two instructions) returns XDP_PASS (2)
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    assert!(lines[lines.len() - 2].ends_with("mov r0, 2"), "{text}");
+    assert!(lines[lines.len() - 1].ends_with("exit"), "{text}");
+}
+
+#[test]
+fn xdp_program_kind_and_no_bounds_check_without_reads() {
+    let prog = parse(ICMP).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert!(matches!(&c.programs[0].kind, honeyc::codegen::ProbeKind::Xdp { interface } if interface == "lo"));
+    let src = "event E { t: u64 } probe xdp(\"lo\") { emit E { t: ktime() }; }";
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    let text = disasm_bytes(&c.programs[0].bytecode);
+    assert!(!text.contains("if r2 > r8"), "no reads, no check\n{text}");
+}

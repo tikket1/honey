@@ -1,0 +1,9 @@
+// error: `pid()` is not available in an `xdp` probe
+//
+// A packet has no process behind it at the point XDP runs.
+
+event E { p: u32 }
+
+probe xdp("lo") {
+    emit E { p: pid() };
+}

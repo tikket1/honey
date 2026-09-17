@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libbpf-dev \
         libelf-dev \
         zlib1g-dev \
+        iputils-ping \
+        iproute2 \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

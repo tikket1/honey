@@ -1,0 +1,30 @@
+// icmp_drop.hny — drop every ICMP packet arriving on an interface, and log
+// where it came from.
+//
+// XDP runs at the earliest point a packet can be seen, before the kernel
+// builds any state for it. That makes it the place for filtering and
+// DDoS-style dropping. `pkt` is the packet's bytes; `pkt.u16(12)` is the
+// Ethernet type, `pkt.u8(23)` the IPv4 protocol, and so on. Multi-byte
+// reads come back in host order, so `0x0800` means IPv4 as you'd expect.
+//
+// Every packet read must be provably inside the packet or the verifier
+// refuses the program. honey computes the furthest byte this probe touches
+// (34 here: the u32 at 30) and checks the packet is at least that long once,
+// on entry; a shorter packet is passed through untouched.
+//
+//   honeyc build examples/icmp_drop.hny -o build/icmp
+//   linux/honey-linux ./linux/run.sh --json build/icmp.bin build/icmp.json
+//   ... then `ping 127.0.0.1` in the environment gets 100% loss.
+
+event Dropped {
+    src: u32,
+    dst: u32,
+    ttl: u8,
+}
+
+probe xdp("lo") {
+    if pkt.u16(12) == 0x0800 && pkt.u8(23) == 1 {
+        emit Dropped { src: pkt.u32(26), dst: pkt.u32(30), ttl: pkt.u8(22) };
+        drop();
+    }
+}

@@ -1,0 +1,12 @@
+// error: packet offset `i` is a variable
+//
+// The verifier needs every packet access proven in bounds. honey does that
+// with one check on entry covering the largest offset in the probe, which
+// only works when every offset is known at compile time.
+
+event E { b: u8 }
+
+probe xdp("lo") {
+    let i = 40;
+    emit E { b: pkt.u8(i) };
+}

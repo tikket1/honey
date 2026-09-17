@@ -412,3 +412,46 @@ fn lsm_has_args_but_no_retval() {
     let msg = first_message("event E { a: u64, r: i64 } probe lsm(\"file_open\") { emit E { a: 1, r: retval() }; }");
     assert!(msg.contains("`retval()` is only available in a `kretprobe`"), "{msg}");
 }
+
+// -------------------------------------------------------------- xdp probes
+
+fn xdp(body: &str) -> String {
+    format!("event E {{ a: u32, b: u16 }}\nprobe xdp(\"lo\") {{\n{body}\n}}")
+}
+
+#[test]
+fn xdp_packet_reads_have_fixed_widths() {
+    ok(&xdp("    emit E { a: pkt.u32(26), b: pkt.u16(12) };"));
+    let msg = first_message(&xdp("    emit E { a: pkt.u16(12), b: 0 };"));
+    assert!(msg.contains("expected `u32`, found `u16`"), "{msg}");
+    ok(&xdp("    let n: u32 = pkt.len();\n    emit E { a: n, b: 0 };"));
+}
+
+#[test]
+fn xdp_actions_and_their_scope() {
+    ok(&xdp("    if pkt.u8(23) == 1 { drop(); }\n    pass();"));
+    let msg = first_message(&probe("    drop();\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`drop()` is only available in an `xdp` probe"), "{msg}");
+    let msg = first_message(&xdp("    deny();"));
+    assert!(msg.contains("`deny()` is only available in an `lsm` probe"), "{msg}");
+}
+
+#[test]
+fn xdp_has_no_process_context() {
+    let msg = first_message(&xdp("    emit E { a: pid(), b: 0 };"));
+    assert!(msg.contains("`pid()` is not available in an `xdp` probe"), "{msg}");
+    let msg = first_message(&xdp("    let x = arg(0);\n    emit E { a: 1, b: 0 };"));
+    assert!(msg.contains("`arg()` is not available in an `xdp` probe"), "{msg}");
+}
+
+#[test]
+fn pkt_only_in_xdp_and_offsets_are_constants() {
+    let msg = first_message(&probe("    emit E { a: 1, b: pkt.u8(0) == 1 };"));
+    assert!(msg.contains("`pkt` is only available in an `xdp` probe"), "{msg}");
+    let ds = diags(&xdp("    let i = 4;\n    emit E { a: 1, b: pkt.u16(i) };"));
+    assert!(ds[0].message.contains("packet offset `i` is a variable"), "{ds:#?}");
+    let msg = first_message(&xdp("    emit E { a: pkt.u32(300), b: 0 };"));
+    assert!(msg.contains("ends past 256 bytes"), "{msg}");
+    // consts are fine
+    ok(&format!("const IP_PROTO: u64 = 23;\n{}", xdp("    if pkt.u8(IP_PROTO) == 6 { drop(); }")));
+}

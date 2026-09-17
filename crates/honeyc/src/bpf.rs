@@ -71,6 +71,9 @@ const MOD: u8 = 0x90;
 const XOR: u8 = 0xa0;
 const MOV: u8 = 0xb0;
 const ARSH: u8 = 0xc0;
+const END: u8 = 0xd0;
+/// `BPF_TO_BE`: with `END`, convert between host and big-endian byte order.
+const TO_BE: u8 = 0x08;
 
 const JA: u8 = 0x00;
 const JEQ: u8 = 0x10;
@@ -214,6 +217,14 @@ pub fn alu32_imm(op: AluOp, dst: Reg, imm: i32) -> Insn {
 /// register to its low 32 bits.
 pub fn alu32_reg(op: AluOp, dst: Reg, src: Reg) -> Insn {
     Insn::new(ALU | op.bits() | X, dst, src, 0, 0)
+}
+
+/// `dst = bswap(dst)` for 16 or 32 bits: converts a big-endian (network
+/// order) value to host order on little-endian hosts, which is every host
+/// eBPF runs on in practice. Encoded as `ALU | END | TO_BE` with the width in
+/// `imm`; the kernel defines it as "to big-endian", which on LE is a swap.
+pub fn bswap(dst: Reg, bits: u8) -> Insn {
+    Insn::new(ALU | END | TO_BE, dst, Reg::R0, 0, bits as i32)
 }
 
 /// `dst = imm` as a full 64-bit load (the only way to get a value wider than
@@ -465,6 +476,9 @@ pub fn disasm(insn: &Insn) -> String {
         ALU | ALU64 => {
             let suffix = if class == ALU { "32" } else { "" };
             let op = insn.opcode & 0xf0;
+            if op == END {
+                return format!("bswap{} {dst}", insn.imm);
+            }
             let name = alu_name(op);
             if op == NEG {
                 return format!("{name}{suffix} {dst}");

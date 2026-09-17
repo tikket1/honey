@@ -96,6 +96,17 @@ per architecture: pass `--arch x86_64` when compiling for an x86 box (the
 default is aarch64, the dev environment). Every record starts with an
 8-byte header carrying the event id so one ring buffer serves every probe.
 
+### Packets (XDP)
+
+An `xdp` probe is `BPF_PROG_TYPE_XDP`, attached to an interface with
+`bpf_xdp_attach` in generic (skb) mode so it works on any device, loopback
+and veth included. XDP programs outlive the loader's file descriptors, so the
+loader detaches them on SIGINT/SIGTERM. The prologue loads `data`/`data_end`
+from the `xdp_md` context into R7/R8 (callee-saved, so helper calls keep
+them) and emits one bounds check for the largest offset the body reads; each
+`pkt.uN(off)` is then a plain load the verifier has already proven safe, with
+a `bswap` for 16/32-bit values. The default return is `XDP_PASS`.
+
 ### Reading kernel struct fields (CO-RE-lite)
 
 A kprobe/LSM argument typed `ptr<S>` can be walked with `.field`. honey reads

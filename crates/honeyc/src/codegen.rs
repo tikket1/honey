@@ -98,7 +98,12 @@ pub enum ProbeKind {
     Kretprobe { function: String },
     /// An LSM hook. The program returns 0 to allow, negative to deny.
     Lsm { hook: String },
+    /// An XDP program on a network interface. Returns an XDP action.
+    Xdp { interface: String },
 }
+
+const XDP_DROP: i32 = 1;
+const XDP_PASS: i32 = 2;
 
 /// A field-offset relocation: instruction slot `slot` carries the byte
 /// offset of `struct_name.field`, resolved at compile time from BTF. The
@@ -294,6 +299,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ("kprobe", [f]) => ProbeKind::Kprobe { function: f.clone() },
             ("kretprobe", [f]) => ProbeKind::Kretprobe { function: f.clone() },
             ("lsm", [h]) => ProbeKind::Lsm { hook: h.clone() },
+            ("xdp", [i]) => ProbeKind::Xdp { interface: i.clone() },
             (k, a) => return Err(format!("probe `{k}` with {} argument(s) is not supported", a.len())),
         };
         let name = match &kind {
@@ -301,6 +307,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ProbeKind::Kprobe { function } => format!("kprobe:{function}"),
             ProbeKind::Kretprobe { function } => format!("kretprobe:{function}"),
             ProbeKind::Lsm { hook } => format!("lsm:{hook}"),
+            ProbeKind::Xdp { interface } => format!("xdp:{interface}"),
         };
         let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p)?;
         programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs });
@@ -338,11 +345,29 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8
     cg.ctx_slot = cg.alloc_slot();
     cg.prog.push(stx_mem(Size::DW, Reg::R10, cg.ctx_slot, Reg::R1));
 
+    if let ProbeKind::Xdp { .. } = kind {
+        // R7 = packet start, R8 = packet end (callee-saved, survive helpers).
+        // Loads from the xdp_md context are 32-bit; the verifier rewrites
+        // them into full packet pointers.
+        cg.prog.push(ldx_mem(Size::W, Reg::R7, Reg::R1, 0));
+        cg.prog.push(ldx_mem(Size::W, Reg::R8, Reg::R1, 4));
+        // One bounds check on entry covering the furthest read in the body:
+        //   if data + MAX > data_end: pass (short packet)
+        let bound = pkt_max_bound(&p.body, &sh.consts)?;
+        if bound > 0 {
+            cg.prog.push(mov64_reg(Reg::R2, Reg::R7));
+            cg.prog.push(alu64_imm(AluOp::Add, Reg::R2, bound as i32));
+            cg.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, cg.exit_label);
+        }
+    }
+
     cg.block(&p.body, true)?;
 
-    // Epilogue: return 0.
+    // Epilogue: the probe's default return. XDP passes the packet; everything
+    // else returns 0 (allow, for LSM).
     cg.prog.bind(cg.exit_label);
-    cg.prog.push(mov64_imm(Reg::R0, 0));
+    let default_ret = if matches!(kind, ProbeKind::Xdp { .. }) { XDP_PASS } else { 0 };
+    cg.prog.push(mov64_imm(Reg::R0, default_ret));
     cg.prog.push(bpf::exit());
 
     if cg.max_stack > BPF_STACK_LIMIT {
@@ -413,6 +438,111 @@ fn map_spec(m: &MapDecl) -> Result<(MapSpec, Ty, Ty), String> {
             args.len()
         )),
     }
+}
+
+/// Pre-pass over an XDP probe body: the largest `offset + width` of any
+/// `pkt.u8/u16/u32(offset)` read, so one entry check can cover them all.
+fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, String> {
+    fn eval(e: &Expr, consts: &HashMap<String, i64>) -> Result<i64, String> {
+        match &e.kind {
+            ExprKind::Int(n) => Ok(*n as i64),
+            ExprKind::Ident(n) => consts.get(n).copied().ok_or_else(|| format!("packet offset `{n}` is not a constant")),
+            ExprKind::Binary { op, lhs, rhs } => {
+                let a = eval(lhs, consts)?;
+                let b = eval(rhs, consts)?;
+                Ok(match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    _ => return Err("unsupported operator in packet offset".into()),
+                })
+            }
+            _ => Err("packet offset must be a constant".into()),
+        }
+    }
+    fn expr(e: &Expr, consts: &HashMap<String, i64>, max: &mut u32) -> Result<(), String> {
+        match &e.kind {
+            ExprKind::MethodCall { receiver, method, args } => {
+                if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") {
+                    let width = match method.name.as_str() {
+                        "u8" => 1,
+                        "u16" => 2,
+                        "u32" => 4,
+                        _ => 0,
+                    };
+                    if width > 0
+                        && let [off] = args.as_slice()
+                    {
+                        let o = eval(off, consts)?;
+                        if o < 0 {
+                            return Err("packet offset must not be negative".into());
+                        }
+                        *max = (*max).max(o as u32 + width);
+                    }
+                } else {
+                    expr(receiver, consts, max)?;
+                }
+                for a in args {
+                    expr(a, consts, max)?;
+                }
+                Ok(())
+            }
+            ExprKind::Unary { expr: inner, .. } | ExprKind::Cast { expr: inner, .. } => expr(inner, consts, max),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expr(lhs, consts, max)?;
+                expr(rhs, consts, max)
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    expr(a, consts, max)?;
+                }
+                Ok(())
+            }
+            ExprKind::Field { expr: inner, .. } => expr(inner, consts, max),
+            ExprKind::Index { expr: inner, index } => {
+                expr(inner, consts, max)?;
+                expr(index, consts, max)
+            }
+            _ => Ok(()),
+        }
+    }
+    fn block(b: &Block, consts: &HashMap<String, i64>, max: &mut u32) -> Result<(), String> {
+        for s in &b.stmts {
+            match &s.kind {
+                StmtKind::Let { value, .. } => expr(value, consts, max)?,
+                StmtKind::Assign { target, value } => {
+                    expr(target, consts, max)?;
+                    expr(value, consts, max)?;
+                }
+                StmtKind::If { cond, then, otherwise } => {
+                    match cond {
+                        Cond::Expr(e) => expr(e, consts, max)?,
+                        Cond::Let { value, .. } => expr(value, consts, max)?,
+                    }
+                    block(then, consts, max)?;
+                    if let Some(o) = otherwise {
+                        block(o, consts, max)?;
+                    }
+                }
+                StmtKind::For { start, end, body, .. } => {
+                    expr(start, consts, max)?;
+                    expr(end, consts, max)?;
+                    block(body, consts, max)?;
+                }
+                StmtKind::Emit { fields, .. } => {
+                    for (_, v) in fields {
+                        expr(v, consts, max)?;
+                    }
+                }
+                StmtKind::Return(Some(e)) | StmtKind::Expr(e) => expr(e, consts, max)?,
+                StmtKind::Return(None) => {}
+            }
+        }
+        Ok(())
+    }
+    let mut max = 0;
+    block(body, consts, &mut max)?;
+    Ok(max)
 }
 
 fn str_capacity(t: &Type) -> Result<u32, String> {
@@ -833,6 +963,12 @@ impl Cg<'_> {
                 }
             }
             ExprKind::MethodCall { receiver, method, args } => {
+                if let ExprKind::Ident(n) = &receiver.kind
+                    && n == "pkt"
+                    && self.lookup("pkt").is_none()
+                {
+                    return self.pkt_method(&method.name, args);
+                }
                 if let ExprKind::Ident(n) = &receiver.kind {
                     if let Some(local) = self.lookup(n).cloned()
                         && let Ty::Str(cap) = local.ty
@@ -979,6 +1115,16 @@ impl Cg<'_> {
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R0, off));
                 Ok(Ty::I64)
             }
+            "drop" => {
+                self.prog.push(mov64_imm(Reg::R0, XDP_DROP));
+                self.prog.push(bpf::exit());
+                Ok(Ty::Uint(8))
+            }
+            "pass" => {
+                self.prog.push(mov64_imm(Reg::R0, XDP_PASS));
+                self.prog.push(bpf::exit());
+                Ok(Ty::Uint(8))
+            }
             "allow" => {
                 // return 0 (allow) immediately.
                 self.prog.push(mov64_imm(Reg::R0, 0));
@@ -1021,6 +1167,9 @@ impl Cg<'_> {
                         .ok_or_else(|| format!("arg index {n} out of range for {}", self.sh.arch.name()))?,
                     ProbeKind::Kretprobe { .. } => {
                         return Err("`arg()` is not available in a kretprobe".into());
+                    }
+                    ProbeKind::Xdp { .. } => {
+                        return Err("`arg()` is not available in an xdp probe".into());
                     }
                 };
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot));
@@ -1073,6 +1222,40 @@ impl Cg<'_> {
         };
         self.prog.push(ldx_mem(szenum, Reg::R0, Reg::R10, tmp));
         self.free_slot();
+    }
+
+    /// `pkt.u8/u16/u32(off)` and `pkt.len()`. R7 = data, R8 = data_end, and
+    /// the prologue proved `data + bound <= data_end` for every offset used,
+    /// so these loads are plain and the verifier accepts them.
+    fn pkt_method(&mut self, method: &str, args: &[Expr]) -> Result<Ty, String> {
+        if !matches!(self.kind, ProbeKind::Xdp { .. }) {
+            return Err("`pkt` is only available in an xdp probe".into());
+        }
+        match (method, args) {
+            ("len", []) => {
+                self.prog.push(mov64_reg(Reg::R0, Reg::R8));
+                self.prog.push(alu64_reg(AluOp::Sub, Reg::R0, Reg::R7));
+                Ok(Ty::Uint(4))
+            }
+            ("u8", [off]) => {
+                let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
+                self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R7, o));
+                Ok(Ty::Uint(1))
+            }
+            ("u16", [off]) => {
+                let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
+                self.prog.push(ldx_mem(Size::H, Reg::R0, Reg::R7, o));
+                self.prog.push(bswap(Reg::R0, 16)); // network -> host order
+                Ok(Ty::Uint(2))
+            }
+            ("u32", [off]) => {
+                let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
+                self.prog.push(ldx_mem(Size::W, Reg::R0, Reg::R7, o));
+                self.prog.push(bswap(Reg::R0, 32));
+                Ok(Ty::Uint(4))
+            }
+            (m, a) => Err(format!("`pkt` has no method `{m}` taking {} argument(s)", a.len())),
+        }
     }
 
     fn str_method(&mut self, off: i16, cap: u32, method: &str, args: &[Expr]) -> Result<Ty, String> {

@@ -1,0 +1,9 @@
+// error: `pkt` is only available in an `xdp` probe
+//
+// There is no packet in a kprobe. honey knows what each probe kind can see.
+
+event E { t: u16 }
+
+probe kprobe("vfs_open") {
+    emit E { t: pkt.u16(12) };
+}

@@ -149,6 +149,8 @@ pub const STACK_RESERVED: u32 = 40;
 pub const MAX_UNROLL: i64 = 64;
 /// Syscall tracepoints and kprobes expose at most six arguments.
 pub const MAX_ARG: i64 = 5;
+/// The furthest byte an XDP probe may read; the entry bounds check covers it.
+pub const MAX_PKT_BOUND: u32 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeKind {
@@ -157,6 +159,8 @@ enum ProbeKind {
     Kretprobe,
     /// An LSM hook: can observe and can `deny()` the action.
     Lsm,
+    /// An XDP program on a network interface: sees raw packets, can `drop()`.
+    Xdp,
 }
 
 // ----------------------------------------------------------------- checker
@@ -374,6 +378,11 @@ impl Checker<'_> {
             ("kprobe", 1) => Some(ProbeKind::Kprobe),
             ("kretprobe", 1) => Some(ProbeKind::Kretprobe),
             ("lsm", 1) => Some(ProbeKind::Lsm),
+            ("xdp", 1) => Some(ProbeKind::Xdp),
+            ("xdp", _) => {
+                self.error(p.span, "`xdp` takes one string argument: the interface name, e.g. `xdp(\"eth0\")`");
+                None
+            }
             ("kprobe" | "kretprobe", _) => {
                 self.error(p.span, format!("`{}` takes one string argument: the kernel function name", p.kind.name));
                 None
@@ -386,7 +395,7 @@ impl Checker<'_> {
                 self.error_help(
                     p.kind.span,
                     format!("unsupported probe kind `{other}`"),
-                    "use `tracepoint(\"category\", \"name\")`, `kprobe(\"function\")`, `kretprobe(\"function\")`, or `lsm(\"hook\")`",
+                    "use `tracepoint(\"category\", \"name\")`, `kprobe(\"function\")`, `kretprobe(\"function\")`, `lsm(\"hook\")`, or `xdp(\"interface\")`",
                 );
                 None
             }
@@ -898,6 +907,19 @@ impl Checker<'_> {
             self.error(callee.span, "only builtins can be called");
             return Ty::Unit;
         };
+        if self.probe_kind == Some(ProbeKind::Xdp)
+            && matches!(name.as_str(), "pid" | "tgid" | "tid" | "uid" | "gid" | "comm" | "arg" | "retval")
+        {
+            self.error_help(
+                span,
+                format!("`{name}()` is not available in an `xdp` probe: a packet has no process context"),
+                "use `pkt.u8/u16/u32(offset)`, `pkt.len()`, and `ktime()` here",
+            );
+            for a in args {
+                self.expr(a);
+            }
+            return if name == "comm" { Ty::Str(16) } else { Ty::U64 };
+        }
         match (name.as_str(), args) {
             ("pid" | "tgid" | "tid" | "uid" | "gid", []) => Ty::U32,
             ("ktime", []) => Ty::U64,
@@ -932,6 +954,20 @@ impl Checker<'_> {
             }
             ("read_user_str" | "read_kernel_str", _) => {
                 self.error_help(span, format!("`{name}` must initialise a bounded string"), format!("write `let s: str<N> = {name}(ptr);`"));
+                Ty::Unit
+            }
+            ("drop" | "pass", []) => {
+                if self.probe_kind != Some(ProbeKind::Xdp) {
+                    self.error_help(
+                        span,
+                        format!("`{name}()` is only available in an `xdp` probe"),
+                        "only an XDP program decides a packet's fate; use `probe xdp(\"iface\") {{ ... }}`",
+                    );
+                }
+                Ty::Unit
+            }
+            ("drop" | "pass", _) => {
+                self.error(span, format!("`{name}()` takes no arguments"));
                 Ty::Unit
             }
             ("deny" | "allow", []) => {
@@ -970,6 +1006,49 @@ impl Checker<'_> {
             self.error(receiver.span, "methods can only be called on maps and strings");
             return Ty::Unit;
         };
+
+        // The packet view, only in xdp probes.
+        if rname == "pkt" && self.lookup("pkt").is_none() {
+            if self.probe_kind != Some(ProbeKind::Xdp) {
+                self.error_help(span, "`pkt` is only available in an `xdp` probe", "packets exist only in `probe xdp(\"iface\")`");
+                for a in args {
+                    self.expr(a);
+                }
+                return Ty::Unit;
+            }
+            return match (method.name.as_str(), args) {
+                ("len", []) => Ty::U32,
+                ("u8" | "u16" | "u32", [off]) => {
+                    let width: u32 = match method.name.as_str() {
+                        "u8" => 1,
+                        "u16" => 2,
+                        _ => 4,
+                    };
+                    match self.const_eval_global(off) {
+                        Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
+                        Some(o) if o as u32 + width > MAX_PKT_BOUND => self.error_help(
+                            off.span,
+                            format!("packet read at offset {o} ends past {MAX_PKT_BOUND} bytes, the most an XDP probe may inspect"),
+                            "honey checks the packet is at least that long once, on entry; keep reads within the first 256 bytes",
+                        ),
+                        _ => {}
+                    }
+                    match width {
+                        1 => Ty::U8,
+                        2 => Ty::U16,
+                        _ => Ty::U32,
+                    }
+                }
+                ("u8" | "u16" | "u32", _) => {
+                    self.error(span, format!("`pkt.{}` takes one constant offset", method.name));
+                    Ty::Unit
+                }
+                (m, _) => {
+                    self.error(method.span, format!("`pkt` has no method `{m}`; use `u8(off)`, `u16(off)`, `u32(off)`, or `len()`"));
+                    Ty::Unit
+                }
+            };
+        }
 
         // Strings.
         if let Some(var) = self.lookup(rname).cloned() {
@@ -1041,6 +1120,22 @@ impl Checker<'_> {
                 }
                 Ty::Unit
             }
+        }
+    }
+
+    /// Like `const_eval` but without loop variables: for packet offsets, which
+    /// must be fixed so the single entry bounds check can cover them all.
+    fn const_eval_global(&mut self, e: &Expr) -> Option<i64> {
+        match &e.kind {
+            ExprKind::Ident(name) if self.lookup(name).is_some() => {
+                self.error_help(
+                    e.span,
+                    format!("packet offset `{name}` is a variable"),
+                    "packet offsets must be literals or `const`s so honey can bounds-check the packet once on entry",
+                );
+                None
+            }
+            _ => self.const_eval(e),
         }
     }
 

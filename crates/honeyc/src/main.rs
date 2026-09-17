@@ -281,6 +281,7 @@ fn manifest(c: &Compiled) -> String {
             ProbeKind::Kprobe { function } => format!("\"type\": \"kprobe\", \"function\": {}", jstr(function)),
             ProbeKind::Kretprobe { function } => format!("\"type\": \"kretprobe\", \"function\": {}", jstr(function)),
             ProbeKind::Lsm { hook } => format!("\"type\": \"lsm\", \"hook\": {}", jstr(hook)),
+            ProbeKind::Xdp { interface } => format!("\"type\": \"xdp\", \"interface\": {}", jstr(interface)),
         };
         let comma = if i + 1 < c.programs.len() { "," } else { "" };
         let mut relocs = String::from("[");

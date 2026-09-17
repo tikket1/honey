@@ -28,6 +28,9 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#include <signal.h>
+#include <net/if.h>
+#include <linux/if_link.h>
 
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
@@ -113,6 +116,7 @@ struct program {
     char tracepoint[64];
     char function[64];  // kprobe / kretprobe
     char hook[64];      // lsm
+    char interface[32]; // xdp
     size_t offset;
     size_t insns;
     const char *relocs; // pointer into the manifest text: the "relocs":[...] array
@@ -189,6 +193,40 @@ static int load_and_attach_lsm(const char *hook, const char *license,
         return -1;
     }
     return prog_fd;
+}
+
+// XDP programs attach to a network interface, not to a perf event, and they
+// stay attached after the loader exits unless detached. Generic ("skb") mode
+// works on any device, including veth and loopback, at the cost of running
+// after the skb is built rather than in the driver.
+static int g_xdp_ifindex[MAX_PROGS];
+static int g_xdp_count;
+static volatile sig_atomic_t g_stop;
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_stop = 1;
+}
+
+static int attach_xdp(const char *interface, int prog_fd) {
+    int ifindex = if_nametoindex(interface);
+    if (ifindex == 0) {
+        fprintf(stderr, "xdp: no interface named `%s`\n", interface);
+        return -1;
+    }
+    int err = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST, NULL);
+    if (err < 0) {
+        fprintf(stderr, "xdp: attach to %s (ifindex %d) failed: %s\n", interface, ifindex, strerror(-err));
+        if (-err == EBUSY) fprintf(stderr, "  (another XDP program is already attached there)\n");
+        return -1;
+    }
+    g_xdp_ifindex[g_xdp_count++] = ifindex;
+    return 0;
+}
+
+static void detach_all_xdp(void) {
+    for (int i = 0; i < g_xdp_count; i++)
+        bpf_xdp_detach(g_xdp_ifindex[i], XDP_FLAGS_SKB_MODE, NULL);
 }
 
 // kprobes attach through the "kprobe" perf PMU: its numeric type comes from
@@ -442,6 +480,7 @@ int main(int argc, char **argv) {
         json_str_in(p, next, "tracepoint", pr->tracepoint, sizeof pr->tracepoint);
         json_str_in(p, next, "function", pr->function, sizeof pr->function);
         json_str_in(p, next, "hook", pr->hook, sizeof pr->hook);
+        json_str_in(p, next, "interface", pr->interface, sizeof pr->interface);
         pr->offset = json_int_in(p, next, "offset", 0);
         pr->insns = json_int_in(p, next, "insns", 0);
         pr->relocs = strstr(p, "\"relocs\":");
@@ -488,6 +527,18 @@ int main(int argc, char **argv) {
         relocate_map_fds(insns, bytes, fds, nfds);
         if (apply_relocs(insns, bytes, pr) < 0) return 1;
 
+        if (strcmp(pr->type, "xdp") == 0) {
+            LIBBPF_OPTS(bpf_prog_load_opts, xopts, .log_buf = log, .log_size = sizeof log, .log_level = 1);
+            int fd = bpf_prog_load(BPF_PROG_TYPE_XDP, "honeyxdp", license, (const struct bpf_insn *)insns, pr->insns, &xopts);
+            if (fd < 0) {
+                fprintf(stderr, "%s: verifier rejected the program (%s):\n%s\n", pr->name, strerror(-fd), log);
+                return 1;
+            }
+            if (attach_xdp(pr->interface, fd) < 0) return 1;
+            fprintf(stderr, "%s: loaded (%zu insns, fd %d) and attached (generic mode)\n", pr->name, pr->insns, fd);
+            continue;
+        }
+
         if (strcmp(pr->type, "lsm") == 0) {
             int fd = load_and_attach_lsm(pr->hook, license, (const struct bpf_insn *)insns, pr->insns, log, sizeof log);
             if (fd < 0) return 1;
@@ -519,10 +570,15 @@ int main(int argc, char **argv) {
     struct ctx c = { .events = events, .n_events = n_events, .header = (uint32_t)header, .json = json };
     struct ring_buffer *rb = ring_buffer__new(rb_fd, on_event, &c, NULL);
     if (!rb) { fprintf(stderr, "ring_buffer__new failed\n"); return 1; }
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
     fprintf(stderr, "waiting for events, Ctrl-C to stop...\n");
-    while (1) {
+    while (!g_stop) {
         int err = ring_buffer__poll(rb, 200);
         if (err < 0 && err != -EINTR) { fprintf(stderr, "poll: %s\n", strerror(-err)); break; }
     }
+    // XDP programs outlive their fds; take them off the interfaces.
+    detach_all_xdp();
+    if (g_xdp_count) fprintf(stderr, "detached %d xdp program(s)\n", g_xdp_count);
     return 0;
 }
