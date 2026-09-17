@@ -44,6 +44,7 @@ use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::bpf::{self, *};
+use crate::btf::{Btf, Resolved};
 use crate::layout::{layout_event, EventLayout, FieldKind};
 
 // ------------------------------------------------------------------ output
@@ -99,6 +100,16 @@ pub enum ProbeKind {
     Lsm { hook: String },
 }
 
+/// A field-offset relocation: instruction slot `slot` carries the byte
+/// offset of `struct_name.field`, resolved at compile time from BTF. The
+/// loader re-resolves it against the running kernel and rewrites the imm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloc {
+    pub slot: usize,
+    pub struct_name: String,
+    pub field: String,
+}
+
 /// One BPF program.
 #[derive(Debug, Clone)]
 pub struct CompiledProbe {
@@ -107,6 +118,7 @@ pub struct CompiledProbe {
     pub kind: ProbeKind,
     pub bytecode: Vec<u8>,
     pub stack_bytes: u32,
+    pub relocs: Vec<Reloc>,
 }
 
 /// Everything the loader needs to install a honey program.
@@ -158,6 +170,10 @@ enum Ty {
     Str(u32),
     ValuePtr(Box<Ty>),
     OptionPtr(Box<Ty>),
+    /// Kernel pointer to a named struct (an address).
+    KPtr(String),
+    /// Kernel pointer to char (a string address).
+    KCharPtr,
 }
 
 impl Ty {
@@ -169,6 +185,7 @@ impl Ty {
             ("u64", []) => Ok(Ty::Uint(8)),
             ("i64", []) => Ok(Ty::I64),
             ("bool", []) => Ok(Ty::Bool),
+            ("ptr", [TypeArg::Type(inner)]) => Ok(Ty::KPtr(inner.name.name.clone())),
             (other, _) => Err(format!("type `{other}` is not supported in codegen")),
         }
     }
@@ -178,7 +195,7 @@ impl Ty {
             Ty::Uint(w) => *w,
             Ty::Bool => 1,
             Ty::Str(n) => *n,
-            Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) => 8,
+            Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::KPtr(_) | Ty::KCharPtr => 8,
         }
     }
 
@@ -201,7 +218,7 @@ struct Local {
 }
 
 /// Declarations shared by every probe in the program.
-struct Shared {
+struct Shared<'a> {
     events: Vec<EventLayout>,
     event_ids: HashMap<String, u32>,
     maps: Vec<MapSpec>,
@@ -209,10 +226,12 @@ struct Shared {
     map_types: HashMap<String, (Ty, Ty)>,
     consts: HashMap<String, i64>,
     arch: Arch,
+    btf: Option<&'a Btf>,
 }
 
+
 struct Cg<'a> {
-    sh: &'a Shared,
+    sh: &'a Shared<'a>,
     kind: &'a ProbeKind,
     prog: Prog,
     scopes: Vec<HashMap<String, Local>>,
@@ -222,11 +241,17 @@ struct Cg<'a> {
     max_stack: i32,
     exit_label: Label,
     ctx_slot: i16,
+    /// (instruction index, struct, field) field-offset relocations.
+    relocs: Vec<(usize, String, String)>,
 }
 
 // -------------------------------------------------------------------- entry
 
 pub fn compile(program: &Program, arch: Arch) -> Result<Compiled, String> {
+    compile_with_btf(program, arch, None)
+}
+
+pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Result<Compiled, String> {
     let mut sh = Shared {
         events: Vec::new(),
         event_ids: HashMap::new(),
@@ -235,6 +260,7 @@ pub fn compile(program: &Program, arch: Arch) -> Result<Compiled, String> {
         map_types: HashMap::new(),
         consts: HashMap::new(),
         arch,
+        btf,
     };
     let mut probes = Vec::new();
 
@@ -276,8 +302,8 @@ pub fn compile(program: &Program, arch: Arch) -> Result<Compiled, String> {
             ProbeKind::Kretprobe { function } => format!("kretprobe:{function}"),
             ProbeKind::Lsm { hook } => format!("lsm:{hook}"),
         };
-        let (bytecode, stack_bytes) = compile_probe(&sh, &kind, p)?;
-        programs.push(CompiledProbe { name, kind, bytecode, stack_bytes });
+        let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p)?;
+        programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs });
     }
 
     let stack_bytes = programs.iter().map(|p| p.stack_bytes).max().unwrap_or(0);
@@ -292,7 +318,7 @@ pub fn compile(program: &Program, arch: Arch) -> Result<Compiled, String> {
     })
 }
 
-fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8>, u32), String> {
+fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8>, u32, Vec<Reloc>), String> {
     let mut prog = Prog::new();
     let exit_label = prog.new_label();
     let mut cg = Cg {
@@ -305,6 +331,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8
         max_stack: 0,
         exit_label,
         ctx_slot: 0,
+        relocs: Vec::new(),
     };
 
     // Prologue: save the context pointer (R1) for `arg` / `retval`.
@@ -325,7 +352,25 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8
         ));
     }
     let max_stack = cg.max_stack as u32;
-    Ok((cg.prog.to_bytes()?, max_stack))
+    let reloc_sites = std::mem::take(&mut cg.relocs);
+    let insns = cg.prog.resolve()?;
+    // Map each reloc's instruction index to its byte-slot index (LD_IMM64
+    // spans two slots, so index != slot).
+    let mut slot_start = Vec::with_capacity(insns.len());
+    let mut slot = 0usize;
+    for insn in &insns {
+        slot_start.push(slot);
+        slot += insn.slots();
+    }
+    let relocs = reloc_sites
+        .into_iter()
+        .map(|(idx, st, f)| Reloc { slot: slot_start[idx], struct_name: st, field: f })
+        .collect();
+    let mut out = Vec::with_capacity(insns.len() * 8);
+    for insn in &insns {
+        insn.encode(&mut out);
+    }
+    Ok((out, max_stack, relocs))
 }
 
 fn const_value(e: &Expr) -> Result<i64, String> {
@@ -500,7 +545,7 @@ impl Cg<'_> {
                     let n = str_capacity(t)?;
                     let off = self.alloc_bytes(n);
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off, ty: Ty::Str(n) });
-                    return self.read_user_str_into(off, n, value);
+                    return self.read_str_into(off, n, value);
                 }
                 let vty = self.expr(value)?;
                 let ty = match ty {
@@ -800,7 +845,43 @@ impl Cg<'_> {
                 }
                 Err(format!("`.{}()` is only supported on maps and strings", method.name))
             }
-            ExprKind::Field { .. } => Err("field access is not supported".into()),
+            ExprKind::Field { expr, field } => {
+                let base = self.expr(expr)?;
+                let Ty::KPtr(sname) = base else {
+                    return Err(format!("`.{}` needs a kernel struct pointer", field.name));
+                };
+                let btf = self.sh.btf.ok_or("kernel field access needs BTF")?;
+                let member = btf
+                    .member(&sname, &field.name)
+                    .ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
+                let off = member.offset_bytes as i32;
+                match btf.resolve(member.type_id) {
+                    Resolved::Struct { name } => {
+                        // embedded struct: address = base + off (no read)
+                        let idx = self.prog.len();
+                        self.prog.push(alu64_imm(AluOp::Add, Reg::R0, off));
+                        self.relocs.push((idx, sname.clone(), field.name.clone()));
+                        Ok(Ty::KPtr(name))
+                    }
+                    Resolved::PtrToStruct { name } => {
+                        self.emit_kernel_read(&sname, &field.name, off, 8);
+                        Ok(Ty::KPtr(name))
+                    }
+                    Resolved::PtrToChar => {
+                        self.emit_kernel_read(&sname, &field.name, off, 8);
+                        Ok(Ty::KCharPtr)
+                    }
+                    Resolved::PtrToOther => {
+                        self.emit_kernel_read(&sname, &field.name, off, 8);
+                        Ok(Ty::Uint(8))
+                    }
+                    Resolved::Int { bytes, .. } => {
+                        self.emit_kernel_read(&sname, &field.name, off, bytes);
+                        Ok(Ty::Uint(bytes))
+                    }
+                    Resolved::Other => Err(format!("field `{}` has a type honey can't read", field.name)),
+                }
+            }
             ExprKind::Index { .. } => Err("indexing is not supported".into()),
         }
     }
@@ -951,23 +1032,47 @@ impl Cg<'_> {
         }
     }
 
-    fn read_user_str_into(&mut self, off: i16, n: u32, value: &Expr) -> Result<(), String> {
+    fn read_str_into(&mut self, off: i16, n: u32, value: &Expr) -> Result<(), String> {
         let ExprKind::Call { callee, args } = &value.kind else {
-            return Err("a `str<N>` local must be initialised with `read_user_str(ptr)`".into());
+            return Err("a `str<N>` local must be initialised with `read_user_str`/`read_kernel_str`".into());
         };
-        if !matches!(&callee.kind, ExprKind::Ident(name) if name == "read_user_str") {
-            return Err("a `str<N>` local must be initialised with `read_user_str(ptr)`".into());
-        }
+        let helper = match &callee.kind {
+            ExprKind::Ident(name) if name == "read_user_str" => Helper::ProbeReadUserStr,
+            ExprKind::Ident(name) if name == "read_kernel_str" => Helper::ProbeReadKernelStr,
+            _ => return Err("a `str<N>` local must be initialised with `read_user_str`/`read_kernel_str`".into()),
+        };
         let [src] = args.as_slice() else {
-            return Err("`read_user_str` takes exactly one pointer argument".into());
+            return Err("the string reader takes exactly one pointer argument".into());
         };
-        self.expr(src)?;
+        self.expr(src)?; // R0 = source address
         self.prog.push(mov64_reg(Reg::R3, Reg::R0));
         self.prog.push(mov64_reg(Reg::R1, Reg::R10));
         self.prog.push(alu64_imm(AluOp::Add, Reg::R1, off as i32));
         self.prog.push(mov64_imm(Reg::R2, n as i32));
-        self.prog.push(call(Helper::ProbeReadUserStr));
+        self.prog.push(call(helper));
         Ok(())
+    }
+
+    /// Emit a BTF-relocated read of `size` bytes from `[R0 + field_offset]`
+    /// into R0. Records the offset instruction as a relocation site.
+    fn emit_kernel_read(&mut self, struct_name: &str, field: &str, off: i32, size: u32) {
+        self.prog.push(mov64_reg(Reg::R3, Reg::R0)); // R3 = base address
+        let idx = self.prog.len();
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R3, off)); // <- reloc site
+        self.relocs.push((idx, struct_name.to_string(), field.to_string()));
+        let tmp = self.alloc_slot();
+        self.prog.push(mov64_reg(Reg::R1, Reg::R10));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R1, tmp as i32));
+        self.prog.push(mov64_imm(Reg::R2, size as i32));
+        self.prog.push(call(Helper::ProbeReadKernel));
+        let szenum = match size {
+            1 => Size::B,
+            2 => Size::H,
+            4 => Size::W,
+            _ => Size::DW,
+        };
+        self.prog.push(ldx_mem(szenum, Reg::R0, Reg::R10, tmp));
+        self.free_slot();
     }
 
     fn str_method(&mut self, off: i16, cap: u32, method: &str, args: &[Expr]) -> Result<Ty, String> {

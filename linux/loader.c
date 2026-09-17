@@ -115,6 +115,8 @@ struct program {
     char hook[64];      // lsm
     size_t offset;
     size_t insns;
+    const char *relocs; // pointer into the manifest text: the "relocs":[...] array
+    const char *relocs_end;
 };
 
 // ----------------------------------------------------------------- attach
@@ -294,6 +296,53 @@ static int on_event(void *vctx, void *data, size_t len) {
 
 // ----------------------------------------------------- map fd relocation
 
+// Resolve struct.field byte offset from the running kernel's BTF, so a probe
+// compiled against one kernel's layout still reads the right bytes here.
+static struct btf *g_vmlinux;
+static long btf_field_offset(const char *struct_name, const char *field) {
+    if (!g_vmlinux) {
+        g_vmlinux = btf__load_vmlinux_btf();
+        if (!g_vmlinux) return -1;
+    }
+    int sid = btf__find_by_name_kind(g_vmlinux, struct_name, BTF_KIND_STRUCT);
+    if (sid < 0) sid = btf__find_by_name_kind(g_vmlinux, struct_name, BTF_KIND_UNION);
+    if (sid < 0) return -1;
+    const struct btf_type *t = btf__type_by_id(g_vmlinux, sid);
+    const struct btf_member *m = btf_members(t);
+    for (int i = 0; i < btf_vlen(t); i++) {
+        const char *mn = btf__name_by_offset(g_vmlinux, m[i].name_off);
+        if (mn && strcmp(mn, field) == 0) return btf_member_bit_offset(t, i) / 8;
+    }
+    return -1;
+}
+
+// Rewrite each field-offset relocation's immediate (the imm of the `add`
+// instruction at its slot) to the offset resolved from this kernel's BTF.
+static int apply_relocs(uint8_t *insns, size_t bytes, struct program *pr) {
+    if (!pr->relocs) return 0;
+    const char *p = pr->relocs;
+    const char *limit = pr->relocs_end;
+    while ((p = strstr(p, "\"slot\":")) != NULL) {
+        if (limit && p >= limit) break;
+        long slot = json_int_in(p, limit, "slot", -1);
+        char sname[64] = "", field[64] = "";
+        json_str_in(p, limit, "struct", sname, sizeof sname);
+        json_str_in(p, limit, "field", field, sizeof field);
+        p += 7;
+        if (slot < 0) continue;
+        size_t at = (size_t)slot * 8;
+        if (at + 8 > bytes) { fprintf(stderr, "reloc slot %ld out of range\n", slot); return -1; }
+        long off = btf_field_offset(sname, field);
+        if (off < 0) {
+            fprintf(stderr, "cannot resolve %s.%s in this kernel's BTF\n", sname, field);
+            return -1;
+        }
+        int32_t imm = (int32_t)off;
+        memcpy(insns + at + 4, &imm, 4);
+    }
+    return 0;
+}
+
 // `ld64 rN, map_fd(i)` is a 16-byte LD_IMM64 (opcode 0x18) with src-reg
 // nibble 1 (BPF_PSEUDO_MAP_FD) and imm = map index. Rewrite to the real fd.
 static void relocate_map_fds(uint8_t *insns, size_t bytes, const int *fds, int nfds) {
@@ -395,6 +444,9 @@ int main(int argc, char **argv) {
         json_str_in(p, next, "hook", pr->hook, sizeof pr->hook);
         pr->offset = json_int_in(p, next, "offset", 0);
         pr->insns = json_int_in(p, next, "insns", 0);
+        pr->relocs = strstr(p, "\"relocs\":");
+        if (pr->relocs && next && pr->relocs > next) pr->relocs = NULL;
+        pr->relocs_end = next;
         if (pr->offset + pr->insns * 8 > code_len) {
             fprintf(stderr, "program %s: offset/insns exceed the bytecode file\n", pr->name);
             return 1;
@@ -434,6 +486,7 @@ int main(int argc, char **argv) {
         uint8_t *insns = code + pr->offset;
         size_t bytes = pr->insns * 8;
         relocate_map_fds(insns, bytes, fds, nfds);
+        if (apply_relocs(insns, bytes, pr) < 0) return 1;
 
         if (strcmp(pr->type, "lsm") == 0) {
             int fd = load_and_attach_lsm(pr->hook, license, (const struct bpf_insn *)insns, pr->insns, log, sizeof log);

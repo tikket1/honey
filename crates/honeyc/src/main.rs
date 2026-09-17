@@ -18,6 +18,15 @@ use honeyc::layout::FieldKind;
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
     // Pull out `--arch X` wherever it appears.
+    let mut btf_path: Option<String> = None;
+    if let Some(i) = args.iter().position(|a| a == "--btf") {
+        let Some(path) = args.get(i + 1).cloned() else {
+            eprintln!("--btf needs a path to a BTF file (e.g. build/vmlinux.btf)");
+            process::exit(2);
+        };
+        btf_path = Some(path);
+        args.drain(i..i + 2);
+    }
     let mut arch = Arch::Aarch64;
     if let Some(i) = args.iter().position(|a| a == "--arch") {
         let Some(name) = args.get(i + 1) else {
@@ -33,17 +42,29 @@ fn main() {
         }
         args.drain(i..i + 2);
     }
+    let btf = match &btf_path {
+        Some(path) => match honeyc::btf::Btf::load(path) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let btf = btf.as_ref();
+
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
     let code = match strs.as_slice() {
         ["--tokens", path] => cmd_tokens(path),
-        ["check", path] => cmd_check(path),
-        ["--asm", path] => cmd_asm(path, arch),
-        ["build", path, "-o", out] => cmd_build(path, out, arch),
+        ["check", path] => cmd_check(path, btf),
+        ["--asm", path] => cmd_asm(path, arch, btf),
+        ["build", path, "-o", out] => cmd_build(path, out, arch, btf),
         [path] if !path.starts_with('-') => cmd_pretty(path),
         _ => {
-            eprintln!("usage: honeyc [--tokens|--asm] <file.hny> [--arch aarch64|x86_64]");
-            eprintln!("       honeyc check <file.hny>");
-            eprintln!("       honeyc build <file.hny> -o <out> [--arch aarch64|x86_64]");
+            eprintln!("usage: honeyc [--tokens|--asm] <file.hny> [--arch aarch64|x86_64] [--btf <file>]");
+            eprintln!("       honeyc check <file.hny> [--btf <file>]");
+            eprintln!("       honeyc build <file.hny> -o <out> [--arch aarch64|x86_64] [--btf <file>]");
             2
         }
     };
@@ -90,7 +111,7 @@ fn cmd_pretty(path: &str) -> i32 {
     }
 }
 
-fn cmd_check(path: &str) -> i32 {
+fn cmd_check(path: &str, btf: Option<&honeyc::btf::Btf>) -> i32 {
     let src = read(path);
     let program = match honeyc::parser::parse(&src) {
         Ok(p) => p,
@@ -99,7 +120,7 @@ fn cmd_check(path: &str) -> i32 {
             return 1;
         }
     };
-    match honeyc::typeck::check(&program) {
+    match honeyc::typeck::check_with_btf(&program, btf) {
         Ok(ok) => {
             eprintln!("{path}: ok ({} bytes of stack)", ok.stack_bytes);
             0
@@ -111,9 +132,9 @@ fn cmd_check(path: &str) -> i32 {
     }
 }
 
-fn cmd_asm(path: &str, arch: Arch) -> i32 {
+fn cmd_asm(path: &str, arch: Arch, btf: Option<&honeyc::btf::Btf>) -> i32 {
     let src = read(path);
-    match compile(path, &src, arch) {
+    match compile(path, &src, arch, btf) {
         Some(c) => {
             for (i, p) in c.programs.iter().enumerate() {
                 if i > 0 {
@@ -128,9 +149,9 @@ fn cmd_asm(path: &str, arch: Arch) -> i32 {
     }
 }
 
-fn cmd_build(path: &str, out: &str, arch: Arch) -> i32 {
+fn cmd_build(path: &str, out: &str, arch: Arch, btf: Option<&honeyc::btf::Btf>) -> i32 {
     let src = read(path);
-    let Some(c) = compile(path, &src, arch) else { return 1 };
+    let Some(c) = compile(path, &src, arch, btf) else { return 1 };
 
     // All programs concatenated; the manifest records each one's offset.
     let mut bin_bytes = Vec::new();
@@ -158,7 +179,7 @@ fn cmd_build(path: &str, out: &str, arch: Arch) -> i32 {
 }
 
 /// Lex, parse, type-check, and run codegen; report errors against the source.
-fn compile(path: &str, src: &str, arch: Arch) -> Option<Compiled> {
+fn compile(path: &str, src: &str, arch: Arch, btf: Option<&honeyc::btf::Btf>) -> Option<Compiled> {
     let program = match honeyc::parser::parse(src) {
         Ok(p) => p,
         Err(e) => {
@@ -166,11 +187,11 @@ fn compile(path: &str, src: &str, arch: Arch) -> Option<Compiled> {
             return None;
         }
     };
-    if let Err(diags) = honeyc::typeck::check(&program) {
+    if let Err(diags) = honeyc::typeck::check_with_btf(&program, btf) {
         report_diags(path, src, &diags);
         return None;
     }
-    match codegen::compile(&program, arch) {
+    match codegen::compile_with_btf(&program, arch, btf) {
         Ok(c) => Some(c),
         Err(msg) => {
             eprintln!("{path}: codegen error: {msg}");
@@ -262,8 +283,14 @@ fn manifest(c: &Compiled) -> String {
             ProbeKind::Lsm { hook } => format!("\"type\": \"lsm\", \"hook\": {}", jstr(hook)),
         };
         let comma = if i + 1 < c.programs.len() { "," } else { "" };
+        let mut relocs = String::from("[");
+        for (j, r) in p.relocs.iter().enumerate() {
+            if j > 0 { relocs.push_str(", "); }
+            relocs.push_str(&format!("{{ \"slot\": {}, \"struct\": {}, \"field\": {} }}", r.slot, jstr(&r.struct_name), jstr(&r.field)));
+        }
+        relocs.push(']');
         s.push_str(&format!(
-            "    {{ \"prog\": {}, {attach}, \"offset\": {offset}, \"insns\": {}, \"stack_bytes\": {} }}{comma}\n",
+            "    {{ \"prog\": {}, {attach}, \"offset\": {offset}, \"insns\": {}, \"stack_bytes\": {}, \"relocs\": {relocs} }}{comma}\n",
             jstr(&p.name), p.bytecode.len() / 8, p.stack_bytes
         ));
         offset += p.bytecode.len();

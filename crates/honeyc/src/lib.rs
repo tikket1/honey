@@ -14,6 +14,7 @@
 
 pub mod ast;
 pub mod bpf;
+pub mod btf;
 pub mod codegen;
 pub mod layout;
 pub mod lexer;

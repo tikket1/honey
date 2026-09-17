@@ -243,6 +243,7 @@ Precedence, lowest to highest: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`,
 | `hash<K, V>`, `array<V>`| Map kinds, only in `map` declarations. K and V are integers or bool. |
 | `Option<&V>`            | The result of `map.get`. Not user-writable. Must be matched with `if let Some(v)` / `if let None`. |
 | `&V`                    | A checked pointer, only bound by `if let Some(v)` and only inside that block. `*v` reads it. |
+| `ptr<S>`                | A kernel pointer to `struct S` (a real kernel type, checked against BTF). From `let p: ptr<S> = arg(n);`. Read fields with `.` (pointers auto-deref). |
 
 Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 

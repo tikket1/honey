@@ -1,0 +1,37 @@
+// file_open_path.hny — log the name of every file opened, by walking kernel
+// structs from a kprobe argument.
+//
+// `vfs_open(const struct path *path, struct file *file)`. At function entry
+// the interesting data is in arg 0, the `struct path *` (the file's own
+// `f_path` is not filled in until later inside the call). From the path:
+//
+//     path -> dentry (struct dentry *)
+//          -> d_name (struct qstr, embedded)
+//          -> name   (const unsigned char *)   == the filename bytes
+//
+// honey reads the kernel's BTF at compile time to know those field offsets,
+// and records each hop in the manifest so the loader re-resolves it against
+// whatever kernel it runs on. That is what lets one compiled probe survive a
+// kernel upgrade: the CO-RE idea, honey-sized.
+//
+//   linux/export-btf                                    # once: build/vmlinux.btf
+//   honeyc build examples/file_open_path.hny -o build/fop --btf build/vmlinux.btf
+//   linux/honey-linux ./linux/run.sh --json build/fop.bin build/fop.json
+
+event OpenPath {
+    pid: u32,
+    uid: u32,
+    comm: str<16>,
+    file: str<64>,
+}
+
+probe kprobe("vfs_open") {
+    let p: ptr<path> = arg(0);
+    let name: str<64> = read_kernel_str(p.dentry.d_name.name);
+    emit OpenPath {
+        pid: pid(),
+        uid: uid(),
+        comm: comm(),
+        file: name,
+    };
+}

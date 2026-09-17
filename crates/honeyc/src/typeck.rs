@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
+use crate::btf::{Btf, Resolved};
 use crate::token::Span;
 
 // ------------------------------------------------------------------- types
@@ -48,6 +49,10 @@ pub enum Ty {
     Option(Box<Ty>),
     /// A checked pointer into a map value.
     Ref(Box<Ty>),
+    /// A kernel pointer to a named struct (from `arg(n)` typed `ptr<S>`).
+    KPtr(String),
+    /// A kernel pointer to a char: a string address for `read_kernel_str`.
+    KCharPtr,
     /// Statements-as-expressions (`map.insert`) produce this.
     Unit,
     /// An integer literal that has not yet picked a width.
@@ -113,6 +118,8 @@ impl std::fmt::Display for Ty {
             Ty::Str(n) => write!(f, "str<{n}>"),
             Ty::Option(inner) => write!(f, "Option<&{inner}>"),
             Ty::Ref(inner) => write!(f, "&{inner}"),
+            Ty::KPtr(name) => write!(f, "ptr<{name}>"),
+            Ty::KCharPtr => write!(f, "ptr<char>"),
             Ty::Unit => write!(f, "()"),
             Ty::Int => write!(f, "{{integer}}"),
         }
@@ -177,7 +184,8 @@ struct EventInfo {
     fields: Vec<(String, Ty)>,
 }
 
-struct Checker {
+struct Checker<'a> {
+    btf: Option<&'a Btf>,
     consts: HashMap<String, (Ty, u64)>,
     maps: HashMap<String, MapInfo>,
     events: HashMap<String, EventInfo>,
@@ -190,7 +198,12 @@ struct Checker {
 }
 
 pub fn check(program: &Program) -> Result<Checked, Vec<Diag>> {
+    check_with_btf(program, None)
+}
+
+pub fn check_with_btf(program: &Program, btf: Option<&Btf>) -> Result<Checked, Vec<Diag>> {
     let mut c = Checker {
+        btf,
         consts: HashMap::new(),
         maps: HashMap::new(),
         events: HashMap::new(),
@@ -208,7 +221,7 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diag>> {
     }
 }
 
-impl Checker {
+impl Checker<'_> {
     // ---- diagnostics -----------------------------------------------------
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
@@ -469,16 +482,22 @@ impl Checker {
     }
 
     fn let_stmt(&mut self, mutable: bool, name: &Ident, ty: Option<&Type>, value: &Expr) {
-        // Strings: `let s: str<N> = read_user_str(p);` — the annotation *is*
-        // the read bound, which is why it is mandatory.
-        if is_call_to(value, "read_user_str") {
+        // Strings: `let s: str<N> = read_user_str(p);` / `read_kernel_str(p);`
+        // — the annotation *is* the read bound, which is why it is mandatory.
+        let reader = if is_call_to(value, "read_user_str") {
+            Some(("read_user_str", false))
+        } else if is_call_to(value, "read_kernel_str") {
+            Some(("read_kernel_str", true))
+        } else {
+            None
+        };
+        if let Some((fname, kernel)) = reader {
             let Some(t) = ty else {
                 self.error_help(
                     value.span,
-                    "`read_user_str` needs a bounded destination",
-                    format!("write `let {}: str<N> = read_user_str(...)` so the read has a known length", name.name),
+                    format!("`{fname}` needs a bounded destination"),
+                    format!("write `let {}: str<N> = {fname}(...)` so the read has a known length", name.name),
                 );
-                // Declare it anyway (as an error type) so later uses don't cascade.
                 self.declare(&name.name, Ty::Unit, mutable, None);
                 return;
             };
@@ -487,19 +506,43 @@ impl Checker {
                 Err(m) => return self.error(t.span, m),
             };
             let Ty::Str(_) = declared else {
-                return self.error(t.span, format!("`read_user_str` produces a `str<N>`, not `{declared}`"));
+                return self.error(t.span, format!("`{fname}` produces a `str<N>`, not `{declared}`"));
             };
             let ExprKind::Call { args, .. } = &value.kind else { unreachable!() };
             match args.as_slice() {
                 [p] => {
                     let pt = self.expr(p);
-                    if pt != Ty::U64 && pt != Ty::Int {
-                        self.error(p.span, format!("`read_user_str` takes a user pointer (`u64`), found `{pt}`"));
+                    let ok = if kernel {
+                        // a kernel char pointer, a kernel struct pointer, or a raw address
+                        matches!(pt, Ty::KCharPtr | Ty::KPtr(_)) || pt == Ty::U64 || pt == Ty::Int
+                    } else {
+                        pt == Ty::U64 || pt == Ty::Int
+                    };
+                    if !ok {
+                        let want = if kernel { "a kernel pointer" } else { "a user pointer (`u64`)" };
+                        self.error(p.span, format!("`{fname}` takes {want}, found `{pt}`"));
                     }
                 }
-                _ => self.error(value.span, "`read_user_str` takes exactly one argument"),
+                _ => self.error(value.span, format!("`{fname}` takes exactly one argument")),
             }
             self.declare(&name.name, declared, mutable, None);
+            return;
+        }
+
+        // Kernel struct pointers: `let f: ptr<S> = arg(n);` (or from another
+        // pointer). Needs BTF to know that `S` is a real kernel struct.
+        if let Some(t) = ty
+            && t.name.name == "ptr"
+        {
+            let target = self.ptr_target(t);
+            let at = self.expr(value);
+            if at != Ty::U64 && at != Ty::Int && !matches!(at, Ty::KPtr(_) | Ty::KCharPtr) {
+                self.error(value.span, format!("`ptr<...>` must come from an argument or another pointer, found `{at}`"));
+            }
+            match target {
+                Some(sname) => self.declare(&name.name, Ty::KPtr(sname), mutable, None),
+                None => self.declare(&name.name, Ty::Unit, mutable, None),
+            }
             return;
         }
 
@@ -662,6 +705,62 @@ impl Checker {
         }
     }
 
+    /// Validate `ptr<S>` and return the struct name, or report and return None.
+    fn ptr_target(&mut self, t: &Type) -> Option<String> {
+        let name = match t.args.as_slice() {
+            [TypeArg::Type(inner)] if inner.args.is_empty() => inner.name.name.clone(),
+            _ => {
+                self.error_help(t.span, "`ptr<...>` needs a struct name", "for example `ptr<file>` or `ptr<task_struct>`");
+                return None;
+            }
+        };
+        let Some(btf) = self.btf else {
+            self.error_help(
+                t.span,
+                "reading kernel struct fields needs the kernel's type information",
+                "pass `--btf /path/to/vmlinux.btf` (export it with `linux/export-btf`)",
+            );
+            return None;
+        };
+        if !btf.is_struct(&name) {
+            self.error(t.span, format!("`{name}` is not a kernel struct in the provided BTF"));
+            return None;
+        }
+        Some(name)
+    }
+
+    /// Type of `base.field` where `base` is a kernel struct pointer.
+    fn field_type(&mut self, struct_name: &str, field: &Ident) -> Ty {
+        let Some(btf) = self.btf else {
+            self.error(field.span, "kernel field access needs `--btf`");
+            return Ty::Unit;
+        };
+        let Some(member) = btf.member(struct_name, &field.name) else {
+            self.error(field.span, format!("`struct {struct_name}` has no field `{}`", field.name));
+            return Ty::Unit;
+        };
+        match btf.resolve(member.type_id) {
+            Resolved::Int { bytes, .. } => match bytes {
+                1 => Ty::U8,
+                2 => Ty::U16,
+                4 => Ty::U32,
+                _ => Ty::U64,
+            },
+            Resolved::Struct { name } => Ty::KPtr(name),
+            Resolved::PtrToStruct { name } => Ty::KPtr(name),
+            Resolved::PtrToChar => Ty::KCharPtr,
+            Resolved::PtrToOther => Ty::U64,
+            Resolved::Other => {
+                self.error_help(
+                    field.span,
+                    format!("field `{}` has a type honey can't read yet (array, enum, or function pointer)", field.name),
+                    "read a scalar, an embedded struct, or a pointer field instead",
+                );
+                Ty::Unit
+            }
+        }
+    }
+
     fn expr(&mut self, e: &Expr) -> Ty {
         match &e.kind {
             ExprKind::Int(_) => Ty::Int,
@@ -726,9 +825,20 @@ impl Checker {
             }
             ExprKind::Call { callee, args } => self.call(callee, args, e.span),
             ExprKind::MethodCall { receiver, method, args } => self.method(receiver, method, args, e.span),
-            ExprKind::Field { .. } => {
-                self.error(e.span, "field access is not supported in v1");
-                Ty::Unit
+            ExprKind::Field { expr, field } => {
+                let base = self.expr(expr);
+                match base {
+                    Ty::KPtr(name) => self.field_type(&name, field),
+                    Ty::Unit => Ty::Unit,
+                    other => {
+                        self.error_help(
+                            e.span,
+                            format!("`.{}` needs a kernel struct pointer, found `{other}`", field.name),
+                            "get one with `let p: ptr<Struct> = arg(n);`",
+                        );
+                        Ty::Unit
+                    }
+                }
             }
             ExprKind::Index { .. } => {
                 self.error_help(e.span, "indexing is not supported in v1", "use `map.get(key)` for maps and `s.byte_at(i)` for strings");
@@ -820,8 +930,8 @@ impl Checker {
                 }
                 Ty::I64
             }
-            ("read_user_str", _) => {
-                self.error_help(span, "`read_user_str` must initialise a bounded string", "write `let s: str<N> = read_user_str(ptr);`");
+            ("read_user_str" | "read_kernel_str", _) => {
+                self.error_help(span, format!("`{name}` must initialise a bounded string"), format!("write `let s: str<N> = {name}(ptr);`"));
                 Ty::Unit
             }
             ("deny" | "allow", []) => {

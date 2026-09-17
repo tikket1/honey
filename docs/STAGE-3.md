@@ -96,6 +96,20 @@ per architecture: pass `--arch x86_64` when compiling for an x86 box (the
 default is aarch64, the dev environment). Every record starts with an
 8-byte header carrying the event id so one ring buffer serves every probe.
 
+### Reading kernel struct fields (CO-RE-lite)
+
+A kprobe/LSM argument typed `ptr<S>` can be walked with `.field`. honey reads
+the kernel's BTF (`--btf build/vmlinux.btf`, exported by `linux/export-btf`)
+at compile time to know each field's offset and whether it is a scalar (read
+it), an embedded struct (add its offset), or a pointer (a bounded
+`bpf_probe_read_kernel`). Each hop is emitted as an `add reg, <offset>` and
+recorded in the manifest as a `(struct, field)` relocation. Before loading,
+the loader re-resolves every relocation against the *running* kernel's BTF
+(`btf__find_by_name_kind` + member walk) and rewrites the immediate. A probe
+compiled against one kernel's layout therefore reads the right bytes on
+another — verified by corrupting the baked offsets and watching the loader
+restore them from BTF.
+
 ### How values move (read `codegen.rs` with this in mind)
 
 - Every expression evaluates into `R0`.

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Copy the running kernel's BTF (its type information) out of the honey
+# Linux environment so honeyc can resolve struct fields at compile time:
+#
+#   linux/export-btf              # writes build/vmlinux.btf
+#   honeyc build x.hny -o build/x --btf build/vmlinux.btf
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "$REPO/build"
+"$REPO/linux/honey-linux" cp /sys/kernel/btf/vmlinux /work/build/vmlinux.btf
+ls -la "$REPO/build/vmlinux.btf"
