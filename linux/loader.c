@@ -172,6 +172,35 @@ static int attach_tracepoint(const char *cat, const char *name, int prog_fd) {
 // (bpf_lsm_<hook>) via a bpf_link. The program returns 0 to allow, negative
 // to deny. Loaded with expected_attach_type BPF_LSM_MAC set at load time,
 // which is why LSM is loaded here rather than in the shared loop.
+// Load a program. The first attempt asks for no verifier log (a log that
+// does not fit its buffer fails an otherwise valid load with ENOSPC, and a
+// few thousand instructions produce megabytes of it). On failure, load
+// again with the log on and a large buffer, and print it.
+static int load_prog(enum bpf_prog_type type, const char *name, const char *license,
+                     const struct bpf_insn *insns, size_t n, struct bpf_prog_load_opts *opts, const char *label) {
+    opts->log_buf = NULL; opts->log_size = 0; opts->log_level = 0;
+    int fd = bpf_prog_load(type, name, license, insns, n, opts);
+    if (fd >= 0) return fd;
+    int err = fd;
+    size_t sz = 64u << 20;
+    char *log = malloc(sz);
+    if (log) {
+        log[0] = 0;
+        opts->log_buf = log; opts->log_size = sz; opts->log_level = 1;
+        fd = bpf_prog_load(type, name, license, insns, n, opts);
+        if (fd >= 0) { free(log); return fd; }
+        err = fd;
+        // the tail is where the verdict is
+        size_t len = strlen(log);
+        const char *tail = len > 4000 ? log + len - 4000 : log;
+        fprintf(stderr, "%s: verifier rejected the program (%s):\n%s%s\n", label, strerror(-err), len > 4000 ? "...\n" : "", tail);
+        free(log);
+    } else {
+        fprintf(stderr, "%s: verifier rejected the program (%s)\n", label, strerror(-err));
+    }
+    return -1;
+}
+
 static int load_and_attach_lsm(const char *hook, const char *license,
                                const struct bpf_insn *insns, size_t n, char *log, size_t logsz) {
     static struct btf *vmlinux;
@@ -186,13 +215,12 @@ static int load_and_attach_lsm(const char *hook, const char *license,
         fprintf(stderr, "LSM hook `%s` not found (looked for `%s` in BTF; is CONFIG_BPF_LSM on and the hook name right?)\n", hook, sym);
         return -1;
     }
-    LIBBPF_OPTS(bpf_prog_load_opts, opts, .expected_attach_type = BPF_LSM_MAC,
-                .attach_btf_id = btf_id, .log_buf = log, .log_size = logsz, .log_level = 1);
-    int prog_fd = bpf_prog_load(BPF_PROG_TYPE_LSM, "honeylsm", license, insns, n, &opts);
-    if (prog_fd < 0) {
-        fprintf(stderr, "lsm:%s: verifier rejected the program (%s):\n%s\n", hook, strerror(-prog_fd), log);
-        return -1;
-    }
+    (void)log; (void)logsz;
+    LIBBPF_OPTS(bpf_prog_load_opts, opts, .expected_attach_type = BPF_LSM_MAC, .attach_btf_id = btf_id);
+    char label[80];
+    snprintf(label, sizeof label, "lsm:%s", hook);
+    int prog_fd = load_prog(BPF_PROG_TYPE_LSM, "honeylsm", license, insns, n, &opts, label);
+    if (prog_fd < 0) return -1;
     int link = bpf_link_create(prog_fd, 0, BPF_LSM_MAC, NULL);
     if (link < 0) {
         fprintf(stderr, "lsm:%s: bpf_link_create failed (%s); is `bpf` in the kernel's active LSM list?\n", hook, strerror(-link));
@@ -963,12 +991,9 @@ int main(int argc, char **argv) {
         if (apply_ifaces(insns, bytes, pr) < 0) return 1;
 
         if (strcmp(pr->type, "xdp") == 0) {
-            LIBBPF_OPTS(bpf_prog_load_opts, xopts, .log_buf = log, .log_size = sizeof log, .log_level = 1);
-            int fd = bpf_prog_load(BPF_PROG_TYPE_XDP, "honeyxdp", license, (const struct bpf_insn *)insns, pr->insns, &xopts);
-            if (fd < 0) {
-                fprintf(stderr, "%s: verifier rejected the program (%s):\n%s\n", pr->name, strerror(-fd), log);
-                return 1;
-            }
+            LIBBPF_OPTS(bpf_prog_load_opts, xopts);
+            int fd = load_prog(BPF_PROG_TYPE_XDP, "honeyxdp", license, (const struct bpf_insn *)insns, pr->insns, &xopts, pr->name);
+            if (fd < 0) return 1;
             if (attach_xdp(pr->interface, fd) < 0) return 1;
             fprintf(stderr, "%s: loaded (%zu insns, fd %d) and attached (generic mode)\n", pr->name, pr->insns, fd);
             continue;
@@ -986,14 +1011,11 @@ int main(int argc, char **argv) {
         int is_kprobe = strcmp(pr->type, "kprobe") == 0 || strcmp(pr->type, "kretprobe") == 0;
         // uprobe/kprobe programs share BPF_PROG_TYPE_KPROBE.
         enum bpf_prog_type pt = (is_kprobe || is_uprobe) ? BPF_PROG_TYPE_KPROBE : BPF_PROG_TYPE_TRACEPOINT;
-        LIBBPF_OPTS(bpf_prog_load_opts, opts, .log_buf = log, .log_size = sizeof log, .log_level = 1);
+        LIBBPF_OPTS(bpf_prog_load_opts, opts);
         char short_name[16];
         snprintf(short_name, sizeof short_name, "honey%d", i);
-        int prog_fd = bpf_prog_load(pt, short_name, license, (const struct bpf_insn *)insns, pr->insns, &opts);
-        if (prog_fd < 0) {
-            fprintf(stderr, "%s: verifier rejected the program (%s):\n%s\n", pr->name, strerror(-prog_fd), log);
-            return 1;
-        }
+        int prog_fd = load_prog(pt, short_name, license, (const struct bpf_insn *)insns, pr->insns, &opts, pr->name);
+        if (prog_fd < 0) return 1;
         int pfd;
         if (is_usdt)
             pfd = attach_usdt(pr->target, prog_fd, usdt_map_fd, (uint32_t)i, un.machine);

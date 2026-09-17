@@ -548,3 +548,22 @@ fn redirect_records_an_interface_reloc() {
     let msg = first(&xdp("    redirect(3);"));
     assert!(msg.contains("takes an interface name literal"), "{msg}");
 }
+
+#[test]
+fn contains_is_a_bounded_window_search() {
+    let udp = "    let udp: ptr<udphdr> = pkt.at(34);\n    let body = udp.payload();\n";
+    check_ok(&xdp(&format!("{udp}    emit E {{ a: 1, m: pkt.mac(0), b: body.contains(\"abc\", 16) }};")));
+    let msg = first(&xdp(&format!("{udp}    emit E {{ a: 1, m: pkt.mac(0), b: body.contains(\"abc\") }};")));
+    assert!(msg.contains("`contains` takes a literal and a window"), "{msg}");
+    let msg = first(&xdp(&format!("{udp}    emit E {{ a: 1, m: pkt.mac(0), b: body.contains(\"abc\", 2) }};")));
+    assert!(msg.contains("needle is 3 bytes but the window only 2"), "{msg}");
+    let msg = first(&xdp(&format!("{udp}    emit E {{ a: 1, m: pkt.mac(0), b: body.contains(\"abc\", 300) }};")));
+    assert!(msg.contains("window must be 1..=256"), "{msg}");
+    // 16-byte window, 3-byte needle: 14 start positions, each with its own check
+    let text = asm_xdp(&format!("{udp}    emit E {{ a: 1, m: pkt.mac(0), b: body.contains(\"abc\", 16) }};"));
+    assert_eq!(text.matches("if r2 > r8 goto").count(), 1 + 14, "{text}");
+    assert_eq!(text.matches("if r0 != 97 goto").count(), 14, "{text}");
+    assert!(text.contains("ldx8 r0, [r9 +13]") && text.contains("ldx8 r0, [r9 +15]"), "{text}");
+    // udp payload starts 8 bytes after the header
+    assert!(text.contains("add r9, 42"), "{text}");
+}

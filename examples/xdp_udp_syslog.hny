@@ -1,0 +1,37 @@
+// xdp_udp_syslog.hny — watch UDP syslog traffic for failed logins.
+//
+// `udp.payload()` is the datagram body (the UDP header is a fixed 8 bytes).
+// `body.contains(needle, window)` is a bounded search: it tries every start
+// position inside the first `window` bytes, each with its own packet-end
+// check, so the verifier sees a fixed amount of work. Then `body.str()`
+// copies the line into the event.
+//
+//   ./honey run examples/xdp_udp_syslog.hny --json \
+//     --then "printf '<38>sshd[812]: Failed password for root from 10.0.0.9' | nc -u -q1 127.0.0.1 5140"
+
+event AuthFail {
+    src: ipv4,
+    sport: u16,
+    line: str<64>,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 17 {
+        return;
+    }
+    let udp: ptr<udphdr> = pkt.view(14 + ip.ihl * 4);
+    if udp.dest != 5140 {
+        return;
+    }
+    let sport = udp.source;
+    let body = udp.payload();
+    if body.contains("Failed password", 96) {
+        let line: str<64> = body.str();
+        emit AuthFail { src: ip.saddr, sport: sport, line: line };
+    }
+}

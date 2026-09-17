@@ -3,9 +3,14 @@
 #
 #   ./honey run   probe.hny [--json] [--arch X]   compile, then load & run it
 #                                                  against the Linux environment
+#   ./honey run   probe.hny --then "CMD"           ...and run CMD in the same
+#                                                  environment 2s later, then stop
+#                 [--prep "CMD"]                   ...running CMD there first
+#                                                  (build a demo, add a veth)
 #   ./honey check probe.hny                        type-check only
 #   ./honey build probe.hny [-o out] [--arch X]    compile to build/<name>.{bin,json}
 #   ./honey asm   probe.hny [--arch X]             show the BPF assembly
+#   ./honey shell                                  a shell in the Linux environment
 #
 # If the probe reads kernel struct fields (`ptr<...>`), the kernel's BTF is
 # needed; `run`/`build`/`check` pass build/vmlinux.btf automatically and
@@ -14,17 +19,21 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO"
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ "${1:-}" = shell ] && exec linux/honey-linux
 [ $# -ge 2 ] || usage
 cmd="$1"; file="$2"; shift 2
 [ -f "$file" ] || { echo "honey: no such file: $file" >&2; exit 1; }
 
-json=""; extra=()
-for a in "$@"; do
-    case "$a" in
+json=""; then_cmd=""; prep_cmd=""; extra=()
+while [ $# -gt 0 ]; do
+    case "$1" in
         --json) json="--json" ;;
-        *) extra+=("$a") ;;
+        --then) then_cmd="${2:-}"; shift ;;
+        --prep) prep_cmd="${2:-}"; shift ;;
+        *) extra+=("$1") ;;
     esac
+    shift
 done
 
 btf_flag=()
@@ -59,6 +68,19 @@ case "$cmd" in
     run)
         ensure_btf
         cargo run -q -- build "$file" -o "$out" ${btf_flag[@]+"${btf_flag[@]}"} ${extra[@]+"${extra[@]}"}
+        if [ -n "$then_cmd" ] || [ -n "$prep_cmd" ]; then
+            # Prep, then load in the background, run the trigger in the same
+            # environment (same network namespace), give events a moment,
+            # stop the loader.
+            echo "honey: loading $out, then running: ${then_cmd:-nothing}" >&2
+            HONEY_PREP="$prep_cmd" HONEY_THEN="$then_cmd" exec linux/honey-linux bash -c '
+                [ -n "$HONEY_PREP" ] && eval "$HONEY_PREP"
+                ./linux/run.sh "$@" & loader=$!
+                sleep 2
+                [ -n "$HONEY_THEN" ] && eval "$HONEY_THEN"
+                sleep 1
+                kill -INT $loader 2>/dev/null; wait $loader' -- "$json" "$out.bin" "$out.json"
+        fi
         echo "honey: loading $out into the kernel (Ctrl-C to stop)" >&2
         exec linux/honey-linux ./linux/run.sh $json "$out.bin" "$out.json"
         ;;

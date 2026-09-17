@@ -1,0 +1,12 @@
+// error: `contains` takes a literal and a window
+//
+// A substring search over a runtime-length payload has no bound the
+// verifier can see. The window is that bound: `contains("...", 96)`.
+
+event E { hit: bool }
+
+probe xdp("lo") {
+    let udp: ptr<udphdr> = pkt.at(34);
+    let body = udp.payload();
+    emit E { hit: body.contains("Failed password") };
+}

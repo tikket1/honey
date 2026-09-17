@@ -54,6 +54,8 @@ pub fn kernel_btf() -> Btf {
     let s_sum16 = s("__sum16", &mut strs);
     let s_frame = s("frame", &mut strs);
     let s_icmphdr = s("icmphdr", &mut strs);
+    let s_udphdr = s("udphdr", &mut strs);
+    let s_len = s("len", &mut strs);
     let s_type = s("type", &mut strs);
     let s_un = s("un", &mut strs);
     let s_echo = s("echo", &mut strs);
@@ -157,6 +159,12 @@ pub fn kernel_btf() -> Btf {
     push(&mut types, 0, info(STRUCT, 2), 4);
     member(&mut types, s_id, 11, 0);
     member(&mut types, s_sequence, 11, 2);
+    // [24] struct udphdr { source: be16 @0, dest: be16 @2, len: be16 @4, check: __sum16 @6 } size 8
+    push(&mut types, s_udphdr, info(STRUCT, 4), 8);
+    member(&mut types, s_source, 11, 0);
+    member(&mut types, s_dest, 11, 2);
+    member(&mut types, s_len, 11, 4);
+    member(&mut types, s_check, 19, 6);
 
     let hdr_len = 24u32;
     let type_len = types.len() as u32;

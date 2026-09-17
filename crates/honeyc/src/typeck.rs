@@ -1600,12 +1600,36 @@ impl Checker<'_> {
                     self.error(span, "`starts_with` takes one string literal");
                     Ty::Unit
                 }
+                ("contains", [lit, window]) => {
+                    // a search needs a bound the verifier can see: the window
+                    let n = match &lit.kind {
+                        ExprKind::Str(l) if l.is_empty() => {
+                            self.error(lit.span, "an empty needle matches everything");
+                            0
+                        }
+                        ExprKind::Str(l) => l.len() as i64,
+                        _ => {
+                            self.error(lit.span, "`contains` takes a string literal to look for");
+                            0
+                        }
+                    };
+                    match self.const_eval(window) {
+                        Some(w) if w < 1 || w > MAX_PKT_BOUND as i64 => self.error(window.span, format!("the search window must be 1..={MAX_PKT_BOUND} bytes")),
+                        Some(w) if n > w => self.error(window.span, format!("the needle is {n} bytes but the window only {w}")),
+                        _ => {}
+                    }
+                    Ty::Bool
+                }
+                ("contains", _) => {
+                    self.error_help(span, "`contains` takes a literal and a window", "`body.contains(\"Failed password\", 96)` searches the first 96 bytes; the window is the bound the verifier needs");
+                    Ty::Unit
+                }
                 ("str", _) => {
                     self.error_help(span, "`.str()` must initialise a bounded string", format!("write `let s: str<N> = {rname}.str();`"));
                     Ty::Unit
                 }
                 (m, _) => {
-                    self.error_help(method.span, format!("payload has no method `{m}`"), "use `len()`, `u8/u16/u32(off)`, `starts_with(\"...\")`, or `let s: str<N> = body.str();`");
+                    self.error_help(method.span, format!("payload has no method `{m}`"), "use `len()`, `u8/u16/u32(off)`, `starts_with(\"...\")`, `contains(\"...\", window)`, or `let s: str<N> = body.str();`");
                     for a in args {
                         self.expr(a);
                     }

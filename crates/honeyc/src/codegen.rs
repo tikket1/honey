@@ -2632,6 +2632,38 @@ impl Cg<'_> {
                 self.prog.bind(end);
                 Ok(Ty::Bool)
             }
+            ("contains", [lit, window]) => {
+                // Every start position in the window, unrolled; each window
+                // position checks its own end against data_end and stops the
+                // search (false) when the packet runs out.
+                let ExprKind::Str(lit) = &lit.kind else { return Err("`contains` takes a string literal".into()) };
+                let needle = lit.as_bytes();
+                let w = self.const_eval(window)?;
+                if needle.is_empty() || w < needle.len() as i64 || w > crate::typeck::MAX_PKT_BOUND as i64 {
+                    return Err("`contains` needs a non-empty needle no longer than its window (at most 256 bytes)".into());
+                }
+                let found = self.prog.new_label();
+                let fail = self.prog.new_label();
+                let end = self.prog.new_label();
+                for start in 0..=(w as i16 - needle.len() as i16) {
+                    let next = self.prog.new_label();
+                    self.payload_check(start as i32 + needle.len() as i32, fail);
+                    for (k, &b) in needle.iter().enumerate() {
+                        self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R9, start + k as i16));
+                        self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, b as i32, next);
+                    }
+                    self.prog.ja_to(found);
+                    self.prog.bind(next);
+                }
+                self.prog.ja_to(fail);
+                self.prog.bind(found);
+                self.prog.push(mov64_imm(Reg::R0, 1));
+                self.prog.ja_to(end);
+                self.prog.bind(fail);
+                self.prog.push(mov64_imm(Reg::R0, 0));
+                self.prog.bind(end);
+                Ok(Ty::Bool)
+            }
             ("str", _) => Err("`.str()` must initialise a `str<N>` local".into()),
             (m, a) => Err(format!("payload has no method `{m}` taking {} argument(s)", a.len())),
         }

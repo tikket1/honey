@@ -21,9 +21,19 @@ fi
 TTY_FLAGS="-i"
 [ -t 0 ] && [ -t 1 ] && TTY_FLAGS="-it"
 
-exec docker run --rm $TTY_FLAGS \
+# One environment at a time: while a session is running (say `./honey run`
+# in one terminal), a second call joins the same container, so a trigger
+# command sees the same network namespace as the probe. HONEY_THEN is passed
+# through for `./honey run --then`.
+NAME=honey-env
+if docker ps -q -f "name=^${NAME}$" | grep -q .; then
+    exec docker exec $TTY_FLAGS -w /work -e "HONEY_THEN=${HONEY_THEN:-}" -e "HONEY_PREP=${HONEY_PREP:-}" "$NAME" "${@:-bash}"
+fi
+
+exec docker run --rm --name "$NAME" $TTY_FLAGS \
     --privileged \
     --pid=host \
+    -e "HONEY_THEN=${HONEY_THEN:-}" -e "HONEY_PREP=${HONEY_PREP:-}" \
     -v "$REPO:/work" \
     -w /work \
     "$IMAGE" \

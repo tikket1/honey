@@ -188,8 +188,14 @@ let body = tcp.payload();
 if body.starts_with("GET ") { ... }           // false when the packet is too short
 let n = body.len();                           // bytes to the end of the packet
 let x = body.u16(2);                          // a short packet passes here
+if body.contains("Failed password", 96) {}    // every start inside the first 96 bytes
 let line: str<32> = body.str();               // at most 31 bytes, stops at the packet end
 ```
+
+`contains(needle, window)` is a search with a bound the verifier can see:
+it tries every start position inside the window, each with its own
+packet-end check, so a 15-byte needle in a 96-byte window is 82 unrolled
+comparisons. There is no unbounded `contains`.
 
 Every method carries its own `data_end` check. `body.str()` copies into a
 `str<N>` and NUL-terminates, so it can be compared and emitted like any
@@ -464,7 +470,7 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `ip.fix_csum()` on a `ptr<iphdr>`         | statement                  | xdp                | zero, sum `ihl * 4` bytes (options checked), fold, store |
 | `view.field = v`                          | statement                  | xdp                | store through the view; `__be*` swapped back; blobs copied |
 | `tcp.payload()` / `udp.payload()`         | payload view (via `let`)   | xdp                | R9 = header + `doff * 4` / 8 |
-| `body.len()`, `body.u8/u16/u32(off)`, `body.starts_with("…")`, `let s: str<N> = body.str()` | `u32`, ints, `bool`, `str<N>` | xdp | each read checked against data_end |
+| `body.len()`, `body.u8/u16/u32(off)`, `body.starts_with("…")`, `body.contains("…", window)`, `let s: str<N> = body.str()` | `u32`, ints, `bool`, `bool`, `str<N>` | xdp | each read checked against data_end; `contains` unrolled over the window |
 
 ## 7. Status
 
@@ -479,8 +485,8 @@ kernel (`examples/*.hny`, each with the evidence in its commit message):
 | 4     | Verifier-aware type checker: `honeyc check`, every rule an error at the source line, `examples/bad/` one program per rule |
 
 Not done, and not planned for v1: more than one live runtime view, payload
-search beyond a prefix (no `contains`), ICMP/TCP payload checksums from
-scratch (only the incremental `csum_update`), IPv6 in maps, functions.
+search without a window, ICMP/TCP payload checksums from scratch (only the
+incremental `csum_update`), IPv6 in maps, functions.
 
 ## 8. Decisions taken along the way
 
