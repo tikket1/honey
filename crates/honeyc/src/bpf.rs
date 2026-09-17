@@ -118,6 +118,7 @@ pub enum Helper {
     GetCurrentPidTgid = 14,
     GetCurrentUidGid = 15,
     GetCurrentComm = 16,
+    Redirect = 23,
     ProbeReadUser = 112,
     ProbeReadKernel = 113,
     ProbeReadUserStr = 114,

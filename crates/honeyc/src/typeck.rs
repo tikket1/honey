@@ -63,6 +63,9 @@ pub enum Ty {
     /// A view of packet bytes as a named struct (`let ip: ptr<iphdr> = pkt.at(14)`).
     /// Read with `.field`; lives nowhere at runtime.
     PktPtr(u32, String),
+    /// The bytes after a transport header (`let body = tcp.payload();`):
+    /// a runtime-length view read with bounded methods.
+    PktBytes,
     /// Statements-as-expressions (`map.insert`) produce this.
     Unit,
     /// An integer literal that has not yet picked a width.
@@ -105,7 +108,7 @@ impl Ty {
             Ty::Str(n) => n.div_ceil(8) * 8,
             Ty::Ipv6 => 16,
             Ty::Mac => 8,
-            Ty::PktPtr(..) | Ty::Unit => 0,
+            Ty::PktPtr(..) | Ty::PktBytes | Ty::Unit => 0,
             _ => 8,
         }
     }
@@ -141,6 +144,7 @@ impl std::fmt::Display for Ty {
             Ty::KPtr(_, name) => write!(f, "ptr<{name}>"),
             Ty::KCharPtr => write!(f, "ptr<char>"),
             Ty::PktPtr(_, name) => write!(f, "ptr<{name}> (packet)"),
+            Ty::PktBytes => write!(f, "payload (packet)"),
             Ty::Unit => write!(f, "()"),
             Ty::Int => write!(f, "{{integer}}"),
         }
@@ -228,6 +232,11 @@ struct Checker<'a> {
     probe_kind: Option<ProbeKind>,
     /// Whether this probe has run `pkt.ipv6_l4(...)` (so `pkt.l4()` is bound).
     l4_ready: bool,
+    /// The local that currently owns the runtime packet pointer (R9): the
+    /// last `pkt.view` / `pkt.l4()` / `.payload()` binding. Binding another
+    /// replaces it, and the previous one must not be read again.
+    dyn_owner: Option<String>,
+    dead_views: Vec<(String, String)>,
 }
 
 pub fn check(program: &Program) -> Result<Checked, Vec<Diag>> {
@@ -246,6 +255,8 @@ pub fn check_with_btf(program: &Program, btf: Option<&Btf>) -> Result<Checked, V
         diags: Vec::new(),
         probe_kind: None,
         l4_ready: false,
+        dyn_owner: None,
+        dead_views: Vec::new(),
     };
     let peak = c.program(program);
     if c.diags.is_empty() {
@@ -288,6 +299,27 @@ impl Checker<'_> {
 
     fn lookup(&self, name: &str) -> Option<&Var> {
         self.scopes.iter().rev().find_map(|s| s.vars.get(name))
+    }
+
+    /// `name` takes over the runtime packet pointer; whoever had it is dead.
+    fn take_dyn(&mut self, name: &str) {
+        if let Some(prev) = self.dyn_owner.replace(name.to_string())
+            && prev != name
+        {
+            self.dead_views.push((prev, name.to_string()));
+        }
+    }
+
+    /// Reading a replaced runtime view would read through the new one's
+    /// pointer: a silent wrong answer, so it is an error.
+    fn check_live(&mut self, name: &str, span: Span) {
+        if let Some((_, by)) = self.dead_views.iter().find(|(n, _)| n == name).cloned() {
+            self.error_help(
+                span,
+                format!("`{name}` is no longer a valid view: `{by}` took the packet pointer"),
+                "one runtime view is live at a time; read everything you need from a view before binding the next",
+            );
+        }
     }
 
     // ---- items -----------------------------------------------------------
@@ -466,6 +498,8 @@ impl Checker<'_> {
         }
         self.probe_kind = kind;
         self.l4_ready = false;
+        self.dyn_owner = None;
+        self.dead_views.clear();
         self.push_scope();
         self.block(&p.body);
         self.pop_scope();
@@ -564,6 +598,38 @@ impl Checker<'_> {
     fn let_stmt(&mut self, mutable: bool, name: &Ident, ty: Option<&Type>, value: &Expr) {
         // Strings: `let s: str<N> = read_user_str(p);` / `read_kernel_str(p);`
         // — the annotation *is* the read bound, which is why it is mandatory.
+        // `let s: str<N> = body.str();` copies from the packet the same way.
+        if let ExprKind::MethodCall { receiver, method, args } = &value.kind
+            && method.name == "str"
+            && let ExprKind::Ident(r) = &receiver.kind
+            && matches!(self.lookup(r), Some(Var { ty: Ty::PktBytes, .. }))
+        {
+            self.check_live(r, receiver.span);
+            if !args.is_empty() {
+                self.error(value.span, "`.str()` takes no arguments; the `str<N>` annotation is the bound");
+            }
+            let declared = ty.map(Ty::from_ast);
+            match declared {
+                Some(Ok(t @ Ty::Str(_))) => self.declare(&name.name, t, mutable, None),
+                Some(Ok(other)) => {
+                    self.error(ty.unwrap().span, format!("`.str()` produces a `str<N>`, not `{other}`"));
+                    self.declare(&name.name, Ty::Unit, mutable, None);
+                }
+                Some(Err(m)) => {
+                    self.error(ty.unwrap().span, m);
+                    self.declare(&name.name, Ty::Unit, mutable, None);
+                }
+                None => {
+                    self.error_help(
+                        value.span,
+                        "`.str()` needs a bounded destination",
+                        format!("write `let {}: str<N> = {r}.str();` so the copy has a known length", name.name),
+                    );
+                    self.declare(&name.name, Ty::Unit, mutable, None);
+                }
+            }
+            return;
+        }
         let reader = if is_call_to(value, "read_user_str") {
             Some(("read_user_str", false))
         } else if is_call_to(value, "read_kernel_str") {
@@ -658,6 +724,9 @@ impl Checker<'_> {
                 ("l4", _) => self.error(value.span, "`pkt.l4()` takes no arguments"),
                 _ => unreachable!(),
             }
+            if method.name != "at" {
+                self.take_dyn(&name.name);
+            }
             match target {
                 Some((id, sname)) => self.declare(&name.name, Ty::PktPtr(id, sname), mutable, None),
                 None => self.declare(&name.name, Ty::Unit, mutable, None),
@@ -682,6 +751,12 @@ impl Checker<'_> {
         let before = self.diags.len();
         let actual = self.expr(value);
         let value_had_errors = self.diags.len() > before;
+        if actual == Ty::PktBytes {
+            if let Some(t) = ty {
+                self.error(t.span, "a payload view takes no type annotation");
+            }
+            self.take_dyn(&name.name);
+        }
         let ty = match ty {
             Some(t) => match Ty::from_ast(t) {
                 Ok(declared) => {
@@ -1028,7 +1103,11 @@ impl Checker<'_> {
             }
             ExprKind::Ident(name) => {
                 if let Some(v) = self.lookup(name) {
-                    return v.ty.clone();
+                    let t = v.ty.clone();
+                    if matches!(t, Ty::PktPtr(..) | Ty::PktBytes) {
+                        self.check_live(name, e.span);
+                    }
+                    return t;
                 }
                 // (a PktPtr local is fine to name: `.field` follows.)
                 if let Some((t, _)) = self.consts.get(name) {
@@ -1351,6 +1430,21 @@ impl Checker<'_> {
                 }
                 Ty::Unit
             }
+            ("redirect", [iface]) => {
+                if self.probe_kind != Some(ProbeKind::Xdp) {
+                    self.error_help(span, "`redirect()` is only available in an `xdp` probe", "only an XDP program holds a packet to send elsewhere");
+                }
+                match &iface.kind {
+                    ExprKind::Str(n) if !n.is_empty() && n.len() < 16 => {}
+                    ExprKind::Str(_) => self.error(iface.span, "an interface name is 1..15 characters"),
+                    _ => self.error_help(iface.span, "`redirect` takes an interface name literal", "e.g. `redirect(\"eth1\")`; the loader resolves it to an ifindex"),
+                }
+                Ty::Unit
+            }
+            ("redirect", _) => {
+                self.error(span, "`redirect(\"iface\")` takes one interface name");
+                Ty::Unit
+            }
             ("drop" | "pass" | "tx", []) => {
                 if self.probe_kind != Some(ProbeKind::Xdp) {
                     self.error_help(
@@ -1467,9 +1561,77 @@ impl Checker<'_> {
             };
         }
 
-        // Packet views: `tcp.opt(kind)`, `ip.fix_csum()`.
-        if let Some(Var { ty: Ty::PktPtr(_, sname), .. }) = self.lookup(rname).cloned() {
+        // The payload view: `body.len()`, `body.u8(i)`, `body.starts_with("..")`.
+        if let Some(Var { ty: Ty::PktBytes, .. }) = self.lookup(rname) {
+            self.check_live(rname, receiver.span);
             return match (method.name.as_str(), args) {
+                ("len", []) => Ty::U32,
+                ("u8" | "u16" | "u32", [off]) => {
+                    let width: u32 = match method.name.as_str() {
+                        "u8" => 1,
+                        "u16" => 2,
+                        _ => 4,
+                    };
+                    match self.const_eval(off) {
+                        Some(o) if o < 0 => self.error(off.span, "payload offset must not be negative"),
+                        Some(o) if o as u32 + width > MAX_PKT_BOUND => self.error(off.span, format!("payload read at offset {o} ends past {MAX_PKT_BOUND} bytes")),
+                        _ => {}
+                    }
+                    match width {
+                        1 => Ty::U8,
+                        2 => Ty::U16,
+                        _ => Ty::U32,
+                    }
+                }
+                ("u8" | "u16" | "u32", _) => {
+                    self.error(span, format!("`.{}` takes one constant offset into the payload", method.name));
+                    Ty::Unit
+                }
+                ("starts_with", [arg]) => {
+                    match &arg.kind {
+                        ExprKind::Str(lit) if lit.is_empty() => self.error(arg.span, "an empty prefix matches everything"),
+                        ExprKind::Str(lit) if lit.len() as u32 > MAX_PKT_BOUND => self.error(arg.span, format!("prefix longer than {MAX_PKT_BOUND} bytes")),
+                        ExprKind::Str(_) => {}
+                        _ => self.error(arg.span, "`starts_with` takes a string literal"),
+                    }
+                    Ty::Bool
+                }
+                ("starts_with", _) => {
+                    self.error(span, "`starts_with` takes one string literal");
+                    Ty::Unit
+                }
+                ("str", _) => {
+                    self.error_help(span, "`.str()` must initialise a bounded string", format!("write `let s: str<N> = {rname}.str();`"));
+                    Ty::Unit
+                }
+                (m, _) => {
+                    self.error_help(method.span, format!("payload has no method `{m}`"), "use `len()`, `u8/u16/u32(off)`, `starts_with(\"...\")`, or `let s: str<N> = body.str();`");
+                    for a in args {
+                        self.expr(a);
+                    }
+                    Ty::Unit
+                }
+            };
+        }
+
+        // Packet views: `tcp.opt(kind)`, `ip.fix_csum()`, `tcp.payload()`.
+        if let Some(Var { ty: Ty::PktPtr(_, sname), .. }) = self.lookup(rname).cloned() {
+            self.check_live(rname, receiver.span);
+            return match (method.name.as_str(), args) {
+                ("payload", []) => {
+                    if sname != "tcphdr" && sname != "udphdr" {
+                        self.error_help(
+                            span,
+                            format!("`.payload()` follows a TCP or UDP header, but `{rname}` is a `ptr<{sname}>`"),
+                            "bind the transport header first: `let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);`",
+                        );
+                    }
+                    Ty::PktBytes
+                }
+                ("payload", _) => {
+                    self.error(span, "`.payload()` takes no arguments");
+                    Ty::Unit
+                }
                 ("opt", [kind]) => {
                     if sname != "tcphdr" {
                         self.error_help(
@@ -1504,7 +1666,7 @@ impl Checker<'_> {
                     Ty::Unit
                 }
                 (m, _) => {
-                    self.error_help(method.span, format!("packet view has no method `{m}`"), "views have `opt(kind)` on a `ptr<tcphdr>` and `fix_csum()` on a `ptr<iphdr>`");
+                    self.error_help(method.span, format!("packet view has no method `{m}`"), "views have `opt(kind)` and `payload()` on a `ptr<tcphdr>`, `payload()` on a `ptr<udphdr>`, and `fix_csum()` on a `ptr<iphdr>`");
                     for a in args {
                         self.expr(a);
                     }

@@ -179,6 +179,25 @@ SACK-permitted) or `None`. Like a map lookup it is only usable through
 if let Some(mss) = tcp.opt(2) { ... }        // 2 MSS, 3 wscale, 4 SACK ok, 8 timestamps
 ```
 
+**Payloads.** `tcp.payload()` / `udp.payload()` binds the bytes after the
+transport header as a runtime-length view:
+
+```honey
+let sport = tcp.source;                       // read the header first: payload() consumes it
+let body = tcp.payload();
+if body.starts_with("GET ") { ... }           // false when the packet is too short
+let n = body.len();                           // bytes to the end of the packet
+let x = body.u16(2);                          // a short packet passes here
+let line: str<32> = body.str();               // at most 31 bytes, stops at the packet end
+```
+
+Every method carries its own `data_end` check. `body.str()` copies into a
+`str<N>` and NUL-terminates, so it can be compared and emitted like any
+string. **One runtime view is live at a time:** binding a `pkt.view`,
+`pkt.l4()` or `.payload()` replaces the previous one, and reading the
+replaced view afterwards is a compile-time error rather than a silent read
+through the wrong pointer.
+
 **Writing.** Assigning to a view's field stores into the packet:
 
 ```honey
@@ -195,8 +214,10 @@ embedded struct is written field by field, and widths must match exactly.
 Checksum fields (`__sum16`) are read and written in host order like every
 other multi-byte field, so `csum_update`'s three words share one byte order.
 
-**Actions and bounds.** `drop()`, `pass()` and `tx()` return immediately;
-falling off the end passes. Every packet read must be provably in bounds or the verifier
+**Actions and bounds.** `drop()`, `pass()`, `tx()` and `redirect("iface")`
+return immediately; falling off the end passes. `redirect` hands the packet
+to the named interface (`bpf_redirect`); the loader resolves the name to an
+index on the machine it runs on. Every packet read must be provably in bounds or the verifier
 rejects the program: honey takes the furthest constant byte the probe
 touches (reads, blobs and `pkt.at` views, at most 256) and checks the packet
 is at least that long once, on entry; runtime views add their own single
@@ -429,6 +450,7 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `emit E { … }`                            | statement                  | anywhere           | `bpf_ringbuf_reserve/submit` |
 | `deny()` / `allow()`                      | statement                  | lsm                | return -EPERM / 0 |
 | `drop()` / `pass()` / `tx()`              | statement                  | xdp                | XDP_DROP / XDP_PASS / XDP_TX |
+| `redirect("iface")`                       | statement                  | xdp                | `bpf_redirect(ifindex, 0)`; ifindex patched by the loader |
 | `csum_update(csum, old, new)`             | `u16`                      | anywhere           | RFC 1624 `~(~c + ~old + new)`, folded |
 | `sample(N)`                               | `bool`                     | anywhere           | a hidden per-site counter map |
 | `in_subnet(addr, "cidr")`                 | `bool`                     | anywhere           | mask-and-compare, folded at compile time |
@@ -441,6 +463,8 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `tcp.opt(kind)` on a `ptr<tcphdr>`        | `Option<u32>`              | xdp                | 10-hop option walk, every byte checked |
 | `ip.fix_csum()` on a `ptr<iphdr>`         | statement                  | xdp                | zero, sum `ihl * 4` bytes (options checked), fold, store |
 | `view.field = v`                          | statement                  | xdp                | store through the view; `__be*` swapped back; blobs copied |
+| `tcp.payload()` / `udp.payload()`         | payload view (via `let`)   | xdp                | R9 = header + `doff * 4` / 8 |
+| `body.len()`, `body.u8/u16/u32(off)`, `body.starts_with("…")`, `let s: str<N> = body.str()` | `u32`, ints, `bool`, `str<N>` | xdp | each read checked against data_end |
 
 ## 7. Status
 
@@ -451,12 +475,12 @@ kernel (`examples/*.hny`, each with the evidence in its commit message):
 |-------|----------------------------------------------------------------------|
 | 1     | Lexer                                                                |
 | 2     | Parser → AST, pretty-printer                                         |
-| 3     | Bytecode emitter + disassembler, C loader; every probe kind; CO-RE-style struct reads; packet views, writes and checksums, TCP options; register allocator |
+| 3     | Bytecode emitter + disassembler, C loader; every probe kind; CO-RE-style struct reads; packet views, writes and checksums, TCP options and payloads, redirect; register allocator |
 | 4     | Verifier-aware type checker: `honeyc check`, every rule an error at the source line, `examples/bad/` one program per rule |
 
-Not done, and not planned for v1: more than one live runtime view, ICMP/TCP
-payload checksums from scratch (only the incremental `csum_update`), IPv6 in
-maps, functions.
+Not done, and not planned for v1: more than one live runtime view, payload
+search beyond a prefix (no `contains`), ICMP/TCP payload checksums from
+scratch (only the incremental `csum_update`), IPv6 in maps, functions.
 
 ## 8. Decisions taken along the way
 

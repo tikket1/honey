@@ -1,0 +1,55 @@
+// xdp_redirect.hny — hand a packet to another interface.
+//
+// `redirect("name")` is `bpf_redirect(ifindex, 0)`: the packet leaves through
+// the named device instead of continuing up this one's stack. The name is
+// resolved to an index by the loader on the machine that runs it.
+//
+// Two probes prove it: ICMP echo requests arriving on `lo` are redirected
+// out of `veth0`; its peer `veth1` receives them, and the second probe
+// reports what showed up there. `ping` itself gets no reply, because the
+// request never reached the stack.
+//
+//   ./honey run examples/xdp_redirect.hny --json
+//   ... in the environment:
+//   ip link add veth0 type veth peer name veth1 && ip link set veth0 up && ip link set veth1 up
+//   ping -c 3 -W 1 127.0.0.1
+
+event Moved {
+    src: ipv4,
+    dst: ipv4,
+}
+
+event Arrived {
+    src: ipv4,
+    dst: ipv4,
+    ttl: u8,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 1 {
+        return;
+    }
+    let icmp: ptr<icmphdr> = pkt.view(14 + ip.ihl * 4);
+    if icmp.type != 8 {
+        return;
+    }
+    emit Moved { src: ip.saddr, dst: ip.daddr };
+    redirect("veth0");
+}
+
+probe xdp("veth1") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 1 {
+        return;
+    }
+    emit Arrived { src: ip.saddr, dst: ip.daddr, ttl: ip.ttl };
+}

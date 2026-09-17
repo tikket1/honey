@@ -1,0 +1,12 @@
+// error: `.str()` needs a bounded destination
+//
+// A payload copy needs a length the verifier can see; `str<N>` is it.
+
+event E { line: str<32> }
+
+probe xdp("lo") {
+    let tcp: ptr<tcphdr> = pkt.at(34);
+    let body = tcp.payload();
+    let line = body.str();
+    emit E { line: line };
+}

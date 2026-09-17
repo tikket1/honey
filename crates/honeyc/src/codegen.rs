@@ -148,6 +148,15 @@ pub struct CompiledProbe {
     pub bytecode: Vec<u8>,
     pub stack_bytes: u32,
     pub relocs: Vec<Reloc>,
+    /// `redirect("name")` sites: the loader rewrites the LD_IMM64 at `slot`
+    /// with the interface's index.
+    pub ifaces: Vec<IfaceReloc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfaceReloc {
+    pub slot: usize,
+    pub name: String,
 }
 
 /// Everything the loader needs to install a honey program.
@@ -218,6 +227,9 @@ enum Ty {
     /// A packet struct view at a runtime offset: the verified packet pointer
     /// lives in R9 (reserved for it); reads are `[R9 + off + field]`.
     PktDyn(u32, i16),
+    /// The payload after a transport header: R9 points at it, its length is
+    /// `data_end - R9`, and every read checks against data_end.
+    PktBytes,
 }
 
 impl Ty {
@@ -245,7 +257,7 @@ impl Ty {
             Ty::Ipv6 => 16,
             Ty::Mac => 6,
             Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::OptionVal(_) | Ty::KPtr { .. } | Ty::KCharPtr => 8,
-            Ty::PktPtr(..) | Ty::PktDyn(..) => 0,
+            Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes => 0,
         }
     }
 
@@ -300,6 +312,8 @@ struct Cg<'a> {
     ctx_slot: i16,
     /// (instruction index, struct, field) field-offset relocations.
     relocs: Vec<(usize, String, String)>,
+    /// (instruction index of the LD_IMM64, interface name) for `redirect`.
+    ifaces: Vec<(usize, String)>,
     /// Running counter that assigns each `sample()` site its map slot.
     sample_next: &'a mut u32,
     /// This program's index in the manifest (key into the USDT spec map).
@@ -408,8 +422,8 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ProbeKind::Uretprobe { target } => format!("uretprobe:{target}"),
             ProbeKind::Usdt { target } => format!("usdt:{target}"),
         };
-        let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p, &mut sample_next, prog_index as u32)?;
-        programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs });
+        let (bytecode, stack_bytes, relocs, ifaces) = compile_probe(&sh, &kind, p, &mut sample_next, prog_index as u32)?;
+        programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs, ifaces });
     }
 
     let stack_bytes = programs.iter().map(|p| p.stack_bytes).max().unwrap_or(0);
@@ -424,7 +438,9 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
     })
 }
 
-fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut u32, prog_index: u32) -> Result<(Vec<u8>, u32, Vec<Reloc>), String> {
+type ProbeOutput = (Vec<u8>, u32, Vec<Reloc>, Vec<IfaceReloc>);
+
+fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut u32, prog_index: u32) -> Result<ProbeOutput, String> {
     let mut prog = Prog::new();
     let exit_label = prog.new_label();
     let mut cg = Cg {
@@ -438,6 +454,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut
         exit_label,
         ctx_slot: 0,
         relocs: Vec::new(),
+        ifaces: Vec::new(),
         sample_next,
         prog_index,
         free_regs: free_callee_saved(kind, &p.body),
@@ -480,6 +497,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut
     }
     let max_stack = cg.max_stack as u32;
     let reloc_sites = std::mem::take(&mut cg.relocs);
+    let iface_sites = std::mem::take(&mut cg.ifaces);
     let insns = cg.prog.resolve()?;
     // Map each reloc's instruction index to its byte-slot index (LD_IMM64
     // spans two slots, so index != slot).
@@ -493,11 +511,12 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut
         .into_iter()
         .map(|(idx, st, f)| Reloc { slot: slot_start[idx], struct_name: st, field: f })
         .collect();
+    let ifaces = iface_sites.into_iter().map(|(idx, name)| IfaceReloc { slot: slot_start[idx], name }).collect();
     let mut out = Vec::with_capacity(insns.len() * 8);
     for insn in &insns {
         insn.encode(&mut out);
     }
-    Ok((out, max_stack, relocs))
+    Ok((out, max_stack, relocs, ifaces))
 }
 
 fn const_value(e: &Expr) -> Result<i64, String> {
@@ -711,6 +730,7 @@ fn body_uses_dyn_view(body: &Block) -> bool {
             ExprKind::MethodCall { receiver, method, args } => {
                 (matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt")
                     && matches!(method.name.as_str(), "view" | "ipv6_l4" | "l4"))
+                    || method.name == "payload"
                     || expr(receiver)
                     || args.iter().any(expr)
             }
@@ -908,7 +928,7 @@ impl Cg<'_> {
                 Ty::Str(n) => n.div_ceil(8) * 8,
                 Ty::Ipv6 => 16,
                 Ty::Mac => 8,
-                Ty::PktPtr(..) | Ty::PktDyn(..) => 0,
+                Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes => 0,
                 _ => 8,
             };
             self.stack_top -= bytes as i32;
@@ -967,6 +987,16 @@ impl Cg<'_> {
                     let n = str_capacity(t)?;
                     let off = self.alloc_bytes(n);
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off, ty: Ty::Str(n), reg: None });
+                    // `let s: str<N> = body.str();` copies from the packet,
+                    // stopping at its end, NUL-terminated.
+                    if let ExprKind::MethodCall { receiver, method, .. } = &value.kind
+                        && method.name == "str"
+                        && let ExprKind::Ident(r) = &receiver.kind
+                        && matches!(self.lookup(r).map(|l| &l.ty), Some(Ty::PktBytes))
+                    {
+                        self.payload_str(off, n);
+                        return Ok(());
+                    }
                     return self.read_str_into(off, n, value);
                 }
                 // Packet struct view: `let ip: ptr<iphdr> = pkt.at(14);` — a
@@ -1013,6 +1043,31 @@ impl Cg<'_> {
                     self.prog.push(alu64_imm(AluOp::Add, Reg::R2, size as i32));
                     self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, self.exit_label);
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktDyn(id, 0), reg: None });
+                    return Ok(());
+                }
+                // `let body = tcp.payload();` — R9 = header + its length.
+                if let ExprKind::MethodCall { receiver, method, .. } = &value.kind
+                    && method.name == "payload"
+                    && let Some((id, base, off)) = self.view_of(receiver)?
+                {
+                    match self.struct_name(id).as_str() {
+                        "tcphdr" => {
+                            self.pkt_field(id, base, off, "doff")?; // R0 = doff
+                            self.prog.push(alu64_imm(AluOp::Lsh, Reg::R0, 2));
+                            self.prog.push(mov64_reg(Reg::R1, base));
+                            self.prog.push(alu64_reg(AluOp::Add, Reg::R1, Reg::R0));
+                            if off != 0 {
+                                self.prog.push(alu64_imm(AluOp::Add, Reg::R1, off as i32));
+                            }
+                            self.prog.push(mov64_reg(Reg::R9, Reg::R1));
+                        }
+                        "udphdr" => {
+                            self.prog.push(mov64_reg(Reg::R9, base));
+                            self.prog.push(alu64_imm(AluOp::Add, Reg::R9, off as i32 + 8));
+                        }
+                        other => return Err(format!("`.payload()` follows a TCP or UDP header, not `{other}`")),
+                    }
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktBytes, reg: None });
                     return Ok(());
                 }
                 // Byte blobs: `let a = pkt.ipv6(22);` copies straight from the packet.
@@ -1321,7 +1376,7 @@ impl Cg<'_> {
             ExprKind::Str(_) => Err("string values are not supported in expressions".into()),
             ExprKind::Ident(name) => {
                 if let Some(local) = self.lookup(name).cloned() {
-                    if !matches!(local.ty, Ty::PktPtr(..) | Ty::PktDyn(..)) {
+                    if !matches!(local.ty, Ty::PktPtr(..) | Ty::PktDyn(..) | Ty::PktBytes) {
                         self.load_local(&local);
                     }
                     return Ok(local.ty);
@@ -1388,6 +1443,9 @@ impl Cg<'_> {
                     {
                         return self.str_method(local.off, cap, &method.name, args);
                     }
+                    if let Some(Local { ty: Ty::PktBytes, .. }) = self.lookup(n) {
+                        return self.payload_method(&method.name, args);
+                    }
                     if let Some(local) = self.lookup(n).cloned()
                         && let Ty::PktPtr(..) | Ty::PktDyn(..) = local.ty
                     {
@@ -1407,6 +1465,7 @@ impl Cg<'_> {
                                 self.emit_ip_csum(id, base, poff)?;
                                 Ok(Ty::Uint(8))
                             }
+                            ("payload", []) => Err("`.payload()` must be bound: `let body = tcp.payload();`".into()),
                             (m, _) => Err(format!("`ptr<{sname}>` has no method `{m}`")),
                         };
                     }
@@ -1840,6 +1899,18 @@ impl Cg<'_> {
             }
             ("in_subnet", [a, cidr]) => self.emit_in_subnet(a, cidr),
             ("csum_update", [c, old, new]) => self.emit_csum_update(c, old, new),
+            ("redirect", [iface]) => {
+                let ExprKind::Str(name) = &iface.kind else { return Err("`redirect` takes an interface name literal".into()) };
+                // r1 = ifindex (patched by the loader), r2 = flags; the helper
+                // returns XDP_REDIRECT, which the program returns as is.
+                let idx = self.prog.len();
+                self.prog.push(ld_imm64(Reg::R1, 0));
+                self.ifaces.push((idx, name.clone()));
+                self.prog.push(mov64_imm(Reg::R2, 0));
+                self.prog.push(call(Helper::Redirect));
+                self.prog.push(bpf::exit());
+                Ok(Ty::Uint(8))
+            }
             ("read_user_str", _) => Err("`read_user_str` may only initialise a `str<N>` local".into()),
             (other, _) => Err(format!("builtin `{other}` does not take arguments here")),
         }
@@ -2513,6 +2584,77 @@ impl Cg<'_> {
         self.prog.push(alu64_imm(AluOp::Xor, Reg::R0, 0xffff));
         self.prog.push(alu64_imm(AluOp::And, Reg::R0, 0xffff));
         Ok(Ty::Uint(2))
+    }
+
+    /// `if R9 + need > data_end goto label`, through R2.
+    fn payload_check(&mut self, need: i32, label: Label) {
+        self.prog.push(mov64_reg(Reg::R2, Reg::R9));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R2, need));
+        self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, label);
+    }
+
+    /// Methods of a payload view (R9 = payload, R8 = data_end). Reads that
+    /// would run past the packet pass it; `starts_with` is simply false.
+    fn payload_method(&mut self, method: &str, args: &[Expr]) -> Result<Ty, String> {
+        match (method, args) {
+            ("len", []) => {
+                self.prog.push(mov64_reg(Reg::R0, Reg::R8));
+                self.prog.push(alu64_reg(AluOp::Sub, Reg::R0, Reg::R9));
+                Ok(Ty::Uint(4))
+            }
+            ("u8" | "u16" | "u32", [off]) => {
+                let (size, w) = match method {
+                    "u8" => (Size::B, 1),
+                    "u16" => (Size::H, 2),
+                    _ => (Size::W, 4),
+                };
+                let o = i16::try_from(self.const_eval(off)?).map_err(|_| "payload offset too large")?;
+                self.payload_check(o as i32 + w, self.exit_label);
+                self.prog.push(ldx_mem(size, Reg::R0, Reg::R9, o));
+                if w > 1 {
+                    self.prog.push(bswap(Reg::R0, (w * 8) as u8));
+                }
+                Ok(Ty::Uint(w as u32))
+            }
+            ("starts_with", [arg]) => {
+                let ExprKind::Str(lit) = &arg.kind else { return Err("`starts_with` takes a string literal".into()) };
+                let fail = self.prog.new_label();
+                let end = self.prog.new_label();
+                self.payload_check(lit.len() as i32, fail);
+                for (i, &b) in lit.as_bytes().iter().enumerate() {
+                    self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R9, i as i16));
+                    self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, b as i32, fail);
+                }
+                self.prog.push(mov64_imm(Reg::R0, 1));
+                self.prog.ja_to(end);
+                self.prog.bind(fail);
+                self.prog.push(mov64_imm(Reg::R0, 0));
+                self.prog.bind(end);
+                Ok(Ty::Bool)
+            }
+            ("str", _) => Err("`.str()` must initialise a `str<N>` local".into()),
+            (m, a) => Err(format!("payload has no method `{m}` taking {} argument(s)", a.len())),
+        }
+    }
+
+    /// Copy up to `n - 1` payload bytes to the stack at `dst`, stopping at
+    /// the packet end, and NUL-terminate. Every byte is its own check, so a
+    /// short payload gives a short string rather than a passed packet.
+    fn payload_str(&mut self, dst: i16, n: u32) {
+        let done = self.prog.new_label();
+        // clear the buffer first so the terminator is there whatever we copy
+        let mut i = 0i16;
+        while (i as u32) < n {
+            self.prog.push(mov64_imm(Reg::R0, 0));
+            self.prog.push(stx_mem(Size::DW, Reg::R10, dst + i, Reg::R0));
+            i += 8;
+        }
+        for i in 0..(n as i16 - 1) {
+            self.payload_check(i as i32 + 1, done);
+            self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R9, i));
+            self.prog.push(stx_mem(Size::B, Reg::R10, dst + i, Reg::R0));
+        }
+        self.prog.bind(done);
     }
 
     fn copy_bytes(&mut self, src: Reg, soff: i16, dst: Reg, doff: i16, n: u32) {

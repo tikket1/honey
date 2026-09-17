@@ -1,0 +1,14 @@
+// error: `tcp` is no longer a valid view: `body` took the packet pointer
+//
+// One runtime view is live at a time: `tcp.payload()` moves the verified
+// packet pointer to the payload, so `tcp.dest` afterwards would read the
+// payload's bytes as a port. Read the header first.
+
+event E { dport: u16, first: u8 }
+
+probe xdp("lo") {
+    let ip: ptr<iphdr> = pkt.at(14);
+    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);
+    let body = tcp.payload();
+    emit E { dport: tcp.dest, first: body.u8(0) };
+}

@@ -126,6 +126,7 @@ struct program {
     size_t insns;
     const char *relocs; // pointer into the manifest text: the "relocs":[...] array
     const char *relocs_end;
+    const char *ifaces; // the "ifaces":[...] array: redirect targets by name
 };
 
 // ----------------------------------------------------------------- attach
@@ -761,6 +762,7 @@ static int apply_relocs(uint8_t *insns, size_t bytes, struct program *pr) {
     if (!pr->relocs) return 0;
     const char *p = pr->relocs;
     const char *limit = pr->relocs_end;
+    if (pr->ifaces && (!limit || pr->ifaces < limit)) limit = pr->ifaces;
     while ((p = strstr(p, "\"slot\":")) != NULL) {
         if (limit && p >= limit) break;
         long slot = json_int_in(p, limit, "slot", -1);
@@ -777,6 +779,29 @@ static int apply_relocs(uint8_t *insns, size_t bytes, struct program *pr) {
             return -1;
         }
         int32_t imm = (int32_t)off;
+        memcpy(insns + at + 4, &imm, 4);
+    }
+    return 0;
+}
+
+// `redirect("name")` compiles to `ld64 r1, 0`; fill in the interface index
+// of the named device on this machine.
+static int apply_ifaces(uint8_t *insns, size_t bytes, struct program *pr) {
+    if (!pr->ifaces) return 0;
+    const char *p = pr->ifaces;
+    const char *limit = pr->relocs_end;
+    while ((p = strstr(p, "\"slot\":")) != NULL) {
+        if (limit && p >= limit) break;
+        long slot = json_int_in(p, limit, "slot", -1);
+        char name[32] = "";
+        json_str_in(p, limit, "iface", name, sizeof name);
+        p += 7;
+        if (slot < 0) continue;
+        size_t at = (size_t)slot * 8;
+        if (at + 16 > bytes) { fprintf(stderr, "iface slot %ld out of range\n", slot); return -1; }
+        unsigned idx = if_nametoindex(name);
+        if (!idx) { fprintf(stderr, "redirect: no interface named %s\n", name); return -1; }
+        int32_t imm = (int32_t)idx;
         memcpy(insns + at + 4, &imm, 4);
     }
     return 0;
@@ -891,6 +916,8 @@ int main(int argc, char **argv) {
         pr->relocs = strstr(p, "\"relocs\":");
         if (pr->relocs && next && pr->relocs > next) pr->relocs = NULL;
         pr->relocs_end = next;
+        pr->ifaces = strstr(p, "\"ifaces\":");
+        if (pr->ifaces && next && pr->ifaces > next) pr->ifaces = NULL;
         if (pr->offset + pr->insns * 8 > code_len) {
             fprintf(stderr, "program %s: offset/insns exceed the bytecode file\n", pr->name);
             return 1;
@@ -933,6 +960,7 @@ int main(int argc, char **argv) {
         size_t bytes = pr->insns * 8;
         relocate_map_fds(insns, bytes, fds, nfds);
         if (apply_relocs(insns, bytes, pr) < 0) return 1;
+        if (apply_ifaces(insns, bytes, pr) < 0) return 1;
 
         if (strcmp(pr->type, "xdp") == 0) {
             LIBBPF_OPTS(bpf_prog_load_opts, xopts, .log_buf = log, .log_size = sizeof log, .log_level = 1);

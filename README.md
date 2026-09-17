@@ -97,7 +97,7 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 263 tests
+cargo test                                  # 267 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
@@ -126,6 +126,12 @@ linux/honey-linux ./linux/run.sh --json build/fop.bin build/fop.json
 #   -> ping 127.0.0.1 shows "ttl=7"; the SYN options of a loopback connect:
 ./honey run examples/xdp_synopts.hny --json
 #   -> {"event":"Syn",...,"mss":65495,"wscale":7,"sack_ok":true,"tsval":3278033550}
+
+# payloads: HTTP request lines through tcp.payload(); packets handed to another interface
+./honey run examples/xdp_http.hny --json
+#   -> {"event":"Http","src":"127.0.0.1","sport":33806,"len":23,"line":"GET /admin HTTP/1.0\r\n\r\n"}
+./honey run examples/xdp_redirect.hny --json
+#   -> {"event":"Moved",...} then {"event":"Arrived",...,"ttl":64} on veth1 for every ping
 
 # packets: drop ICMP on loopback and watch ping fail
 cargo run -- build examples/icmp_drop.hny -o build/icmp

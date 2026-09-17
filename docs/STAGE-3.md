@@ -82,6 +82,8 @@ commit that added it:
 | `examples/xdp_tcp4.hny`        | `ip.ihl` bitfield + `pkt.view(14 + ihl*4)` runtime-offset view of `tcphdr`   |
 | `examples/xdp_tcp6.hny`        | `pkt.ipv6_l4` extension-header walk + `pkt.l4()` (extension branches verifier-checked; test traffic has none) |
 | `examples/xdp_synopts.hny`     | `tcp.opt(kind)` through `if let`: MSS 65495, wscale 7, SACK ok, tsval from a loopback SYN |
+| `examples/xdp_http.hny`        | `tcp.payload()` view: `starts_with("GET ")`, `len()`, `let line: str<32> = body.str()` — the request line arrives in the event |
+| `examples/xdp_redirect.hny`    | `redirect("veth0")` from `lo`; a second probe on `veth1` reports each packet arriving there |
 | `examples/xdp_pong.hny`        | packet writes (`eth.h_dest = eth.h_source`, `ip.ttl = 7`), `ip.fix_csum()`, `csum_update`, `tx()`: ping answered from XDP with `ttl=7`; without `fix_csum` the stack drops every reply |
 
 Supported: `const`; `map` (`hash<K, V>`, `array<V>`) with `.get`, `.insert`,
@@ -93,7 +95,8 @@ sample in_subnet read_user_str read_kernel_str`); `*ptr`; unsigned and
 `starts_with`, `byte_at`, `==`/`!=`; `ipv4`/`ipv6`/`mac` with `==`/`!=`;
 kernel struct reads via `ptr<S>`; packet views, bitfields, runtime views,
 the IPv6 walk; packet writes through views, `fix_csum`, `csum_update`,
-`tcp.opt`, `tx`.
+`tcp.opt`, `tx`; payload views with bounded reads and `str` copies;
+`redirect` with the interface name resolved by the loader.
 
 Not supported (clear errors, never unverifiable bytecode): `as` casts,
 signed widths other than `i64`, `return <value>`, writing through map

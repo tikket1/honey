@@ -1,0 +1,47 @@
+// xdp_http.hny — look inside TCP payloads: HTTP request lines on port 2226.
+//
+// `tcp.payload()` binds the bytes after the TCP header (at `doff * 4`) as
+// a runtime-length view. Its methods are all bounded: `starts_with` is
+// false if the packet is too short, `u8/u16/u32(off)` pass a packet that
+// ends before the read, and `let s: str<N> = body.str()` copies at most
+// N-1 bytes, stopping at the packet end, NUL-terminated. So every access
+// carries its own `data_end` check and the verifier is satisfied without
+// the program author thinking about it.
+//
+// Taking the payload consumes the transport view: `tcp` is no longer
+// readable after `tcp.payload()` (one runtime view is live at a time), so
+// read the ports first.
+//
+//   ./honey run examples/xdp_http.hny --json
+//   ... in the environment:  nc -l 2226 >/dev/null &  printf 'GET /admin HTTP/1.0\r\n\r\n' | nc -q1 127.0.0.1 2226
+
+event Http {
+    src: ipv4,
+    sport: u16,
+    len: u32,
+    line: str<32>,
+}
+
+probe xdp("lo") {
+    let eth: ptr<ethhdr> = pkt.at(0);
+    if eth.h_proto != 0x0800 {
+        return;
+    }
+    let ip: ptr<iphdr> = pkt.at(14);
+    if ip.protocol != 6 {
+        return;
+    }
+    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);
+    if tcp.dest != 2226 {
+        return;
+    }
+    let sport = tcp.source;
+    let body = tcp.payload();
+    if body.len() == 0 {
+        return;
+    }
+    if body.starts_with("GET ") || body.starts_with("POST ") {
+        let line: str<32> = body.str();
+        emit Http { src: ip.saddr, sport: sport, len: body.len(), line: line };
+    }
+}

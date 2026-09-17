@@ -296,8 +296,14 @@ fn manifest(c: &Compiled) -> String {
             relocs.push_str(&format!("{{ \"slot\": {}, \"struct\": {}, \"field\": {} }}", r.slot, jstr(&r.struct_name), jstr(&r.field)));
         }
         relocs.push(']');
+        let mut ifaces = String::from("[");
+        for (j, r) in p.ifaces.iter().enumerate() {
+            if j > 0 { ifaces.push_str(", "); }
+            ifaces.push_str(&format!("{{ \"slot\": {}, \"iface\": {} }}", r.slot, jstr(&r.name)));
+        }
+        ifaces.push(']');
         s.push_str(&format!(
-            "    {{ \"prog\": {}, {attach}, \"offset\": {offset}, \"insns\": {}, \"stack_bytes\": {}, \"relocs\": {relocs} }}{comma}\n",
+            "    {{ \"prog\": {}, {attach}, \"offset\": {offset}, \"insns\": {}, \"stack_bytes\": {}, \"relocs\": {relocs}, \"ifaces\": {ifaces} }}{comma}\n",
             jstr(&p.name), p.bytecode.len() / 8, p.stack_bytes
         ));
         offset += p.bytecode.len();

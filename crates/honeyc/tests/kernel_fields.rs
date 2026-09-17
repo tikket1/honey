@@ -485,3 +485,66 @@ fn tcp_opt_walks_ten_bounded_hops() {
     // the binding is stored, then the found flag decides the branch
     assert!(text.contains("if r1 == 0 goto"), "{text}");
 }
+
+// ------------------------------------------------------ payload + redirect
+
+const HTTP: &str = "    let ip: ptr<iphdr> = pkt.at(14);\n    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    let sport = tcp.source;\n    let body = tcp.payload();\n";
+
+#[test]
+fn payload_view_types_its_methods() {
+    check_ok(&xdp(&format!("{HTTP}    let line: str<16> = body.str();\n    emit E {{ a: body.len() + body.u32(4), m: pkt.mac(0), b: body.starts_with(\"GET \") && body.u8(0) == 71 }};")));
+    let msg = first(&xdp(&format!("{HTTP}    let line = body.str();\n    emit E {{ a: 1, m: pkt.mac(0), b: true }};")));
+    assert!(msg.contains("`.str()` needs a bounded destination"), "{msg}");
+    let msg = first(&xdp(&format!("{HTTP}    emit E {{ a: body.u32(254), m: pkt.mac(0), b: true }};")));
+    assert!(msg.contains("ends past 256 bytes"), "{msg}");
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let body = ip.payload();\n    emit E { a: body.len(), m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("`ip` is a `ptr<iphdr>`"), "{msg}");
+    let msg = first(&xdp(&format!("{HTTP}    emit E {{ a: 1, m: pkt.mac(0), b: body.starts_with(\"\") }};")));
+    assert!(msg.contains("empty prefix"), "{msg}");
+}
+
+#[test]
+fn taking_the_payload_consumes_the_transport_view() {
+    // reading tcp after tcp.payload() would go through the moved pointer
+    let msg = first(&xdp(&format!("{HTTP}    emit E {{ a: tcp.dest, m: pkt.mac(0), b: true }};")));
+    assert!(msg.contains("`tcp` is no longer a valid view: `body` took the packet pointer"), "{msg}");
+    // the same rule for two runtime views
+    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let a: ptr<tcphdr> = pkt.view(34);\n    let b: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    emit E { a: a.dest, m: pkt.mac(0), b: true };"));
+    assert!(msg.contains("`a` is no longer a valid view: `b` took the packet pointer"), "{msg}");
+    // static views are unaffected
+    check_ok(&xdp(&format!("{HTTP}    emit E {{ a: ip.saddr, m: pkt.mac(0), b: sport == 80 }};")));
+}
+
+#[test]
+fn payload_reads_are_checked_against_data_end() {
+    let text = asm_xdp(&format!("{HTTP}    let line: str<8> = body.str();\n    emit E {{ a: body.u16(2), m: pkt.mac(0), b: body.starts_with(\"GET\") }};"));
+    // r9 = tcp + doff*4
+    assert!(text.contains("lsh r0, 2") && text.contains("mov r9, r1"), "{text}");
+    // entry bound + the tcp view's sizeof check, then str<8>: 7 guarded byte
+    // copies; starts_with: one 3-byte check; u16: one check
+    assert_eq!(text.matches("if r2 > r8 goto").count(), 2 + 7 + 1 + 1, "{text}");
+    assert!(text.contains("ldx16 r0, [r9 +2]"), "{text}");
+    assert!(text.contains("ldx8 r0, [r9 +6]") && text.contains("stx8 [r10 -"), "{text}");
+    // len = data_end - payload
+    let text = asm_xdp(&format!("{HTTP}    emit E {{ a: body.len(), m: pkt.mac(0), b: true }};"));
+    assert!(text.contains("mov r0, r8") && text.contains("sub r0, r9"), "{text}");
+}
+
+#[test]
+fn redirect_records_an_interface_reloc() {
+    let src = xdp("    redirect(\"veth0\");");
+    let btf = kernel_btf();
+    let c = compile_with_btf(&parse(&src).unwrap(), Arch::Aarch64, Some(&btf)).unwrap();
+    let p = &c.programs[0];
+    assert_eq!(p.ifaces.len(), 1, "{:#?}", p.ifaces);
+    assert_eq!(p.ifaces[0].name, "veth0");
+    let at = p.ifaces[0].slot * 8;
+    assert_eq!(p.bytecode[at], 0x18, "an LD_IMM64 for the loader to patch");
+    assert_eq!(p.bytecode[at + 1] & 0xf, 1, "into r1");
+    let text = asm(&src);
+    assert!(text.contains("call 23"), "{text}");
+    let msg = first("event E { a: u32 } probe kprobe(\"f\") { redirect(\"eth0\"); emit E { a: 1 }; }");
+    assert!(msg.contains("`redirect()` is only available in an `xdp` probe"), "{msg}");
+    let msg = first(&xdp("    redirect(3);"));
+    assert!(msg.contains("takes an interface name literal"), "{msg}");
+}

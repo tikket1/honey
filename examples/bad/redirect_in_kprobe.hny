@@ -1,0 +1,10 @@
+// error: `redirect()` is only available in an `xdp` probe
+//
+// Only an XDP program holds a packet to send out of another interface.
+
+event E { p: u64 }
+
+probe kprobe("vfs_open") {
+    redirect("eth0");
+    emit E { p: arg(0) };
+}
