@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <bpf/libbpf.h>
 
 // ----------------------------------------------------- tiny manifest reader
@@ -111,6 +112,7 @@ struct program {
     char category[64];  // tracepoint
     char tracepoint[64];
     char function[64];  // kprobe / kretprobe
+    char hook[64];      // lsm
     size_t offset;
     size_t insns;
 };
@@ -154,6 +156,39 @@ static int attach_tracepoint(const char *cat, const char *name, int prog_fd) {
     return pfd;
 }
 
+// LSM programs are BPF_PROG_TYPE_LSM attached to a BTF function id
+// (bpf_lsm_<hook>) via a bpf_link. The program returns 0 to allow, negative
+// to deny. Loaded with expected_attach_type BPF_LSM_MAC set at load time,
+// which is why LSM is loaded here rather than in the shared loop.
+static int load_and_attach_lsm(const char *hook, const char *license,
+                               const struct bpf_insn *insns, size_t n, char *log, size_t logsz) {
+    static struct btf *vmlinux;
+    if (!vmlinux) {
+        vmlinux = btf__load_vmlinux_btf();
+        if (!vmlinux) { fprintf(stderr, "cannot load vmlinux BTF (needed for LSM)\n"); return -1; }
+    }
+    char sym[96];
+    snprintf(sym, sizeof sym, "bpf_lsm_%s", hook);
+    int btf_id = btf__find_by_name_kind(vmlinux, sym, BTF_KIND_FUNC);
+    if (btf_id < 0) {
+        fprintf(stderr, "LSM hook `%s` not found (looked for `%s` in BTF; is CONFIG_BPF_LSM on and the hook name right?)\n", hook, sym);
+        return -1;
+    }
+    LIBBPF_OPTS(bpf_prog_load_opts, opts, .expected_attach_type = BPF_LSM_MAC,
+                .attach_btf_id = btf_id, .log_buf = log, .log_size = logsz, .log_level = 1);
+    int prog_fd = bpf_prog_load(BPF_PROG_TYPE_LSM, "honeylsm", license, insns, n, &opts);
+    if (prog_fd < 0) {
+        fprintf(stderr, "lsm:%s: verifier rejected the program (%s):\n%s\n", hook, strerror(-prog_fd), log);
+        return -1;
+    }
+    int link = bpf_link_create(prog_fd, 0, BPF_LSM_MAC, NULL);
+    if (link < 0) {
+        fprintf(stderr, "lsm:%s: bpf_link_create failed (%s); is `bpf` in the kernel's active LSM list?\n", hook, strerror(-link));
+        return -1;
+    }
+    return prog_fd;
+}
+
 // kprobes attach through the "kprobe" perf PMU: its numeric type comes from
 // sysfs, the function name goes in config1, and the retprobe flag is a
 // config bit whose position sysfs also tells us (usually bit 0).
@@ -195,6 +230,7 @@ struct ctx {
     struct event *events;
     int n_events;
     uint32_t header;
+    int json;
 };
 
 static int on_event(void *vctx, void *data, size_t len) {
@@ -209,31 +245,46 @@ static int on_event(void *vctx, void *data, size_t len) {
     struct event *ev = &c->events[id];
     if (len < c->header + ev->size) return 0;
     const uint8_t *rec = (const uint8_t *)data + c->header;
+
+    if (c->json) {
+        printf("{\"event\":\"%s\"", ev->name);
+        for (int i = 0; i < ev->n_fields; i++) {
+            struct field *f = &ev->fields[i];
+            const uint8_t *p = rec + f->offset;
+            printf(",\"%s\":", f->name);
+            switch (f->kind) {
+            case K_UINT: { uint64_t v = 0; memcpy(&v, p, f->size); printf("%llu", (unsigned long long)v); break; }
+            case K_INT:  { int64_t v = 0; memcpy(&v, p, f->size); if (f->size == 4) v = (int32_t)v; printf("%lld", (long long)v); break; }
+            case K_BOOL: printf("%s", *p ? "true" : "false"); break;
+            case K_STR:
+                putchar('"');
+                for (uint32_t j = 0; j < f->size && p[j]; j++) {
+                    unsigned char ch = p[j];
+                    if (ch == '"' || ch == '\\') { putchar('\\'); putchar(ch); }
+                    else if (ch == '\n') { putchar('\\'); putchar('n'); }
+                    else if (ch == '\t') { putchar('\\'); putchar('t'); }
+                    else if (ch < 0x20) printf("\\u%04x", ch);
+                    else putchar(ch);
+                }
+                putchar('"');
+                break;
+            }
+        }
+        printf("}\n");
+        fflush(stdout);
+        return 0;
+    }
+
     printf("%-14s", ev->name);
     for (int i = 0; i < ev->n_fields; i++) {
         struct field *f = &ev->fields[i];
         const uint8_t *p = rec + f->offset;
         printf("  %s=", f->name);
         switch (f->kind) {
-        case K_UINT: {
-            uint64_t v = 0;
-            memcpy(&v, p, f->size);
-            printf("%llu", (unsigned long long)v);
-            break;
-        }
-        case K_INT: {
-            int64_t v = 0;
-            memcpy(&v, p, f->size);
-            if (f->size == 4) v = (int32_t)v;
-            printf("%lld", (long long)v);
-            break;
-        }
-        case K_BOOL:
-            printf("%s", *p ? "true" : "false");
-            break;
-        case K_STR:
-            printf("%.*s", (int)f->size, (const char *)p);
-            break;
+        case K_UINT: { uint64_t v = 0; memcpy(&v, p, f->size); printf("%llu", (unsigned long long)v); break; }
+        case K_INT:  { int64_t v = 0; memcpy(&v, p, f->size); if (f->size == 4) v = (int32_t)v; printf("%lld", (long long)v); break; }
+        case K_BOOL: printf("%s", *p ? "true" : "false"); break;
+        case K_STR:  printf("%.*s", (int)f->size, (const char *)p); break;
         }
     }
     printf("\n");
@@ -264,14 +315,17 @@ static void relocate_map_fds(uint8_t *insns, size_t bytes, const int *fds, int n
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <program.bin> <program.json>\n", argv[0]);
+    int json = 0;
+    int a = 1;
+    if (a < argc && strcmp(argv[a], "--json") == 0) { json = 1; a++; }
+    if (argc - a != 2) {
+        fprintf(stderr, "usage: %s [--json] <program.bin> <program.json>\n", argv[0]);
         return 2;
     }
 
     size_t code_len = 0;
-    uint8_t *code = (uint8_t *)slurp(argv[1], &code_len);
-    char *man = slurp(argv[2], NULL);
+    uint8_t *code = (uint8_t *)slurp(argv[a], &code_len);
+    char *man = slurp(argv[a + 1], NULL);
     if (!code || !man) return 1;
     if (code_len % 8 != 0) {
         fprintf(stderr, "bytecode length %zu is not a multiple of 8\n", code_len);
@@ -338,6 +392,7 @@ int main(int argc, char **argv) {
         json_str_in(p, next, "category", pr->category, sizeof pr->category);
         json_str_in(p, next, "tracepoint", pr->tracepoint, sizeof pr->tracepoint);
         json_str_in(p, next, "function", pr->function, sizeof pr->function);
+        json_str_in(p, next, "hook", pr->hook, sizeof pr->hook);
         pr->offset = json_int_in(p, next, "offset", 0);
         pr->insns = json_int_in(p, next, "insns", 0);
         if (pr->offset + pr->insns * 8 > code_len) {
@@ -380,6 +435,13 @@ int main(int argc, char **argv) {
         size_t bytes = pr->insns * 8;
         relocate_map_fds(insns, bytes, fds, nfds);
 
+        if (strcmp(pr->type, "lsm") == 0) {
+            int fd = load_and_attach_lsm(pr->hook, license, (const struct bpf_insn *)insns, pr->insns, log, sizeof log);
+            if (fd < 0) return 1;
+            fprintf(stderr, "%s: loaded (%zu insns, fd %d) and attached\n", pr->name, pr->insns, fd);
+            continue;
+        }
+
         int is_kprobe = strcmp(pr->type, "kprobe") == 0 || strcmp(pr->type, "kretprobe") == 0;
         enum bpf_prog_type pt = is_kprobe ? BPF_PROG_TYPE_KPROBE : BPF_PROG_TYPE_TRACEPOINT;
         LIBBPF_OPTS(bpf_prog_load_opts, opts, .log_buf = log, .log_size = sizeof log, .log_level = 1);
@@ -401,7 +463,7 @@ int main(int argc, char **argv) {
     }
 
     // ---- 3. poll
-    struct ctx c = { .events = events, .n_events = n_events, .header = (uint32_t)header };
+    struct ctx c = { .events = events, .n_events = n_events, .header = (uint32_t)header, .json = json };
     struct ring_buffer *rb = ring_buffer__new(rb_fd, on_event, &c, NULL);
     if (!rb) { fprintf(stderr, "ring_buffer__new failed\n"); return 1; }
     fprintf(stderr, "waiting for events, Ctrl-C to stop...\n");

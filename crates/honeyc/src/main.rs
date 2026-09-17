@@ -259,6 +259,7 @@ fn manifest(c: &Compiled) -> String {
             ),
             ProbeKind::Kprobe { function } => format!("\"type\": \"kprobe\", \"function\": {}", jstr(function)),
             ProbeKind::Kretprobe { function } => format!("\"type\": \"kretprobe\", \"function\": {}", jstr(function)),
+            ProbeKind::Lsm { hook } => format!("\"type\": \"lsm\", \"hook\": {}", jstr(hook)),
         };
         let comma = if i + 1 < c.programs.len() { "," } else { "" };
         s.push_str(&format!(

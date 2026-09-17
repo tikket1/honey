@@ -148,6 +148,8 @@ enum ProbeKind {
     Tracepoint,
     Kprobe,
     Kretprobe,
+    /// An LSM hook: can observe and can `deny()` the action.
+    Lsm,
 }
 
 // ----------------------------------------------------------------- checker
@@ -358,15 +360,20 @@ impl Checker {
             }
             ("kprobe", 1) => Some(ProbeKind::Kprobe),
             ("kretprobe", 1) => Some(ProbeKind::Kretprobe),
+            ("lsm", 1) => Some(ProbeKind::Lsm),
             ("kprobe" | "kretprobe", _) => {
                 self.error(p.span, format!("`{}` takes one string argument: the kernel function name", p.kind.name));
+                None
+            }
+            ("lsm", _) => {
+                self.error(p.span, "`lsm` takes one string argument: the hook name, e.g. `lsm(\"file_open\")`");
                 None
             }
             (other, _) => {
                 self.error_help(
                     p.kind.span,
                     format!("unsupported probe kind `{other}`"),
-                    "use `tracepoint(\"category\", \"name\")`, `kprobe(\"function\")`, or `kretprobe(\"function\")`",
+                    "use `tracepoint(\"category\", \"name\")`, `kprobe(\"function\")`, `kretprobe(\"function\")`, or `lsm(\"hook\")`",
                 );
                 None
             }
@@ -815,6 +822,20 @@ impl Checker {
             }
             ("read_user_str", _) => {
                 self.error_help(span, "`read_user_str` must initialise a bounded string", "write `let s: str<N> = read_user_str(ptr);`");
+                Ty::Unit
+            }
+            ("deny" | "allow", []) => {
+                if self.probe_kind != Some(ProbeKind::Lsm) {
+                    self.error_help(
+                        span,
+                        format!("`{name}()` is only available in an `lsm` probe"),
+                        "only an LSM hook can allow or deny an action; use `probe lsm(\"hook\") {{ ... }}`",
+                    );
+                }
+                Ty::Unit
+            }
+            ("deny" | "allow", _) => {
+                self.error(span, format!("`{name}()` takes no arguments"));
                 Ty::Unit
             }
             ("pid" | "tgid" | "tid" | "uid" | "gid" | "ktime" | "arg" | "retval", _) => {

@@ -336,3 +336,38 @@ fn unsigned_compares_stay_unsigned() {
     // exec_burst compares u64s: no signed jump anywhere.
     assert!(!asm(EXEC_BURST).contains(" s>"), "{}", asm(EXEC_BURST));
 }
+
+// --------------------------------------------------------------- lsm hooks
+
+const LSM: &str = include_str!("../../../examples/lsm_block_uid.hny");
+
+#[test]
+fn lsm_probe_compiles_to_an_lsm_program() {
+    let prog = parse(LSM).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert_eq!(c.programs.len(), 1);
+    assert_eq!(c.programs[0].name, "lsm:file_open");
+    assert!(matches!(&c.programs[0].kind, honeyc::codegen::ProbeKind::Lsm { hook } if hook == "file_open"));
+}
+
+#[test]
+fn deny_returns_minus_one_and_allow_returns_zero() {
+    let asm = disasm_bytes(&compile(&parse(LSM).unwrap(), Arch::Aarch64).unwrap().programs[0].bytecode);
+    // deny(): mov r0, -1 then exit.
+    assert!(asm.contains("mov r0, -1"), "{asm}");
+    // the fall-through allow path: mov r0, 0 then exit.
+    assert!(asm.trim_end().ends_with("mov r0, 0\n  33: exit") || asm.contains("mov r0, 0"), "{asm}");
+    // both an early deny-exit and a final allow-exit exist.
+    assert_eq!(asm.matches("exit").count(), 2, "{asm}");
+}
+
+#[test]
+fn lsm_arg_reads_the_context_array_directly() {
+    // In an LSM probe arg(n) is at ctx + 8n (no +16 tracepoint header).
+    let src = "event E { a: u64 } probe lsm(\"file_open\") { emit E { a: arg(0) }; }";
+    let asm = disasm_bytes(&compile(&parse(src).unwrap(), Arch::Aarch64).unwrap().programs[0].bytecode);
+    assert!(asm.contains("ldx64 r0, [r0 +0]"), "arg(0) at ctx+0\n{asm}");
+    let src = "event E { a: u64 } probe lsm(\"file_open\") { emit E { a: arg(2) }; }";
+    let asm = disasm_bytes(&compile(&parse(src).unwrap(), Arch::Aarch64).unwrap().programs[0].bytecode);
+    assert!(asm.contains("ldx64 r0, [r0 +16]"), "arg(2) at ctx+16\n{asm}");
+}

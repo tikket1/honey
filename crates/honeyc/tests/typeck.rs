@@ -383,3 +383,32 @@ fn multiple_probes_each_get_their_own_stack_budget() {
 fn probes_can_emit_different_events() {
     ok("event A { x: u64 }\nevent B { y: u32 }\nprobe kprobe(\"f\") { emit A { x: arg(0) }; }\nprobe kretprobe(\"f\") { emit B { y: uid() }; }");
 }
+
+// ------------------------------------------------------------- lsm probes
+
+#[test]
+fn lsm_allows_deny_and_allow() {
+    ok("event E { u: u32 } probe lsm(\"file_open\") { if uid() == 0 { emit E { u: uid() }; deny(); } }");
+    ok("event E { u: u32 } probe lsm(\"file_open\") { allow(); }");
+}
+
+#[test]
+fn deny_and_allow_are_lsm_only() {
+    let msg = first_message(&probe("    deny();\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`deny()` is only available in an `lsm` probe"), "{msg}");
+    let msg = first_message("event E { a: u64 } probe kprobe(\"f\") { allow(); emit E { a: 1 }; }");
+    assert!(msg.contains("`allow()` is only available in an `lsm` probe"), "{msg}");
+}
+
+#[test]
+fn lsm_takes_one_hook_argument() {
+    let msg = first_message("event E { a: u64 } probe lsm(\"a\", \"b\") { emit E { a: 1 }; }");
+    assert!(msg.contains("`lsm` takes one string argument"), "{msg}");
+}
+
+#[test]
+fn lsm_has_args_but_no_retval() {
+    ok("event E { a: u64 } probe lsm(\"file_open\") { emit E { a: arg(0) }; }");
+    let msg = first_message("event E { a: u64, r: i64 } probe lsm(\"file_open\") { emit E { a: 1, r: retval() }; }");
+    assert!(msg.contains("`retval()` is only available in a `kretprobe`"), "{msg}");
+}

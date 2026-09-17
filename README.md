@@ -12,16 +12,17 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 }
 ```
 
-Status: **v1 pipeline complete, with kprobes and multi-probe programs.** All four
-example programs compile to eBPF bytecode the kernel verifier accepts and the loader
-prints live events. The stage 4 type checker turns every verifier rule into an error
+Status: **v1 pipeline complete: tracepoints, kprobes, LSM enforcement, multi-probe
+programs, and JSON output.** Every example compiles to eBPF bytecode the kernel
+verifier accepts and the loader prints live events (text, or `--json` for a log
+pipeline). The stage 4 type checker turns every verifier rule into an error
 at your source line; `examples/bad/` holds one program per rule, each rejected with a
 fix hint.
 
-The example that shows why kprobes matter, `examples/shadow_open_ok.hny`: a syscall
-tracepoint sees every *attempt* to open `/etc/shadow`. Hooking the kernel function
-on entry and return, sharing a map keyed by thread id, reports only the opens that
-*succeeded*, with the file descriptor they got.
+Two examples show the range. `examples/shadow_open_ok.hny` (kprobe + kretprobe)
+reports only the opens of `/etc/shadow` that *succeeded*, with the file descriptor.
+`examples/lsm_block_uid.hny` (LSM) does not just watch — it *blocks*: a quarantined
+uid cannot open a single file, verified returning EPERM in-kernel.
 
 ## The idea in one screen
 
@@ -58,8 +59,8 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (25)
-  tests/typeck.rs    stage 4 acceptance tests (34)
+  tests/codegen.rs   stage 3 acceptance tests (27)
+  tests/typeck.rs    stage 4 acceptance tests (38)
 linux/               the Linux side (build + run against a real kernel)
   loader.c           loads bytecode, attaches to a tracepoint, reads events
   honey-linux        run a command in the Docker Linux environment
@@ -73,16 +74,17 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 169 tests
+cargo test                                  # 175 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
 cargo run -- build examples/exec.hny -o build/exec   # write bytecode + manifest
 
 # run one against a real kernel (needs Docker Desktop):
-cargo run -- build examples/shadow_open_ok.hny -o build/shadow
-linux/honey-linux ./linux/run.sh build/shadow.bin build/shadow.json
-#   -> ShadowOpen  pid=6500  uid=0  fd=3      (only successful opens)
+cargo run -- build examples/lsm_block_uid.hny -o build/lsm
+linux/honey-linux ./linux/run.sh --json build/lsm.bin build/lsm.json
+#   -> {"event":"Blocked","uid":4242,"pid":23944,"comm":"setpriv"}
+#      and the quarantined uid's open is denied with EPERM
 # compiling for an x86_64 box: add --arch x86_64 (kprobe register layout)
 ```
 
@@ -100,8 +102,8 @@ buffers.
    budget, bounded reads: illegal-to-verify becomes illegal-to-typecheck.
 
 All four stages are in place, plus kprobes/kretprobes and multi-probe programs.
-What comes next is breadth (LSM hooks, more builtins, string equality, sampling,
-JSON event output) on the same skeleton.
+What comes next is breadth (XDP, uprobes, string equality, sampling, reading
+struct fields from kprobe/LSM pointer arguments) on the same skeleton.
 
 ## Prior art
 

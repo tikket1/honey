@@ -1,0 +1,26 @@
+// lsm_block_uid.hny — quarantine a user id: block every file it opens, and
+// log each attempt.
+//
+// This is enforcement, not just observation. `lsm("file_open")` runs inside
+// the kernel's access-control path: returning from `deny()` makes the open
+// fail with EPERM. A tracepoint could only watch it happen. The default,
+// falling off the end of the probe, allows the action.
+//
+// Pick a uid nothing normally runs as, so the policy is safe to demo. Any
+// process running as QUARANTINE cannot open a single file — not even the
+// binary it tries to exec.
+
+const QUARANTINE: u32 = 4242;
+
+event Blocked {
+    uid: u32,
+    pid: u32,
+    comm: str<16>,
+}
+
+probe lsm("file_open") {
+    if uid() == QUARANTINE {
+        emit Blocked { uid: uid(), pid: pid(), comm: comm() };
+        deny();
+    }
+}

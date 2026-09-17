@@ -95,6 +95,8 @@ pub enum ProbeKind {
     Tracepoint { category: String, name: String },
     Kprobe { function: String },
     Kretprobe { function: String },
+    /// An LSM hook. The program returns 0 to allow, negative to deny.
+    Lsm { hook: String },
 }
 
 /// One BPF program.
@@ -265,12 +267,14 @@ pub fn compile(program: &Program, arch: Arch) -> Result<Compiled, String> {
             ("tracepoint", [c, n]) => ProbeKind::Tracepoint { category: c.clone(), name: n.clone() },
             ("kprobe", [f]) => ProbeKind::Kprobe { function: f.clone() },
             ("kretprobe", [f]) => ProbeKind::Kretprobe { function: f.clone() },
+            ("lsm", [h]) => ProbeKind::Lsm { hook: h.clone() },
             (k, a) => return Err(format!("probe `{k}` with {} argument(s) is not supported", a.len())),
         };
         let name = match &kind {
             ProbeKind::Tracepoint { category, name } => format!("tracepoint:{category}:{name}"),
             ProbeKind::Kprobe { function } => format!("kprobe:{function}"),
             ProbeKind::Kretprobe { function } => format!("kretprobe:{function}"),
+            ProbeKind::Lsm { hook } => format!("lsm:{hook}"),
         };
         let (bytecode, stack_bytes) = compile_probe(&sh, &kind, p)?;
         programs.push(CompiledProbe { name, kind, bytecode, stack_bytes });
@@ -894,6 +898,18 @@ impl Cg<'_> {
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R0, off));
                 Ok(Ty::I64)
             }
+            "allow" => {
+                // return 0 (allow) immediately.
+                self.prog.push(mov64_imm(Reg::R0, 0));
+                self.prog.push(bpf::exit());
+                Ok(Ty::Uint(8))
+            }
+            "deny" => {
+                // return -EPERM (-1) immediately: the LSM hook blocks the action.
+                self.prog.push(mov64_imm(Reg::R0, -1));
+                self.prog.push(bpf::exit());
+                Ok(Ty::Uint(8))
+            }
             "comm" => Err("`comm()` can only be used directly as an `emit` field value".into()),
             other => Err(format!("unknown builtin `{other}()`")),
         }
@@ -909,6 +925,13 @@ impl Cg<'_> {
                             return Err(format!("arg index {n} out of range"));
                         }
                         (16 + 8 * n) as i16
+                    }
+                    // LSM context is a u64 array of the hook's arguments.
+                    ProbeKind::Lsm { .. } => {
+                        if !(0..=5).contains(&n) {
+                            return Err(format!("arg index {n} out of range"));
+                        }
+                        (8 * n) as i16
                     }
                     ProbeKind::Kprobe { .. } => self
                         .sh

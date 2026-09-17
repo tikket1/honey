@@ -1,0 +1,11 @@
+// error: `deny()` is only available in an `lsm` probe
+//
+// A tracepoint fires alongside the event; it cannot change the outcome.
+// Only an LSM hook sits in the decision path and can block.
+
+event E { pid: u32 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    deny();
+    emit E { pid: pid() };
+}
