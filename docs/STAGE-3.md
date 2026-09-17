@@ -75,6 +75,11 @@ Supported: `const` integer literals; `map` (`hash<K, V>`, `array<V>`) with
 nullary builtins (`pid tgid tid uid gid ktime`), `comm()` as an emit field,
 `*ptr`, unsigned arithmetic/bitwise/comparison, `&&`/`||`/`!`.
 
+Address equality (`a == "::1"`, `m == n`) is unrolled into 8/4/2/1-byte
+chunk compares (a literal's chunk is loaded as a 64-bit immediate in the
+byte order the CPU would read it); `ip == "10.0.0.1"` on a `u32` rewrites
+the literal into the integer and takes the ordinary compare path.
+
 String equality (`s == "lit"`, `s == t`) is unrolled into one byte compare
 per position with an early exit on mismatch and, for `s == t`, on a shared
 NUL; a literal test ends with a terminator check unless the literal fills the
@@ -178,9 +183,18 @@ restore them from BTF.
 ### How values move (read `codegen.rs` with this in mind)
 
 - Every expression evaluates into `R0`.
-- Locals are 8-byte stack slots at `[R10 - off]`, allocated per scope and
-  released in LIFO order. Binary operators spill the left operand to a
-  scratch slot, compute the right, reload into `R1`, and combine.
+- **Register allocation.** Scalar locals and binary-operator temporaries
+  live in the callee-saved registers `R6..R9` that the probe isn't already
+  reserving — `R6` when it emits (record pointer), `R7`/`R8` in XDP (packet
+  bounds), `R9` in USDT (arg spec) — and fall back to 8-byte stack slots
+  when the pool is empty. Callee-saved registers survive helper calls, so a
+  parked value needs no spill. Buffers (`str<N>`, `ipv6`, `mac`) always live
+  on the stack. Registers are handed back when a scope ends, LIFO like the
+  stack. Honest note: BPF has no memory-operand ALU forms, so this does not
+  shrink the instruction count — a `mov r9, r0` costs the same as a
+  `stx64 [r10-16], r0`. It removes the stack traffic (exec_burst now has
+  zero scalar reloads) and cuts stack use, and it lets the verifier track a
+  map pointer's null check directly on the register that holds it.
 - `map.get(k)` stores the key on the stack, calls `bpf_map_lookup_elem`, and
   the result is *spilled and then null-checked*. The verifier propagates the
   null check to the spilled copy, so reloading it inside the `if let` body

@@ -1,0 +1,13 @@
+// error: "2001:db8::1::2" is not a valid `ipv6` literal
+//
+// Address literals are checked at compile time; a typo here would otherwise
+// be a rule that silently never matches.
+
+event E { a: u8 }
+
+probe xdp("lo") {
+    let src = pkt.ipv6(22);
+    if src == "2001:db8::1::2" {
+        emit E { a: 1 };
+    }
+}

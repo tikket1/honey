@@ -152,15 +152,16 @@ fn exec_burst_compiles() {
 }
 
 #[test]
-fn map_lookup_spills_then_null_checks() {
+fn map_lookup_parks_the_pointer_then_null_checks() {
     // The verifier needs: lookup result checked for null before any deref.
-    // Our shape: call 1, spill r0, `if r0 == 0`, and only then reload+deref.
+    // Our shape: call 1, park r0 in a callee-saved register, `if r0 == 0`,
+    // and only then copy it back and deref.
     let text = asm(EXEC_BURST);
     let after = text.split("call 1\n").nth(1).unwrap();
     let l: Vec<&str> = after.lines().take(4).collect();
-    assert!(l[0].contains("stx64 [r10"), "{l:?}");
+    assert!(l[0].contains("mov r") && l[0].contains(", r0"), "park in a register: {l:?}");
     assert!(l[1].contains("if r0 == 0 goto"), "{l:?}");
-    assert!(l[2].contains("ldx64 r0, [r10"), "{l:?}");
+    assert!(l[2].contains("mov r0, r"), "{l:?}");
     assert!(l[3].contains("ldx64 r0, [r0 +0]"), "{l:?}");
 }
 
@@ -624,4 +625,94 @@ fn blob_local_uses_its_full_stack_size() {
     let c = compile(&prog, Arch::Aarch64).unwrap();
     // ctx slot (8) + one ipv6 local (16) = 24; no temporaries needed.
     assert_eq!(c.programs[0].stack_bytes, 24);
+}
+
+// ------------------------------------------------------ register allocator
+
+#[test]
+fn scalar_locals_live_in_callee_saved_registers() {
+    // exec_burst: uid, n, prev all fit in R7/R8/R9 (R6 is the emit record).
+    let text = asm(EXEC_BURST);
+    assert!(text.contains("mov r9, r0"), "first local -> r9\n{text}");
+    assert!(text.contains("mov r8, r0"), "second local -> r8\n{text}");
+    // no scalar spills for locals: the only 8-byte stack stores are the ctx
+    // save and the map *value* slot that bpf_map_update_elem needs a pointer
+    // to. Before the allocator, uid/n/prev each had a slot at -16/-24/-32.
+    let stack_stores = text.lines().filter(|l| l.contains("stx64 [r10")).count();
+    assert_eq!(stack_stores, 2, "ctx save + insert value slot\n{text}");
+    assert!(!text.contains("stx64 [r10 -16], r0"), "no local at -16\n{text}");
+}
+
+#[test]
+fn temporaries_use_a_free_register_before_the_stack() {
+    // `n + 1` parks n in a free register while 1 is materialised, no spill.
+    let src = "event E { a: u64 } probe tracepoint(\"s\",\"n\") { let n = ktime(); emit E { a: n + 1 }; }";
+    let text = asm_helper(src);
+    assert!(text.contains("mov r1, r"), "lhs reloaded from a register\n{text}");
+    assert!(!text.contains("stx64 [r10 -16]"), "no temp spill\n{text}");
+}
+
+#[test]
+fn reserved_registers_are_never_allocated() {
+    // XDP with an emit: R6 (record), R7/R8 (packet) reserved -> only R9.
+    let src = "event E { a: u32 } probe xdp(\"lo\") { let a = pkt.u32(26); let b = pkt.u32(30); emit E { a: a }; }";
+    let text = asm_helper(src);
+    assert!(text.contains("mov r9, r0"), "{text}");
+    assert!(!text.contains("mov r6, r0\n") || text.matches("mov r6, r0").count() == 1, "r6 only for the record\n{text}");
+    assert!(text.contains("stx64 [r10 -16], r0"), "second local falls back to the stack\n{text}");
+}
+
+#[test]
+fn stack_falls_back_when_registers_run_out() {
+    let src = "event E { a: u64 } probe tracepoint(\"s\",\"n\") { let a = ktime(); let b = ktime(); let c = ktime(); let d = ktime(); emit E { a: a + b + c + d }; }";
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    // ctx (8) + the 4th local on the stack (8) + one temp when the pool is empty
+    assert!(c.programs[0].stack_bytes >= 16, "{}", c.programs[0].stack_bytes);
+    assert!(disasm_bytes(&c.programs[0].bytecode).contains("stx64 [r10 -16], r0"));
+}
+
+#[test]
+fn allocator_removes_stack_traffic_for_scalars() {
+    // BPF has no memory-operand ALU forms, so a register move and a stack
+    // store both cost one instruction: the allocator does not shrink the
+    // instruction count. What it removes is the memory traffic. exec_burst
+    // used to reload uid/n/prev and every binary-op temporary from the
+    // stack; now nothing scalar is ever read back from the stack.
+    let text = asm(EXEC_BURST);
+    let reloads = text.lines().filter(|l| l.contains("ldx64 r0, [r10") || l.contains("ldx64 r1, [r10")).count();
+    assert_eq!(reloads, 0, "no scalar reloads\n{text}");
+    // and the stack is just the ctx save plus the two map slots.
+    let prog = parse(EXEC_BURST).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert_eq!(c.programs[0].stack_bytes, 24);
+}
+
+// ------------------------------------------------------ address comparison
+
+#[test]
+fn ipv6_literal_compare_is_two_chunk_compares() {
+    let src = "event E { a: u8 } probe xdp(\"lo\") { let s = pkt.ipv6(22); if s == \"::1\" { emit E { a: 1 }; } }";
+    let text = asm_helper(src);
+    // ::1 as two little-endian u64 chunks: 0 and 1<<56
+    assert!(text.contains("ld64 r0, 0\n"), "{text}");
+    assert!(text.contains("ld64 r0, 72057594037927936"), "1 << 56\n{text}");
+    assert_eq!(text.matches("if r1 != r0 goto").count(), 2, "{text}");
+}
+
+#[test]
+fn mac_compare_is_a_word_and_a_half() {
+    let src = "event E { a: u8 } probe xdp(\"lo\") { let m = pkt.mac(6); let n = pkt.mac(0); if m == n { emit E { a: 1 }; } }";
+    let text = asm_helper(src);
+    assert!(text.contains("ldx32 r1, [r10"), "{text}");
+    assert!(text.contains("ldx16 r1, [r10"), "{text}");
+    assert_eq!(text.matches("if r1 != r0 goto").count(), 2, "{text}");
+}
+
+#[test]
+fn dotted_quad_literal_becomes_an_integer_compare() {
+    let src = "event E { a: u8 } probe xdp(\"lo\") { if pkt.u32(26) == \"127.0.0.1\" { emit E { a: 1 }; } }";
+    let text = asm_helper(src);
+    assert!(text.contains("mov r0, 2130706433") || text.contains("ld64 r0, 2130706433"), "{text}");
+    assert!(text.contains("if r1 == r0 goto"), "{text}");
 }

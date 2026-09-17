@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 
+use crate::addr;
 use crate::ast::*;
 use crate::btf::{Btf, Resolved};
 use crate::token::Span;
@@ -918,9 +919,10 @@ impl Checker<'_> {
     /// evaluating it (a bare literal is an error everywhere else).
     fn str_side(&self, e: &Expr) -> StrSide {
         match &e.kind {
-            ExprKind::Str(lit) => StrSide::Lit(lit.len() as u32),
+            ExprKind::Str(lit) => StrSide::Lit(lit.clone()),
             ExprKind::Ident(n) => match self.lookup(n).map(|v| v.ty.clone()) {
                 Some(Ty::Str(cap)) => StrSide::Local(cap),
+                Some(t @ (Ty::Ipv6 | Ty::Mac)) => StrSide::Blob(t),
                 _ => StrSide::No,
             },
             _ => StrSide::No,
@@ -928,18 +930,21 @@ impl Checker<'_> {
     }
 
     fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> Ty {
-        // String comparisons: `s == "lit"`, `s != t`. Only `==` / `!=`.
+        // String and address comparisons: `s == "lit"`, `s != t`,
+        // `a == "::1"`, `m == other_mac`, `ip == "10.0.0.1"`. Only `==` / `!=`.
         let (ls, rs) = (self.str_side(lhs), self.str_side(rhs));
         if ls != StrSide::No || rs != StrSide::No {
             if !matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
-                self.error_help(span, format!("strings do not support `{}`", op.symbol()), "strings can only be compared with `==` and `!=`, or tested with `starts_with`");
+                self.error_help(span, format!("strings and addresses do not support `{}`", op.symbol()), "they can only be compared with `==` and `!=`");
                 return Ty::Bool;
             }
+            let lhs_plain = ls == StrSide::No;
             match (ls, rs) {
                 (StrSide::Lit(_), StrSide::Lit(_)) => {
-                    self.error(span, "comparing two string literals; compare a `str<N>` variable with a literal");
+                    self.error(span, "comparing two string literals; compare a variable with a literal");
                 }
-                (StrSide::Local(cap), StrSide::Lit(len)) | (StrSide::Lit(len), StrSide::Local(cap)) => {
+                (StrSide::Local(cap), StrSide::Lit(lit)) | (StrSide::Lit(lit), StrSide::Local(cap)) => {
+                    let len = lit.len() as u32;
                     if len > cap {
                         self.error_help(
                             span,
@@ -949,16 +954,46 @@ impl Checker<'_> {
                     }
                 }
                 (StrSide::Local(_), StrSide::Local(_)) => {}
+                (StrSide::Blob(a), StrSide::Blob(b)) => {
+                    if a != b {
+                        self.error(span, format!("cannot compare `{a}` with `{b}`"));
+                    }
+                }
+                (StrSide::Blob(t), StrSide::Lit(lit)) | (StrSide::Lit(lit), StrSide::Blob(t)) => {
+                    let ok = match t {
+                        Ty::Ipv6 => addr::parse_ipv6(&lit).is_some(),
+                        _ => addr::parse_mac(&lit).is_some(),
+                    };
+                    if !ok {
+                        let example = if t == Ty::Ipv6 { "\"2001:db8::1\"" } else { "\"aa:bb:cc:dd:ee:ff\"" };
+                        self.error_help(span, format!("{lit:?} is not a valid `{t}` literal"), format!("write it like {example}"));
+                    }
+                }
+                (StrSide::Blob(t), StrSide::Local(_)) | (StrSide::Local(_), StrSide::Blob(t)) => {
+                    self.error(span, format!("cannot compare `{t}` with a `str<N>`"));
+                }
                 (StrSide::Local(cap), StrSide::No) | (StrSide::No, StrSide::Local(cap)) => {
-                    let other = if ls == StrSide::No { self.expr(lhs) } else { self.expr(rhs) };
+                    let other = if lhs_plain { self.expr(lhs) } else { self.expr(rhs) };
                     if other != Ty::Unit {
                         self.error(span, format!("cannot compare `str<{cap}>` with `{other}`"));
                     }
                 }
-                (StrSide::Lit(_), StrSide::No) | (StrSide::No, StrSide::Lit(_)) => {
-                    let other = if ls == StrSide::No { self.expr(lhs) } else { self.expr(rhs) };
+                (StrSide::Blob(t), StrSide::No) | (StrSide::No, StrSide::Blob(t)) => {
+                    let other = if lhs_plain { self.expr(lhs) } else { self.expr(rhs) };
                     if other != Ty::Unit {
-                        self.error_help(span, format!("cannot compare a string literal with `{other}`"), "only a `str<N>` variable can be compared with a literal");
+                        self.error(span, format!("cannot compare `{t}` with `{other}`"));
+                    }
+                }
+                (StrSide::Lit(lit), StrSide::No) | (StrSide::No, StrSide::Lit(lit)) => {
+                    // A dotted quad against a u32 address is fine.
+                    let other = if lhs_plain { self.expr(lhs) } else { self.expr(rhs) };
+                    let is_u32 = other == Ty::U32 || other == Ty::Int;
+                    if other != Ty::Unit && !(is_u32 && addr::parse_ipv4(&lit).is_some()) {
+                        if is_u32 {
+                            self.error_help(span, format!("{lit:?} is not an IPv4 address literal"), "compare a `u32` address with a dotted quad like \"10.0.0.1\"");
+                        } else {
+                            self.error_help(span, format!("cannot compare a string literal with `{other}`"), "only a `str<N>`, `ipv6`, `mac`, or `u32` address can be compared with a literal");
+                        }
                     }
                 }
                 (StrSide::No, StrSide::No) => unreachable!(),
@@ -969,7 +1004,7 @@ impl Checker<'_> {
         let l = self.expr(lhs);
         let r = self.expr(rhs);
         if matches!(l, Ty::Ipv6 | Ty::Mac) || matches!(r, Ty::Ipv6 | Ty::Mac) {
-            self.error(span, "`ipv6` and `mac` values cannot be compared yet; emit them");
+            self.error(span, "`ipv6` and `mac` values can only be compared with `==` and `!=` against another address or a literal");
             return Ty::Bool;
         }
         // Errors in operands already reported; don't cascade.
@@ -1314,12 +1349,14 @@ impl Checker<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StrSide {
     /// A `str<N>` variable with this capacity.
     Local(u32),
-    /// A string literal of this byte length.
-    Lit(u32),
+    /// A string literal (its text).
+    Lit(String),
+    /// An `ipv6` or `mac` variable.
+    Blob(Ty),
     No,
 }
 

@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 
+use crate::addr;
 use crate::ast::*;
 use crate::bpf::{self, *};
 use crate::btf::{Btf, Resolved};
@@ -245,8 +246,11 @@ impl Ty {
 
 #[derive(Debug, Clone)]
 struct Local {
+    /// Stack offset below R10 (unused when `reg` is set).
     off: i16,
     ty: Ty,
+    /// The callee-saved register holding this scalar, if it got one.
+    reg: Option<Reg>,
 }
 
 /// Declarations shared by every probe in the program.
@@ -283,6 +287,11 @@ struct Cg<'a> {
     sample_next: &'a mut u32,
     /// This program's index in the manifest (key into the USDT spec map).
     prog_index: u32,
+    /// Callee-saved registers free for locals and temporaries. R6 is
+    /// reserved when the probe emits (record pointer), R7/R8 in XDP (packet
+    /// bounds), R9 in USDT (arg spec); the rest are ours. Registers survive
+    /// helper calls, so a value parked here needs no spill.
+    free_regs: Vec<Reg>,
 }
 
 // -------------------------------------------------------------------- entry
@@ -414,6 +423,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sample_next: &mut
         relocs: Vec::new(),
         sample_next,
         prog_index,
+        free_regs: free_callee_saved(kind, &p.body),
     };
 
     // Prologue: save the context pointer (R1) for `arg` / `retval`.
@@ -622,6 +632,30 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, Str
     Ok(max)
 }
 
+/// Which of R6..R9 this probe may use for locals and temporaries.
+fn free_callee_saved(kind: &ProbeKind, body: &Block) -> Vec<Reg> {
+    let mut regs = vec![Reg::R9, Reg::R8, Reg::R7, Reg::R6];
+    if body_has_emit(body) {
+        regs.retain(|r| *r != Reg::R6);
+    }
+    if matches!(kind, ProbeKind::Xdp { .. }) {
+        regs.retain(|r| !matches!(r, Reg::R7 | Reg::R8));
+    }
+    if matches!(kind, ProbeKind::Usdt { .. }) {
+        regs.retain(|r| *r != Reg::R9);
+    }
+    regs
+}
+
+fn body_has_emit(body: &Block) -> bool {
+    body.stmts.iter().any(|s| match &s.kind {
+        StmtKind::Emit { .. } => true,
+        StmtKind::If { then, otherwise, .. } => body_has_emit(then) || otherwise.as_ref().is_some_and(body_has_emit),
+        StmtKind::For { body, .. } => body_has_emit(body),
+        _ => false,
+    })
+}
+
 /// Count `sample()` call sites in a probe body (for sizing the hidden map).
 fn count_samples(body: &Block) -> u32 {
     fn expr(e: &Expr, n: &mut u32) {
@@ -738,11 +772,30 @@ impl Cg<'_> {
         -(self.stack_top as i16)
     }
 
+    /// Declare a scalar local: in a free callee-saved register if there is
+    /// one, otherwise in a stack slot.
     fn declare(&mut self, name: &str, ty: Ty) -> Local {
-        let off = self.alloc_slot();
-        let local = Local { off, ty };
+        let local = match self.free_regs.pop() {
+            Some(reg) => Local { off: 0, ty, reg: Some(reg) },
+            None => Local { off: self.alloc_slot(), ty, reg: None },
+        };
         self.scopes.last_mut().unwrap().insert(name.to_string(), local.clone());
         local
+    }
+
+    /// Store R0 into a local; load a local into R0.
+    fn store_local(&mut self, local: &Local) {
+        match local.reg {
+            Some(r) => self.prog.push(mov64_reg(r, Reg::R0)),
+            None => self.prog.push(stx_mem(Size::DW, Reg::R10, local.off, Reg::R0)),
+        };
+    }
+
+    fn load_local(&mut self, local: &Local) {
+        match local.reg {
+            Some(r) => self.prog.push(mov64_reg(Reg::R0, r)),
+            None => self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, local.off)),
+        };
     }
 
     fn lookup(&self, name: &str) -> Option<&Local> {
@@ -758,6 +811,10 @@ impl Cg<'_> {
     fn pop_scope(&mut self) {
         let scope = self.scopes.pop().unwrap();
         for local in scope.values() {
+            if let Some(r) = local.reg {
+                self.free_regs.push(r);
+                continue;
+            }
             let bytes = match &local.ty {
                 Ty::Str(n) => n.div_ceil(8) * 8,
                 Ty::Ipv6 => 16,
@@ -819,14 +876,14 @@ impl Cg<'_> {
                 {
                     let n = str_capacity(t)?;
                     let off = self.alloc_bytes(n);
-                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off, ty: Ty::Str(n) });
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off, ty: Ty::Str(n), reg: None });
                     return self.read_str_into(off, n, value);
                 }
                 // Byte blobs: `let a = pkt.ipv6(22);` copies straight from the packet.
                 if let Some((width, off)) = self.pkt_blob(value)? {
                     let ty = if width == 16 { Ty::Ipv6 } else { Ty::Mac };
                     let dst = self.alloc_bytes(width);
-                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: dst, ty });
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: dst, ty, reg: None });
                     self.copy_bytes(Reg::R7, off, Reg::R10, dst, width);
                     return Ok(());
                 }
@@ -836,7 +893,7 @@ impl Cg<'_> {
                     None => vty,
                 };
                 let local = self.declare(&name.name, ty);
-                self.prog.push(stx_mem(Size::DW, Reg::R10, local.off, Reg::R0));
+                self.store_local(&local);
                 Ok(())
             }
             StmtKind::Assign { target, value } => {
@@ -847,7 +904,7 @@ impl Cg<'_> {
                             .lookup(n)
                             .cloned()
                             .ok_or_else(|| format!("assignment to unknown variable `{n}`"))?;
-                        self.prog.push(stx_mem(Size::DW, Reg::R10, local.off, Reg::R0));
+                        self.store_local(&local);
                         Ok(())
                     }
                     _ => Err("unsupported assignment target".into()),
@@ -928,7 +985,10 @@ impl Cg<'_> {
             ("Some", Some(bind)) => {
                 self.push_scope();
                 let local = self.declare(&bind.name, Ty::ValuePtr(inner));
-                self.prog.push(stx_mem(Size::DW, Reg::R10, local.off, Reg::R0));
+                // Park the pointer, then null-check R0. In a register the
+                // verifier sees the check on a copy of the same value; on the
+                // stack it propagates the check to the spilled slot.
+                self.store_local(&local);
                 self.prog.jmp_imm_to(JmpOp::Eq, Reg::R0, 0, else_label);
                 Ok(true)
             }
@@ -958,6 +1018,10 @@ impl Cg<'_> {
             }
             ExprKind::Unary { op: UnaryOp::Not, expr } => self.cond(expr, else_label, then_label),
             ExprKind::Binary { op, lhs, rhs } if is_comparison(*op) && !self.is_str_compare(lhs, rhs) => {
+                if let Some((l, r)) = self.rewrite_ipv4_literal(lhs, rhs) {
+                    let e2 = Expr { kind: ExprKind::Binary { op: *op, lhs: Box::new(l), rhs: Box::new(r) }, span: e.span };
+                    return self.cond(&e2, then_label, else_label);
+                }
                 let (lty, rty) = self.binary_operands(lhs, rhs)?; // R1 = lhs, R0 = rhs
                 let signed = lty == Ty::I64 || rty == Ty::I64;
                 let jop = compare_op(*op, signed).unwrap();
@@ -1083,7 +1147,7 @@ impl Cg<'_> {
             ExprKind::Str(_) => Err("string values are not supported in expressions".into()),
             ExprKind::Ident(name) => {
                 if let Some(local) = self.lookup(name).cloned() {
-                    self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, local.off));
+                    self.load_local(&local);
                     return Ok(local.ty);
                 }
                 if let Some(v) = self.const_lookup(name) {
@@ -1203,15 +1267,28 @@ impl Cg<'_> {
         }
     }
 
-    /// Leaves lhs in R1 and rhs in R0. Returns both operand types.
+    /// Leaves lhs in R1 and rhs in R0. Returns both operand types. The lhs
+    /// waits in a free callee-saved register while rhs is computed, or in a
+    /// stack slot when none is free.
     fn binary_operands(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(Ty, Ty), String> {
         let lty = self.expr(lhs)?;
-        let tmp = self.alloc_slot();
-        self.prog.push(stx_mem(Size::DW, Reg::R10, tmp, Reg::R0));
-        let rty = self.expr(rhs)?;
-        self.prog.push(ldx_mem(Size::DW, Reg::R1, Reg::R10, tmp));
-        self.free_slot();
-        Ok((lty, rty))
+        match self.free_regs.pop() {
+            Some(t) => {
+                self.prog.push(mov64_reg(t, Reg::R0));
+                let rty = self.expr(rhs)?;
+                self.prog.push(mov64_reg(Reg::R1, t));
+                self.free_regs.push(t);
+                Ok((lty, rty))
+            }
+            None => {
+                let tmp = self.alloc_slot();
+                self.prog.push(stx_mem(Size::DW, Reg::R10, tmp, Reg::R0));
+                let rty = self.expr(rhs)?;
+                self.prog.push(ldx_mem(Size::DW, Reg::R1, Reg::R10, tmp));
+                self.free_slot();
+                Ok((lty, rty))
+            }
+        }
     }
 
     /// Is this `a == b` / `a != b` a string comparison (a `str<N>` local on a
@@ -1219,10 +1296,91 @@ impl Cg<'_> {
     fn is_str_compare(&self, lhs: &Expr, rhs: &Expr) -> bool {
         let is_str = |e: &Expr| match &e.kind {
             ExprKind::Str(_) => true,
-            ExprKind::Ident(n) => matches!(self.lookup(n).map(|l| &l.ty), Some(Ty::Str(_))),
+            ExprKind::Ident(n) => matches!(self.lookup(n).map(|l| &l.ty), Some(Ty::Str(_) | Ty::Ipv6 | Ty::Mac)),
             _ => false,
         };
         is_str(lhs) || is_str(rhs)
+    }
+
+    /// `x == "10.0.0.1"` on a u32: the literal becomes the integer.
+    fn rewrite_ipv4_literal(&self, lhs: &Expr, rhs: &Expr) -> Option<(Expr, Expr)> {
+        let as_int = |e: &Expr| -> Option<Expr> {
+            let ExprKind::Str(lit) = &e.kind else { return None };
+            let v = addr::parse_ipv4(lit)?;
+            Some(Expr { kind: ExprKind::Int(v as u64), span: e.span })
+        };
+        let blobby = |e: &Expr| matches!(&e.kind, ExprKind::Ident(n) if matches!(self.lookup(n).map(|l| &l.ty), Some(Ty::Str(_) | Ty::Ipv6 | Ty::Mac)));
+        if blobby(lhs) || blobby(rhs) {
+            return None;
+        }
+        if let Some(r) = as_int(rhs) {
+            return Some((lhs.clone(), r));
+        }
+        if let Some(l) = as_int(lhs) {
+            return Some((l, rhs.clone()));
+        }
+        None
+    }
+
+    /// `a == b` for ipv6/mac values: unrolled chunk compares. Result in R0.
+    fn blob_equal(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        enum Side {
+            Local(i16, u32),
+            Lit(Vec<u8>),
+        }
+        let side = |cg: &Self, e: &Expr, other_kind: Option<&Ty>| -> Result<Side, String> {
+            match &e.kind {
+                ExprKind::Ident(n) => match cg.lookup(n) {
+                    Some(Local { off, ty: Ty::Ipv6, .. }) => Ok(Side::Local(*off, 16)),
+                    Some(Local { off, ty: Ty::Mac, .. }) => Ok(Side::Local(*off, 6)),
+                    _ => Err(format!("`{n}` is not an address")),
+                },
+                ExprKind::Str(lit) => match other_kind {
+                    Some(Ty::Ipv6) => addr::parse_ipv6(lit).map(|b| Side::Lit(b.to_vec())).ok_or_else(|| format!("{lit:?} is not an ipv6 literal")),
+                    Some(Ty::Mac) => addr::parse_mac(lit).map(|b| Side::Lit(b.to_vec())).ok_or_else(|| format!("{lit:?} is not a mac literal")),
+                    _ => Err("address literal needs an address on the other side".into()),
+                },
+                _ => Err("address comparison needs a variable or a literal".into()),
+            }
+        };
+        let kind_of = |cg: &Self, e: &Expr| -> Option<Ty> {
+            if let ExprKind::Ident(n) = &e.kind { cg.lookup(n).map(|l| l.ty.clone()) } else { None }
+        };
+        let lk = kind_of(self, lhs);
+        let rk = kind_of(self, rhs);
+        let a = side(self, lhs, rk.as_ref())?;
+        let b = side(self, rhs, lk.as_ref())?;
+        let n = match (&a, &b) {
+            (Side::Local(_, n), _) | (_, Side::Local(_, n)) => *n,
+            _ => return Err("cannot compare two literals".into()),
+        };
+        let fail = self.prog.new_label();
+        let end = self.prog.new_label();
+        let mut done = 0u32;
+        while done < n {
+            let left = n - done;
+            let (size, w) = if left >= 8 { (Size::DW, 8) } else if left >= 4 { (Size::W, 4) } else if left >= 2 { (Size::H, 2) } else { (Size::B, 1) };
+            // chunk of A -> R1, chunk of B -> R0
+            for (sd, reg) in [(&a, Reg::R1), (&b, Reg::R0)] {
+                match sd {
+                    Side::Local(off, _) => self.prog.push(ldx_mem(size, reg, Reg::R10, off + done as i16)),
+                    Side::Lit(bytes) => {
+                        // the bytes as the CPU would load them: little-endian
+                        let mut buf = [0u8; 8];
+                        buf[..w as usize].copy_from_slice(&bytes[done as usize..(done + w) as usize]);
+                        self.prog.push(ld_imm64(reg, u64::from_le_bytes(buf) as i64))
+                    }
+                };
+            }
+            self.prog.jmp_reg_to(JmpOp::Ne, Reg::R1, Reg::R0, fail);
+            done += w;
+        }
+        self.prog.push(mov64_imm(Reg::R0, 1));
+        self.prog.ja_to(end);
+        self.prog.bind(fail);
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.bind(end);
+        Ok(())
     }
 
     /// Emit a string equality test into R0 (1 = equal). C-string semantics:
@@ -1237,7 +1395,7 @@ impl Cg<'_> {
             match &e.kind {
                 ExprKind::Str(lit) => Ok(Side::Lit(lit.as_bytes().to_vec())),
                 ExprKind::Ident(n) => match cg.lookup(n) {
-                    Some(Local { off, ty: Ty::Str(cap) }) => Ok(Side::Local(*off, *cap)),
+                    Some(Local { off, ty: Ty::Str(cap), .. }) => Ok(Side::Local(*off, *cap)),
                     _ => Err(format!("`{n}` is not a string")),
                 },
                 _ => Err("string comparison needs a `str<N>` variable or a literal".into()),
@@ -1293,12 +1451,22 @@ impl Cg<'_> {
     }
 
     fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Result<Ty, String> {
-        if matches!(op, BinaryOp::Eq | BinaryOp::Ne) && self.is_str_compare(lhs, rhs) {
-            self.str_equal(lhs, rhs)?;
-            if op == BinaryOp::Ne {
-                self.prog.push(alu64_imm(AluOp::Xor, Reg::R0, 1));
+        if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+            if let Some((l, r)) = self.rewrite_ipv4_literal(lhs, rhs) {
+                return self.binary(op, &l, &r);
             }
-            return Ok(Ty::Bool);
+            if self.is_str_compare(lhs, rhs) {
+                let blob = |cg: &Self, e: &Expr| matches!(&e.kind, ExprKind::Ident(n) if matches!(cg.lookup(n).map(|l| &l.ty), Some(Ty::Ipv6 | Ty::Mac)));
+                if blob(self, lhs) || blob(self, rhs) {
+                    self.blob_equal(lhs, rhs)?;
+                } else {
+                    self.str_equal(lhs, rhs)?;
+                }
+                if op == BinaryOp::Ne {
+                    self.prog.push(alu64_imm(AluOp::Xor, Reg::R0, 1));
+                }
+                return Ok(Ty::Bool);
+            }
         }
         if matches!(op, BinaryOp::And | BinaryOp::Or) || is_comparison(op) {
             let t = self.prog.new_label();

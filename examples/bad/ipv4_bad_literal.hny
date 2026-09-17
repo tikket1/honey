@@ -1,0 +1,9 @@
+// error: "10.0.0.300" is not an IPv4 address literal
+
+event E { a: u8 }
+
+probe xdp("lo") {
+    if pkt.u32(26) == "10.0.0.300" {
+        emit E { a: 1 };
+    }
+}

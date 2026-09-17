@@ -244,7 +244,7 @@ Precedence, lowest to highest: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`,
 | `Option<&V>`            | The result of `map.get`. Not user-writable. Must be matched with `if let Some(v)` / `if let None`. |
 | `&V`                    | A checked pointer, only bound by `if let Some(v)` and only inside that block. `*v` reads it. |
 | `ipv4`                  | A `u32` to the type system, printed by the loader as a dotted quad (`127.0.0.1`). Assign from `pkt.u32(...)`. |
-| `ipv6`, `mac`           | 16- and 6-byte values copied straight from the packet with `pkt.ipv6(off)` / `pkt.mac(off)`. Bind with `let` or emit directly; printed as `::1` / `aa:bb:cc:dd:ee:ff`. Cannot be compared or reassigned (yet), and cannot live in maps. |
+| `ipv6`, `mac`           | 16- and 6-byte values copied straight from the packet with `pkt.ipv6(off)` / `pkt.mac(off)`. Bind with `let`, compare with `==`/`!=` against a literal (`"::1"`, `"aa:bb:cc:dd:ee:ff"`) or another address of the same kind, emit; printed as addresses. Cannot be reassigned and cannot live in maps. |
 | `ptr<S>`                | A kernel pointer to `struct S` (a real kernel type, checked against BTF). From `let p: ptr<S> = arg(n);`. Read fields with `.` (pointers auto-deref). |
 
 Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
@@ -261,6 +261,11 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
   `str<N>` values compare as C strings: equal through the terminating NUL,
   bounded by the capacities, fully unrolled. A literal longer than `N` is a
   compile-time error (it could never match); `<`/`>` on strings are errors.
+- **Address equality.** `ipv6`/`mac` values compare with `==`/`!=` against a
+  literal or another address of the same kind (unrolled chunk compares); a
+  `u32` address compares against a dotted quad (`ip == "10.0.0.1"`). Address
+  literals are validated at compile time, so a typo is an error rather than
+  a rule that never matches. Kinds never mix (`ipv6` vs `mac` is an error).
 - **Stack budget.** Locals are 8 bytes (scalars, pointers) or `N` rounded to 8
   (`str<N>`), summed along each scope path. Peak + 40 bytes reserve ≤ 512.
 - **No pointer writes** in v1: `*p = v` is rejected, use `map.insert`.
@@ -283,6 +288,7 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `emit E { … }`             | statement                         | `bpf_ringbuf_output`          |
 | `s.starts_with("…")`, `s.byte_at(i)` | `bool` / `u8`           | inline, bounded by `N`        |
 | `s == "…"`, `s != t`       | `bool`                            | exact C-string equality, unrolled, bounded by `N` |
+| `a == "::1"`, `m != n`, `ip == "1.2.3.4"` | `bool`             | address equality: ipv6/mac chunk compares; a dotted quad is a `u32` literal |
 
 ## 7. Roadmap
 

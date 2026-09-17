@@ -20,11 +20,14 @@ event Dropped {
     src: ipv4,   // printed as a dotted quad
     dst: ipv4,
     ttl: u8,
+    local: bool, // came from 127.0.0.1?
 }
 
 probe xdp("lo") {
     if pkt.u16(12) == 0x0800 && pkt.u8(23) == 1 {
-        emit Dropped { src: pkt.u32(26), dst: pkt.u32(30), ttl: pkt.u8(22) };
+        let src = pkt.u32(26);
+        // a u32 address compares against a dotted-quad literal
+        emit Dropped { src: src, dst: pkt.u32(30), ttl: pkt.u8(22), local: src == "127.0.0.1" };
         drop();
     }
 }

@@ -12,6 +12,7 @@
 //! - `typeck`  : stage 4, the verifier-aware type checker (runs before codegen)
 //! - `codegen` : stage 3, AST → BPF bytecode
 
+pub mod addr;
 pub mod ast;
 pub mod bpf;
 pub mod btf;

@@ -521,15 +521,18 @@ fn string_literal_longer_than_capacity_can_never_match() {
 #[test]
 fn strings_only_support_equality() {
     let msg = first_message(&with_path("    if path < \"/bin\" { }\n    emit E { a: 1, b: true };"));
-    assert!(msg.contains("strings do not support `<`"), "{msg}");
+    assert!(msg.contains("strings and addresses do not support `<`"), "{msg}");
 }
 
 #[test]
 fn string_vs_non_string_is_an_error() {
     let msg = first_message(&with_path("    if path == 5 { }\n    emit E { a: 1, b: true };"));
     assert!(msg.contains("cannot compare `str<32>` with `{integer}`"), "{msg}");
+    // a u32 only accepts a dotted-quad literal
     let msg = first_message(&with_path("    if pid() == \"x\" { }\n    emit E { a: 1, b: true };"));
-    assert!(msg.contains("cannot compare a string literal with `u32`"), "{msg}");
+    assert!(msg.contains("is not an IPv4 address literal"), "{msg}");
+    let msg = first_message(&with_path("    if ktime() == \"x\" { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("cannot compare a string literal with `u64`"), "{msg}");
     let msg = first_message(&with_path("    if \"a\" == \"a\" { }\n    emit E { a: 1, b: true };"));
     assert!(msg.contains("two string literals"), "{msg}");
 }
@@ -575,8 +578,10 @@ fn ipv6_and_mac_are_packet_blobs() {
 fn blobs_only_come_from_the_packet_and_cannot_be_compared_or_reassigned() {
     let msg = first_message("event E { s: ipv6 } probe xdp(\"lo\") { let x: ipv6 = 5; emit E { s: x }; }");
     assert!(msg.contains("an `ipv6` value can only come straight from the packet") || msg.contains("expected `ipv6`"), "{msg}");
-    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.ipv6(22); let b = pkt.ipv6(38); if a == b { emit E { a: 1 }; } }");
-    assert!(msg.contains("cannot be compared yet"), "{msg}");
+    // same-kind addresses compare; `<` on them does not
+    ok("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.ipv6(22); let b = pkt.ipv6(38); if a == b { emit E { a: 1 }; } }");
+    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.ipv6(22); let b = pkt.ipv6(38); if a < b { emit E { a: 1 }; } }");
+    assert!(msg.contains("do not support `<`"), "{msg}");
     let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let mut a = pkt.mac(0); a = pkt.mac(6); emit E { a: 1 }; }");
     assert!(msg.contains("is a `mac` buffer and cannot be reassigned"), "{msg}");
     // not in a map, not in a kprobe
@@ -589,4 +594,27 @@ fn blob_reads_count_toward_the_packet_bound() {
     let msg = first_message("event E { s: ipv6 } probe xdp(\"lo\") { emit E { s: pkt.ipv6(250) }; }");
     assert!(msg.contains("ends past 256 bytes"), "{msg}");
     ok("event E { s: ipv6 } probe xdp(\"lo\") { emit E { s: pkt.ipv6(240) }; }");
+}
+
+// ------------------------------------------------------ address comparison
+
+#[test]
+fn addresses_compare_with_literals_and_each_other() {
+    ok("event E { a: u8 } probe xdp(\"lo\") { let s = pkt.ipv6(22); if s == \"::1\" || s != \"fe80::1\" { emit E { a: 1 }; } }");
+    ok("event E { a: u8 } probe xdp(\"lo\") { let m = pkt.mac(6); if m == \"aa:bb:cc:dd:ee:ff\" { emit E { a: 1 }; } }");
+    ok("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.mac(0); let b = pkt.mac(6); emit E { a: 1 }; if a != b { emit E { a: 2 }; } }");
+    ok("event E { a: u8 } probe xdp(\"lo\") { if pkt.u32(26) == \"127.0.0.1\" { emit E { a: 1 }; } }");
+    ok("event E { a: u8 } probe xdp(\"lo\") { let ip: ipv4 = pkt.u32(30); if \"10.0.0.1\" != ip { emit E { a: 1 }; } }");
+}
+
+#[test]
+fn address_literals_are_validated_and_kinds_must_match() {
+    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let s = pkt.ipv6(22); if s == \"1::2::3\" { emit E { a: 1 }; } }");
+    assert!(msg.contains("is not a valid `ipv6` literal"), "{msg}");
+    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let m = pkt.mac(6); if m == \"::1\" { emit E { a: 1 }; } }");
+    assert!(msg.contains("is not a valid `mac` literal"), "{msg}");
+    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let s = pkt.ipv6(22); let m = pkt.mac(6); if s == m { emit E { a: 1 }; } }");
+    assert!(msg.contains("cannot compare `ipv6` with `mac`"), "{msg}");
+    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { if pkt.u32(26) == \"1.2.3\" { emit E { a: 1 }; } }");
+    assert!(msg.contains("is not an IPv4 address literal"), "{msg}");
 }

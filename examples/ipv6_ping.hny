@@ -2,9 +2,9 @@
 //
 // `ipv6` and `mac` are byte values, not numbers: `pkt.ipv6(off)` copies 16
 // bytes straight out of the packet and `pkt.mac(off)` copies 6. They can be
-// bound with `let` or emitted directly, and the loader prints them the way
-// you'd read them (`::1`, `aa:bb:cc:dd:ee:ff`). Both count toward the single
-// entry bounds check like every other packet read.
+// bound with `let`, compared with `==`/`!=` against a literal or each other,
+// and emitted; the loader prints them the way you'd read them (`::1`,
+// `aa:bb:cc:dd:ee:ff`). Both count toward the single entry bounds check.
 //
 //   ./honey run examples/ipv6_ping.hny --json
 //   ... then `ping -6 -c 1 ::1` inside the environment.
@@ -20,6 +20,10 @@ event Icmp6 {
 probe xdp("lo") {
     if pkt.u16(12) == 0x86DD && pkt.u8(20) == 58 {
         let src = pkt.ipv6(22);
+        // addresses compare with `==` against a literal or another address
+        if src != "::1" {
+            return;
+        }
         emit Icmp6 {
             smac: pkt.mac(6),
             dmac: pkt.mac(0),
