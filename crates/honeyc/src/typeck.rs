@@ -57,12 +57,12 @@ pub enum Ty {
     /// A checked pointer into a map value.
     Ref(Box<Ty>),
     /// A kernel pointer to a named struct (from `arg(n)` typed `ptr<S>`).
-    KPtr(String),
+    KPtr(u32, String),
     /// A kernel pointer to a char: a string address for `read_kernel_str`.
     KCharPtr,
     /// A view of packet bytes as a named struct (`let ip: ptr<iphdr> = pkt.at(14)`).
     /// Read with `.field`; lives nowhere at runtime.
-    PktPtr(String),
+    PktPtr(u32, String),
     /// Statements-as-expressions (`map.insert`) produce this.
     Unit,
     /// An integer literal that has not yet picked a width.
@@ -105,7 +105,7 @@ impl Ty {
             Ty::Str(n) => n.div_ceil(8) * 8,
             Ty::Ipv6 => 16,
             Ty::Mac => 8,
-            Ty::PktPtr(_) | Ty::Unit => 0,
+            Ty::PktPtr(..) | Ty::Unit => 0,
             _ => 8,
         }
     }
@@ -138,9 +138,9 @@ impl std::fmt::Display for Ty {
             Ty::Option(inner) => write!(f, "Option<&{inner}>"),
             Ty::OptionVal(inner) => write!(f, "Option<{inner}>"),
             Ty::Ref(inner) => write!(f, "&{inner}"),
-            Ty::KPtr(name) => write!(f, "ptr<{name}>"),
+            Ty::KPtr(_, name) => write!(f, "ptr<{name}>"),
             Ty::KCharPtr => write!(f, "ptr<char>"),
-            Ty::PktPtr(name) => write!(f, "ptr<{name}> (packet)"),
+            Ty::PktPtr(_, name) => write!(f, "ptr<{name}> (packet)"),
             Ty::Unit => write!(f, "()"),
             Ty::Int => write!(f, "{{integer}}"),
         }
@@ -594,7 +594,7 @@ impl Checker<'_> {
                     let pt = self.expr(p);
                     let ok = if kernel {
                         // a kernel char pointer, a kernel struct pointer, or a raw address
-                        matches!(pt, Ty::KCharPtr | Ty::KPtr(_)) || pt == Ty::U64 || pt == Ty::Int
+                        matches!(pt, Ty::KCharPtr | Ty::KPtr(..)) || pt == Ty::U64 || pt == Ty::Int
                     } else {
                         pt == Ty::U64 || pt == Ty::Int
                     };
@@ -624,7 +624,7 @@ impl Checker<'_> {
             let ExprKind::MethodCall { method, args, .. } = &value.kind else { unreachable!() };
             match (method.name.as_str(), args.as_slice()) {
                 ("at", [off]) => {
-                    if let Some(sname) = &target {
+                    if let Some((_, sname)) = &target {
                         let size = self.btf.and_then(|b| b.struct_size(sname)).unwrap_or(0);
                         match self.const_eval_global(off) {
                             Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
@@ -659,7 +659,7 @@ impl Checker<'_> {
                 _ => unreachable!(),
             }
             match target {
-                Some(sname) => self.declare(&name.name, Ty::PktPtr(sname), mutable, None),
+                Some((id, sname)) => self.declare(&name.name, Ty::PktPtr(id, sname), mutable, None),
                 None => self.declare(&name.name, Ty::Unit, mutable, None),
             }
             return;
@@ -669,11 +669,11 @@ impl Checker<'_> {
         {
             let target = self.ptr_target(t);
             let at = self.expr(value);
-            if at != Ty::U64 && at != Ty::Int && !matches!(at, Ty::KPtr(_) | Ty::KCharPtr) {
+            if at != Ty::U64 && at != Ty::Int && !matches!(at, Ty::KPtr(..) | Ty::KCharPtr) {
                 self.error(value.span, format!("`ptr<...>` must come from an argument or another pointer, found `{at}`"));
             }
             match target {
-                Some(sname) => self.declare(&name.name, Ty::KPtr(sname), mutable, None),
+                Some((id, sname)) => self.declare(&name.name, Ty::KPtr(id, sname), mutable, None),
                 None => self.declare(&name.name, Ty::Unit, mutable, None),
             }
             return;
@@ -747,7 +747,7 @@ impl Checker<'_> {
             // `view.field = value`: a packet write through a bounded view.
             ExprKind::Field { expr: view, field } => {
                 let base = self.expr(view);
-                let Ty::PktPtr(sname) = base else {
+                let Ty::PktPtr(sid, sname) = base else {
                     if base != Ty::Unit {
                         self.error_help(
                             target.span,
@@ -758,9 +758,9 @@ impl Checker<'_> {
                     self.expr(value);
                     return;
                 };
-                let ft = self.pkt_field_type(&sname, field);
+                let ft = self.pkt_field_type(sid, &sname, field);
                 if let Some(btf) = self.btf
-                    && let Some(m) = btf.member(&sname, &field.name)
+                    && let Some(m) = btf.member_of(sid, &field.name)
                     && m.bitfield()
                 {
                     self.error_help(field.span, format!("cannot write the bitfield `{}`", field.name), "honey writes whole fields only");
@@ -786,7 +786,7 @@ impl Checker<'_> {
                             format!("e.g. `eth.h_dest = eth.h_source;` or `eth.h_dest = \"{}\";`", if ft == Ty::Mac { "aa:bb:cc:dd:ee:ff" } else { "fe80::1" }),
                         ),
                     },
-                    Ty::PktPtr(_) => {
+                    Ty::PktPtr(..) => {
                         self.error_help(target.span, format!("cannot assign the embedded struct `{}`", field.name), "write its fields one by one");
                         self.expr(value);
                     }
@@ -903,7 +903,7 @@ impl Checker<'_> {
     }
 
     /// Validate `ptr<S>` and return the struct name, or report and return None.
-    fn ptr_target(&mut self, t: &Type) -> Option<String> {
+    fn ptr_target(&mut self, t: &Type) -> Option<(u32, String)> {
         let name = match t.args.as_slice() {
             [TypeArg::Type(inner)] if inner.args.is_empty() => inner.name.name.clone(),
             _ => {
@@ -919,20 +919,26 @@ impl Checker<'_> {
             );
             return None;
         };
-        if !btf.is_struct(&name) {
+        let Some(id) = btf.struct_id(&name) else {
             self.error(t.span, format!("`{name}` is not a kernel struct in the provided BTF"));
             return None;
-        }
-        Some(name)
+        };
+        Some((id, name))
+    }
+
+    /// How an embedded struct is named in messages: its own name, or the
+    /// path to it when it is anonymous (`icmphdr.un`).
+    fn embedded_name(parent: &str, own: &str, field: &str) -> String {
+        if own.is_empty() { format!("{parent}.{field}") } else { own.to_string() }
     }
 
     /// Type of `base.field` where `base` is a kernel struct pointer.
-    fn field_type(&mut self, struct_name: &str, field: &Ident) -> Ty {
+    fn field_type(&mut self, id: u32, struct_name: &str, field: &Ident) -> Ty {
         let Some(btf) = self.btf else {
             self.error(field.span, "kernel field access needs `--btf`");
             return Ty::Unit;
         };
-        let Some(member) = btf.member(struct_name, &field.name) else {
+        let Some(member) = btf.member_of(id, &field.name) else {
             self.error(field.span, format!("`struct {struct_name}` has no field `{}`", field.name));
             return Ty::Unit;
         };
@@ -957,8 +963,8 @@ impl Checker<'_> {
                 self.error(field.span, format!("field `{}` is an array honey can't read as a value; only byte arrays are supported", field.name));
                 Ty::Unit
             }
-            Resolved::Struct { name } => Ty::KPtr(name),
-            Resolved::PtrToStruct { name } => Ty::KPtr(name),
+            Resolved::Struct { id, name } => Ty::KPtr(id, Self::embedded_name(struct_name, &name, &field.name)),
+            Resolved::PtrToStruct { id, name } => Ty::KPtr(id, name),
             Resolved::PtrToChar => Ty::KCharPtr,
             Resolved::PtrToOther => Ty::U64,
             Resolved::Other => {
@@ -973,12 +979,12 @@ impl Checker<'_> {
     }
 
     /// Type of `view.field` where `view` is a packet struct view.
-    fn pkt_field_type(&mut self, struct_name: &str, field: &Ident) -> Ty {
+    fn pkt_field_type(&mut self, id: u32, struct_name: &str, field: &Ident) -> Ty {
         let Some(btf) = self.btf else {
             self.error(field.span, "packet struct access needs `--btf`");
             return Ty::Unit;
         };
-        let Some(member) = btf.member(struct_name, &field.name) else {
+        let Some(member) = btf.member_of(id, &field.name) else {
             self.error(field.span, format!("`struct {struct_name}` has no field `{}`", field.name));
             return Ty::Unit;
         };
@@ -999,8 +1005,8 @@ impl Checker<'_> {
             },
             Resolved::Array { elem_bytes: 1, len: 6 } => Ty::Mac,
             Resolved::Array { elem_bytes: 1, len: 16 } => Ty::Ipv6,
-            Resolved::Struct { name } if name == "in6_addr" => Ty::Ipv6,
-            Resolved::Struct { name } => Ty::PktPtr(name),
+            Resolved::Struct { name, .. } if name == "in6_addr" => Ty::Ipv6,
+            Resolved::Struct { id, name } => Ty::PktPtr(id, Self::embedded_name(struct_name, &name, &field.name)),
             Resolved::PtrToStruct { .. } | Resolved::PtrToChar | Resolved::PtrToOther => {
                 self.error(field.span, format!("`{}` is a pointer; packet structs are read by value, not followed", field.name));
                 Ty::Unit
@@ -1080,8 +1086,8 @@ impl Checker<'_> {
             ExprKind::Field { expr, field } => {
                 let base = self.expr(expr);
                 match base {
-                    Ty::KPtr(name) => self.field_type(&name, field),
-                    Ty::PktPtr(name) => self.pkt_field_type(&name, field),
+                    Ty::KPtr(id, name) => self.field_type(id, &name, field),
+                    Ty::PktPtr(id, name) => self.pkt_field_type(id, &name, field),
                     Ty::Unit => Ty::Unit,
                     other => {
                         self.error_help(
@@ -1462,7 +1468,7 @@ impl Checker<'_> {
         }
 
         // Packet views: `tcp.opt(kind)`, `ip.fix_csum()`.
-        if let Some(Var { ty: Ty::PktPtr(sname), .. }) = self.lookup(rname).cloned() {
+        if let Some(Var { ty: Ty::PktPtr(_, sname), .. }) = self.lookup(rname).cloned() {
             return match (method.name.as_str(), args) {
                 ("opt", [kind]) => {
                     if sname != "tcphdr" {

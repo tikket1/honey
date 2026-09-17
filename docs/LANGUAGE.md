@@ -140,9 +140,11 @@ if eth.h_proto == 0x0800 && ip.protocol == 6 {
 
 A field the kernel declares `__be16`/`__be32` is converted to host order; a
 6- or 16-byte array or `struct in6_addr` is a `mac`/`ipv6`; an embedded
-struct is another view; a bitfield such as `ip.ihl` is loaded, shifted and
-masked into the narrowest integer that holds it; a pointer field is an
-error. Views exist only at compile time and cost no stack or registers.
+struct is another view (anonymous ones included: `icmp.un.echo.sequence`
+works because views carry BTF type ids, not names); a bitfield such as
+`ip.ihl` is loaded, shifted and masked into the narrowest integer that holds
+it; a pointer field is an error. Views exist only at compile time and cost
+no stack or registers.
 
 **Headers at runtime offsets.** The transport header is not at a fixed
 place: IPv4's header length is `ihl * 4`, and IPv6 may have extension

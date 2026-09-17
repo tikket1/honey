@@ -165,10 +165,12 @@ them) and emits one bounds check for the largest offset the body reads; each
 a `bswap` for 16/32-bit values. The default return is `XDP_PASS`.
 
 **Packet struct views.** `let ip: ptr<iphdr> = pkt.at(14)` is a compile-time
-binding: `Ty::PktPtr(struct, offset)`, nothing emitted. `ip.saddr` looks the
-member up in BTF — descending through anonymous struct/union members, which
-is how modern kernels wrap `saddr`/`daddr` — and emits a plain load from
-`[R7 + 14 + 12]`. If the member's typedef chain names a `__be*` type the
+binding: `Ty::PktPtr(btf type id, offset)`, nothing emitted. `ip.saddr` looks
+the member up in BTF by type id — descending through anonymous struct/union
+members, which is how modern kernels wrap `saddr`/`daddr` — and emits a plain
+load from `[R7 + 14 + 12]`. Carrying ids rather than names is what lets a
+chain pass through anonymous types: `icmp.un.echo.sequence` names `un`, a
+member whose type has no name, and `echo` inside it. If the member's typedef chain names a `__be*` type the
 load is followed by a `bswap`, so network-order fields arrive host-order.
 Byte arrays of 6/16 and `struct in6_addr` are blobs copied with the usual
 chunked copy; embedded structs become deeper views; bitfields and pointers
@@ -217,11 +219,15 @@ widths count toward the entry bounds check. The loader prints them with
 A kprobe/LSM argument typed `ptr<S>` can be walked with `.field`. honey reads
 the kernel's BTF (`--btf build/vmlinux.btf`, exported by `linux/export-btf`)
 at compile time to know each field's offset and whether it is a scalar (read
-it), an embedded struct (add its offset), or a pointer (a bounded
-`bpf_probe_read_kernel`). Each hop is emitted as an `add reg, <offset>` and
-recorded in the manifest as a `(struct, field)` relocation. Before loading,
-the loader re-resolves every relocation against the *running* kernel's BTF
-(`btf__find_by_name_kind` + member walk) and rewrites the immediate. A probe
+it), an embedded struct (keep the offset pending), or a pointer (a bounded
+`bpf_probe_read_kernel`). A pointer value is `Ty::KPtr { id, root, path, off }`:
+the BTF type it currently designates, the named struct it really points at,
+the dotted member path from that struct, and the path's compile-time offset.
+Embedded structs (named or anonymous) only extend the path; every actual
+read emits one `add reg, <offset>` recorded in the manifest as a
+`(struct, "a.b.c")` relocation. Before loading, the loader re-walks each path
+segment by segment against the *running* kernel's BTF — through anonymous
+members, like C — and rewrites the immediate. A probe
 compiled against one kernel's layout therefore reads the right bytes on
 another — verified by corrupting the baked offsets and watching the loader
 restore them from BTF.

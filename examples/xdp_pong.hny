@@ -20,6 +20,7 @@
 event Pong {
     src: ipv4,
     dst: ipv4,
+    seq: u16,
 }
 
 probe xdp("lo") {
@@ -52,6 +53,7 @@ probe xdp("lo") {
     icmp.type = 0;
     icmp.checksum = csum_update(icmp.checksum, 0x0800, 0x0000);
 
-    emit Pong { src: src, dst: ip.saddr };
+    // `un.echo.sequence`: named members of anonymous types, found by BTF id.
+    emit Pong { src: src, dst: ip.saddr, seq: icmp.un.echo.sequence };
     tx();
 }

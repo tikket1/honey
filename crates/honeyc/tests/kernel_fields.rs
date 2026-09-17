@@ -116,14 +116,15 @@ fn asm(src: &str) -> String {
 const CHAIN: &str = "event E { file: str<32> }\nprobe kprobe(\"vfs_open\") {\n    let p: ptr<path> = arg(0);\n    let s: str<32> = read_kernel_str(p.dentry.d_name.name);\n    emit E { file: s };\n}";
 
 #[test]
-fn field_chain_records_one_reloc_per_hop() {
+fn field_chain_records_one_reloc_per_read_with_the_member_path() {
     let btf = kernel_btf();
     let p = parse(CHAIN).unwrap();
     let c = compile_with_btf(&p, Arch::Aarch64, Some(&btf)).unwrap();
     let relocs = &c.programs[0].relocs;
-    // path.dentry (read), dentry.d_name (embedded), qstr.name (read).
+    // path.dentry (a pointer read); then d_name is embedded, so its offset
+    // stays pending and the next read names the whole path from dentry.
     let names: Vec<(&str, &str)> = relocs.iter().map(|r| (r.struct_name.as_str(), r.field.as_str())).collect();
-    assert_eq!(names, vec![("path", "dentry"), ("dentry", "d_name"), ("qstr", "name")], "{relocs:#?}");
+    assert_eq!(names, vec![("path", "dentry"), ("dentry", "d_name.name")], "{relocs:#?}");
 }
 
 #[test]
@@ -138,15 +139,38 @@ fn reloc_slots_point_at_add_instructions_with_the_compile_time_offset() {
         // 0x07 = ALU64 | ADD | K (add reg, imm)
         assert_eq!(opcode, 0x07, "reloc slot must be an add instruction");
         let imm = i32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]]);
-        // synthetic offsets: dentry@8, d_name@32, name@8
+        // synthetic offsets: dentry@8, d_name@32 + name@8
         let expect = match (r.struct_name.as_str(), r.field.as_str()) {
             ("path", "dentry") => 8,
-            ("dentry", "d_name") => 32,
-            ("qstr", "name") => 8,
+            ("dentry", "d_name.name") => 40,
             _ => panic!("unexpected reloc"),
         };
         assert_eq!(imm, expect, "{}.{}", r.struct_name, r.field);
     }
+}
+
+#[test]
+fn anonymous_members_are_reached_by_type_id() {
+    // packet view: un (anonymous union) . echo (anonymous struct) . sequence
+    let text = asm_xdp("    let icmp: ptr<icmphdr> = pkt.at(34);\n    emit E { a: icmp.un.echo.sequence, m: pkt.mac(0), b: icmp.type == 8 };");
+    assert!(text.contains("ldx16 r0, [r7 +40]"), "{text}");
+    assert!(text.contains("ldx8 r0, [r7 +34]"), "{text}");
+    // kernel pointer: one reloc naming the whole path, imm = 4 + 0 + 2
+    let src = "event E { a: u32 }\nprobe kprobe(\"f\") {\n    let p: ptr<icmphdr> = arg(0);\n    emit E { a: p.un.echo.sequence };\n}";
+    let btf = kernel_btf();
+    let c = compile_with_btf(&parse(src).unwrap(), Arch::Aarch64, Some(&btf)).unwrap();
+    let relocs = &c.programs[0].relocs;
+    assert_eq!(relocs.len(), 1, "{relocs:#?}");
+    assert_eq!((relocs[0].struct_name.as_str(), relocs[0].field.as_str()), ("icmphdr", "un.echo.sequence"));
+    let at = relocs[0].slot * 8;
+    let b = &c.programs[0].bytecode;
+    assert_eq!(i32::from_le_bytes([b[at + 4], b[at + 5], b[at + 6], b[at + 7]]), 6);
+    // messages name anonymous types by their path
+    let msg = first("event E { a: u32 } probe kprobe(\"f\") { let p: ptr<icmphdr> = arg(0); emit E { a: p.un.nope }; }");
+    assert!(msg.contains("`struct icmphdr.un` has no field `nope`"), "{msg}");
+    // a pointer bound to an embedded struct keeps its pending offset
+    let src = "event E { a: u32 }\nprobe kprobe(\"f\") {\n    let p: ptr<icmphdr> = arg(0);\n    let e: ptr<icmphdr.un.echo> = p.un.echo;\n    emit E { a: e.id };\n}";
+    assert!(parse(src).is_err() || first(src).contains("not a kernel struct"), "anonymous types can't be named in annotations");
 }
 
 #[test]
@@ -390,12 +414,13 @@ fn tx_is_an_xdp_verdict() {
 
 #[test]
 fn embedded_structs_in_a_runtime_view_stay_relative_to_r9() {
-    let text = asm_xdp("    let f: ptr<frame> = pkt.view(0);\n    f.ip.ttl = 1;\n    emit E { a: f.ip.saddr, m: pkt.mac(6), b: f.eth.h_proto == 0x0800 };");
+    let text = asm_xdp("    let f: ptr<frame> = pkt.view(0);\n    f.ip.ttl = 1;\n    emit E { a: f.ip.saddr, m: f.eth.h_source, b: f.eth.h_proto == 0x0800 };");
     assert!(text.contains("stx8 [r9 +22], r0"), "{text}");
     assert!(text.contains("ldx32 r0, [r9 +26]"), "{text}");
     assert!(text.contains("ldx16 r0, [r9 +12]"), "{text}");
-    // only the raw pkt.mac read is relative to r7
-    assert_eq!(text.matches("[r7 +").count(), 2, "{text}");
+    // the nested blob copies from r9 + 6 too
+    assert!(text.contains("ldx32 r0, [r9 +6]") && text.contains("ldx16 r0, [r9 +10]"), "{text}");
+    assert!(!text.contains("[r7 +"), "{text}");
 }
 
 // ------------------------------------------------------------- checksums

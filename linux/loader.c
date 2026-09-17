@@ -694,24 +694,65 @@ static int on_event(void *vctx, void *data, size_t len) {
 
 // ----------------------------------------------------- map fd relocation
 
-// Resolve struct.field byte offset from the running kernel's BTF, so a probe
-// compiled against one kernel's layout still reads the right bytes here.
+// Resolve a `struct.a.b.c` byte offset from the running kernel's BTF, so a
+// probe compiled against one kernel's layout still reads the right bytes
+// here. Each segment of the dotted path is a member of the type reached by
+// the previous one, found through anonymous structs/unions like C does.
 static struct btf *g_vmlinux;
-static long btf_field_offset(const char *struct_name, const char *field) {
+
+static int btf_strip(int id) {
+    for (;;) {
+        const struct btf_type *t = btf__type_by_id(g_vmlinux, id);
+        if (!t) return id;
+        int k = btf_kind(t);
+        if (k == BTF_KIND_TYPEDEF || k == BTF_KIND_CONST || k == BTF_KIND_VOLATILE || k == BTF_KIND_RESTRICT)
+            id = t->type;
+        else
+            return id;
+    }
+}
+
+// Byte offset of member `name` in struct/union `id`, descending into
+// anonymous members; on success *type_out is the member's type.
+static long btf_member_offset(int id, const char *name, int *type_out) {
+    const struct btf_type *t = btf__type_by_id(g_vmlinux, id);
+    if (!t || !(btf_is_struct(t) || btf_is_union(t))) return -1;
+    const struct btf_member *m = btf_members(t);
+    for (int i = 0; i < btf_vlen(t); i++) {
+        const char *mn = btf__name_by_offset(g_vmlinux, m[i].name_off);
+        if (mn && *mn && strcmp(mn, name) == 0) {
+            *type_out = m[i].type;
+            return btf_member_bit_offset(t, i) / 8;
+        }
+    }
+    for (int i = 0; i < btf_vlen(t); i++) {
+        const char *mn = btf__name_by_offset(g_vmlinux, m[i].name_off);
+        if (mn && *mn) continue;
+        long inner = btf_member_offset(btf_strip(m[i].type), name, type_out);
+        if (inner >= 0) return btf_member_bit_offset(t, i) / 8 + inner;
+    }
+    return -1;
+}
+
+static long btf_field_offset(const char *struct_name, const char *path) {
     if (!g_vmlinux) {
         g_vmlinux = btf__load_vmlinux_btf();
         if (!g_vmlinux) return -1;
     }
-    int sid = btf__find_by_name_kind(g_vmlinux, struct_name, BTF_KIND_STRUCT);
-    if (sid < 0) sid = btf__find_by_name_kind(g_vmlinux, struct_name, BTF_KIND_UNION);
-    if (sid < 0) return -1;
-    const struct btf_type *t = btf__type_by_id(g_vmlinux, sid);
-    const struct btf_member *m = btf_members(t);
-    for (int i = 0; i < btf_vlen(t); i++) {
-        const char *mn = btf__name_by_offset(g_vmlinux, m[i].name_off);
-        if (mn && strcmp(mn, field) == 0) return btf_member_bit_offset(t, i) / 8;
+    int id = btf__find_by_name_kind(g_vmlinux, struct_name, BTF_KIND_STRUCT);
+    if (id < 0) id = btf__find_by_name_kind(g_vmlinux, struct_name, BTF_KIND_UNION);
+    if (id < 0) return -1;
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", path);
+    long total = 0;
+    for (char *seg = strtok(buf, "."); seg; seg = strtok(NULL, ".")) {
+        int next = 0;
+        long off = btf_member_offset(id, seg, &next);
+        if (off < 0) return -1;
+        total += off;
+        id = btf_strip(next);
     }
-    return -1;
+    return total;
 }
 
 // Rewrite each field-offset relocation's immediate (the imm of the `add`
@@ -723,7 +764,7 @@ static int apply_relocs(uint8_t *insns, size_t bytes, struct program *pr) {
     while ((p = strstr(p, "\"slot\":")) != NULL) {
         if (limit && p >= limit) break;
         long slot = json_int_in(p, limit, "slot", -1);
-        char sname[64] = "", field[64] = "";
+        char sname[64] = "", field[256] = "";
         json_str_in(p, limit, "struct", sname, sizeof sname);
         json_str_in(p, limit, "field", field, sizeof field);
         p += 7;

@@ -90,9 +90,10 @@ pub enum Resolved {
     /// useful to honey: MACs and raw addresses).
     Array { elem_bytes: u32, len: u32 },
     /// An embedded struct/union: its address is `base + offset`, no read.
-    Struct { name: String },
+    /// `name` is empty for an anonymous type; `id` always identifies it.
+    Struct { id: u32, name: String },
     /// A pointer to a named struct: read 8 bytes to get that struct's address.
-    PtrToStruct { name: String },
+    PtrToStruct { id: u32, name: String },
     /// A pointer to a `char`: read 8 bytes to get a string address.
     PtrToChar,
     /// A pointer to anything else: read 8 bytes to get an address.
@@ -246,6 +247,24 @@ impl Btf {
         self.member_in(id, field, 0)
     }
 
+    /// `member`, by type id: the way to reach fields of anonymous
+    /// structs/unions, which have no name to look up.
+    pub fn member_of(&self, type_id: u32, field: &str) -> Option<Member> {
+        self.member_in(type_id, field, 0)
+    }
+
+    /// Size in bytes of a struct/union by id (through typedefs).
+    pub fn type_size(&self, type_id: u32) -> Option<u32> {
+        let t = self.strip(type_id)?;
+        (t.kind == STRUCT || t.kind == UNION).then_some(t.size_or_type)
+    }
+
+    /// The name of a struct/union by id: `Some("")` when it is anonymous.
+    pub fn type_name(&self, type_id: u32) -> Option<String> {
+        let t = self.strip(type_id)?;
+        (t.kind == STRUCT || t.kind == UNION).then(|| t.name.clone())
+    }
+
     fn member_in(&self, type_id: u32, field: &str, base: u32) -> Option<Member> {
         let t = self.strip(type_id)?;
         if t.kind != STRUCT && t.kind != UNION {
@@ -269,12 +288,17 @@ impl Btf {
     }
 
     /// Follow typedef/const/volatile/restrict until a concrete type.
-    fn strip(&self, mut id: u32) -> Option<&BtfType> {
+    fn strip(&self, id: u32) -> Option<&BtfType> {
+        self.strip_id(id).map(|(_, t)| t)
+    }
+
+    /// `strip`, also returning the id the chain ends at.
+    fn strip_id(&self, mut id: u32) -> Option<(u32, &BtfType)> {
         for _ in 0..32 {
             let t = self.get(id)?;
             match t.kind {
                 TYPEDEF | CONST | VOLATILE | RESTRICT => id = t.size_or_type,
-                _ => return Some(t),
+                _ => return Some((id, t)),
             }
         }
         None
@@ -308,7 +332,7 @@ impl Btf {
     /// Resolve a member's type id into honey's field model.
     pub fn resolve(&self, type_id: u32) -> Resolved {
         let big_endian = self.is_big_endian(type_id);
-        let Some(t) = self.strip(type_id) else { return Resolved::Other };
+        let Some((tid, t)) = self.strip_id(type_id) else { return Resolved::Other };
         match t.kind {
             INT => Resolved::Int { bytes: t.size_or_type.min(8), signed: t.int_signed, big_endian },
             ARRAY => {
@@ -320,11 +344,11 @@ impl Btf {
                     Resolved::Other
                 }
             }
-            STRUCT | UNION => Resolved::Struct { name: t.name.clone() },
+            STRUCT | UNION => Resolved::Struct { id: tid, name: t.name.clone() },
             PTR => {
-                let Some(pointee) = self.strip(t.size_or_type) else { return Resolved::PtrToOther };
+                let Some((pid, pointee)) = self.strip_id(t.size_or_type) else { return Resolved::PtrToOther };
                 match pointee.kind {
-                    STRUCT | UNION if !pointee.name.is_empty() => Resolved::PtrToStruct { name: pointee.name.clone() },
+                    STRUCT | UNION if !pointee.name.is_empty() => Resolved::PtrToStruct { id: pid, name: pointee.name.clone() },
                     INT if pointee.size_or_type == 1 => Resolved::PtrToChar,
                     _ => Resolved::PtrToOther,
                 }
@@ -424,11 +448,14 @@ mod tests {
 
         let dname = btf.member("dentry", "d_name").unwrap();
         assert_eq!(dname.offset_bytes, 32);
-        assert_eq!(btf.resolve(dname.type_id), Resolved::Struct { name: "qstr".into() });
+        assert_eq!(btf.resolve(dname.type_id), Resolved::Struct { id: 4, name: "qstr".into() });
 
         let dparent = btf.member("dentry", "d_parent").unwrap();
         assert_eq!(dparent.offset_bytes, 24);
-        assert_eq!(btf.resolve(dparent.type_id), Resolved::PtrToStruct { name: "dentry".into() });
+        assert_eq!(btf.resolve(dparent.type_id), Resolved::PtrToStruct { id: 6, name: "dentry".into() });
+        assert_eq!(btf.member_of(6, "d_name").map(|m| m.offset_bytes), Some(32));
+        assert_eq!(btf.type_size(6), Some(192));
+        assert_eq!(btf.type_name(4).as_deref(), Some("qstr"));
         assert_eq!(btf.struct_size("dentry"), Some(192));
         assert_eq!(btf.resolve(1), Resolved::Int { bytes: 4, signed: false, big_endian: false });
     }

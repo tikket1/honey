@@ -204,16 +204,20 @@ enum Ty {
     OptionPtr(Box<Ty>),
     /// `tcp.opt(kind)`: R0 = value, R1 = 1 if the option was present.
     OptionVal(Box<Ty>),
-    /// Kernel pointer to a named struct (an address).
-    KPtr(String),
+    /// A kernel struct address plus a pending, compile-time offset into it.
+    /// `id` is the BTF type at `root + off` (possibly anonymous); `root` is
+    /// the named struct the pointer really points at and `path` the dotted
+    /// member path from it — what a relocation is expressed as, so the
+    /// loader can re-walk it against the running kernel's BTF.
+    KPtr { id: u32, root: String, path: String, off: i32 },
     /// Kernel pointer to char (a string address).
     KCharPtr,
-    /// A packet struct view: `struct name` at this constant packet offset.
+    /// A packet struct view: the BTF type at this constant packet offset.
     /// Never stored; every field read is `[R7 + off + field]`.
-    PktPtr(String, i16),
+    PktPtr(u32, i16),
     /// A packet struct view at a runtime offset: the verified packet pointer
-    /// lives in R9 (reserved for it); reads are `[R9 + field]`.
-    PktDyn(String, i16),
+    /// lives in R9 (reserved for it); reads are `[R9 + off + field]`.
+    PktDyn(u32, i16),
 }
 
 impl Ty {
@@ -228,7 +232,7 @@ impl Ty {
             ("ipv6", []) => Ok(Ty::Ipv6),
             ("mac", []) => Ok(Ty::Mac),
             ("bool", []) => Ok(Ty::Bool),
-            ("ptr", [TypeArg::Type(inner)]) => Ok(Ty::KPtr(inner.name.name.clone())),
+            ("ptr", _) => Err("`ptr<S>` is resolved against BTF, not from the annotation alone".into()),
             (other, _) => Err(format!("type `{other}` is not supported in codegen")),
         }
     }
@@ -240,7 +244,7 @@ impl Ty {
             Ty::Str(n) => *n,
             Ty::Ipv6 => 16,
             Ty::Mac => 6,
-            Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::OptionVal(_) | Ty::KPtr(_) | Ty::KCharPtr => 8,
+            Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::OptionVal(_) | Ty::KPtr { .. } | Ty::KCharPtr => 8,
             Ty::PktPtr(..) | Ty::PktDyn(..) => 0,
         }
     }
@@ -978,7 +982,8 @@ impl Cg<'_> {
                     let ExprKind::MethodCall { args, .. } = &value.kind else { unreachable!() };
                     let [off] = args.as_slice() else { return Err("`pkt.at` takes one constant offset".into()) };
                     let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
-                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktPtr(sname, o), reg: None });
+                    let id = self.struct_id(&sname)?;
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktPtr(id, o), reg: None });
                     return Ok(());
                 }
                 // Dynamic views: `let t: ptr<tcphdr> = pkt.view(expr)` / `pkt.l4()`.
@@ -992,7 +997,8 @@ impl Cg<'_> {
                         [TypeArg::Type(inner)] => inner.name.name.clone(),
                         _ => return Err("dynamic views need `ptr<Struct>`".into()),
                     };
-                    let size = self.sh.btf.and_then(|b| b.struct_size(&sname)).ok_or_else(|| format!("unknown struct `{sname}` (need --btf)"))?;
+                    let id = self.struct_id(&sname)?;
+                    let size = self.sh.btf.and_then(|b| b.type_size(id)).ok_or_else(|| format!("unknown struct `{sname}` (need --btf)"))?;
                     let ExprKind::MethodCall { method, args, .. } = &value.kind else { unreachable!() };
                     if method.name == "view" {
                         let [off] = args.as_slice() else { return Err("`pkt.view` takes one offset".into()) };
@@ -1006,26 +1012,31 @@ impl Cg<'_> {
                     self.prog.push(mov64_reg(Reg::R2, Reg::R9));
                     self.prog.push(alu64_imm(AluOp::Add, Reg::R2, size as i32));
                     self.prog.jmp_reg_to(JmpOp::Gt, Reg::R2, Reg::R8, self.exit_label);
-                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktDyn(sname, 0), reg: None });
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: 0, ty: Ty::PktDyn(id, 0), reg: None });
                     return Ok(());
                 }
                 // Byte blobs: `let a = pkt.ipv6(22);` copies straight from the packet.
-                if let Some((width, off)) = self.pkt_blob_with_base(value)? {
+                if let Some((width, base, off)) = self.pkt_blob(value)? {
                     let ty = if width == 16 { Ty::Ipv6 } else { Ty::Mac };
                     let dst = self.alloc_bytes(width);
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: dst, ty, reg: None });
-                    self.copy_bytes(Reg::R9, off, Reg::R10, dst, width);
-                    return Ok(());
-                }
-                if let Some((width, off)) = self.pkt_blob(value)? {
-                    let ty = if width == 16 { Ty::Ipv6 } else { Ty::Mac };
-                    let dst = self.alloc_bytes(width);
-                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: dst, ty, reg: None });
-                    self.copy_bytes(Reg::R7, off, Reg::R10, dst, width);
+                    self.copy_bytes(base, off, Reg::R10, dst, width);
                     return Ok(());
                 }
                 let vty = self.expr(value)?;
                 let ty = match ty {
+                    // `let p: ptr<S> = arg(n)`: a root pointer. A pointer that
+                    // came from another pointer already carries its BTF type
+                    // (and possibly a pending offset), so keep that.
+                    Some(t) if t.name.name == "ptr" => match vty {
+                        Ty::KPtr { .. } => vty,
+                        _ => {
+                            let [TypeArg::Type(inner)] = t.args.as_slice() else { return Err("`ptr<...>` needs a struct name".into()) };
+                            let root = inner.name.name.clone();
+                            let id = self.struct_id(&root)?;
+                            Ty::KPtr { id, root, path: String::new(), off: 0 }
+                        }
+                    },
                     Some(t) => Ty::from_ast(t)?,
                     None => vty,
                 };
@@ -1047,12 +1058,12 @@ impl Cg<'_> {
                 // already bounds-checked for its whole struct, so the store
                 // needs no check of its own.
                 ExprKind::Field { expr: view, field } => {
-                    let (sname, base, poff) = match self.expr(view)? {
+                    let (id, base, poff) = match self.expr(view)? {
                         Ty::PktPtr(s, o) => (s, Reg::R7, o),
                         Ty::PktDyn(s, o) => (s, Reg::R9, o),
                         _ => return Err("only packet views can be written through".into()),
                     };
-                    self.pkt_write(&sname, base, poff, &field.name, value)
+                    self.pkt_write(id, base, poff, &field.name, value)
                 }
                 _ => Err("unsupported assignment target".into()),
             },
@@ -1260,18 +1271,11 @@ impl Cg<'_> {
             }
             if matches!(fl.kind, FieldKind::Ipv6 | FieldKind::Mac) {
                 let width = fl.size;
-                if let Some((w, poff)) = self.pkt_blob_with_base(value)? {
+                if let Some((w, base, poff)) = self.pkt_blob(value)? {
                     if w != width {
                         return Err(format!("field `{}` is {width} bytes but the packet read is {w}", fname.name));
                     }
-                    self.copy_bytes(Reg::R9, poff, Reg::R6, off, width);
-                    continue;
-                }
-                if let Some((w, poff)) = self.pkt_blob(value)? {
-                    if w != width {
-                        return Err(format!("field `{}` is {width} bytes but the packet read is {w}", fname.name));
-                    }
-                    self.copy_bytes(Reg::R7, poff, Reg::R6, off, width);
+                    self.copy_bytes(base, poff, Reg::R6, off, width);
                     continue;
                 }
                 let ExprKind::Ident(n) = &value.kind else {
@@ -1387,19 +1391,20 @@ impl Cg<'_> {
                     if let Some(local) = self.lookup(n).cloned()
                         && let Ty::PktPtr(..) | Ty::PktDyn(..) = local.ty
                     {
-                        let (sname, base, poff) = match local.ty {
+                        let (id, base, poff) = match local.ty {
                             Ty::PktPtr(s, o) => (s, Reg::R7, o),
                             Ty::PktDyn(s, o) => (s, Reg::R9, o),
                             _ => unreachable!(),
                         };
+                        let sname = self.struct_name(id);
                         return match (method.name.as_str(), args.as_slice()) {
                             ("opt", [kind]) if sname == "tcphdr" => {
                                 let k = self.const_eval(kind)?;
-                                self.emit_tcp_opt(base, poff, k as i32)?;
+                                self.emit_tcp_opt(id, base, poff, k as i32)?;
                                 Ok(Ty::OptionVal(Box::new(Ty::Uint(4))))
                             }
                             ("fix_csum", []) if sname == "iphdr" => {
-                                self.emit_ip_csum(base, poff)?;
+                                self.emit_ip_csum(id, base, poff)?;
                                 Ok(Ty::Uint(8))
                             }
                             (m, _) => Err(format!("`ptr<{sname}>` has no method `{m}`")),
@@ -1413,23 +1418,26 @@ impl Cg<'_> {
             }
             ExprKind::Field { expr, field } => {
                 let base = self.expr(expr)?;
-                if let Ty::PktPtr(sname, poff) = base {
-                    return self.pkt_field(&sname, Reg::R7, poff, &field.name);
+                if let Ty::PktPtr(id, poff) = base {
+                    return self.pkt_field(id, Reg::R7, poff, &field.name);
                 }
-                if let Ty::PktDyn(sname, poff) = base {
-                    return self.pkt_field(&sname, Reg::R9, poff, &field.name);
+                if let Ty::PktDyn(id, poff) = base {
+                    return self.pkt_field(id, Reg::R9, poff, &field.name);
                 }
-                let Ty::KPtr(sname) = base else {
+                let Ty::KPtr { id, root, path, off: base_off } = base else {
                     return Err(format!("`.{}` needs a kernel struct pointer", field.name));
                 };
                 let btf = self.sh.btf.ok_or("kernel field access needs BTF")?;
                 let member = btf
-                    .member(&sname, &field.name)
-                    .ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
-                let off = member.offset_bytes as i32;
+                    .member_of(id, &field.name)
+                    .ok_or_else(|| format!("struct `{}` has no field `{}`", self.struct_name(id), field.name))?;
+                // The reloc names the member path from the root struct; the
+                // compile-time offset is the whole path's, from this BTF.
+                let path = if path.is_empty() { field.name.clone() } else { format!("{path}.{}", field.name) };
+                let off = base_off + member.offset_bytes as i32;
                 if member.bitfield() {
                     let (cont_off, width, shift) = bitfield_container(member.bit_offset, member.bit_size);
-                    self.emit_kernel_read(&sname, &field.name, cont_off as i32, width);
+                    self.emit_kernel_read(&root, &path, base_off + cont_off as i32, width);
                     if shift > 0 {
                         self.prog.push(alu64_imm(AluOp::Rsh, Reg::R0, shift as i32));
                     }
@@ -1437,27 +1445,22 @@ impl Cg<'_> {
                     return Ok(Ty::Uint(width));
                 }
                 match btf.resolve(member.type_id) {
-                    Resolved::Struct { name } => {
-                        // embedded struct: address = base + off (no read)
-                        let idx = self.prog.len();
-                        self.prog.push(alu64_imm(AluOp::Add, Reg::R0, off));
-                        self.relocs.push((idx, sname.clone(), field.name.clone()));
-                        Ok(Ty::KPtr(name))
-                    }
-                    Resolved::PtrToStruct { name } => {
-                        self.emit_kernel_read(&sname, &field.name, off, 8);
-                        Ok(Ty::KPtr(name))
+                    // embedded struct: nothing to read, the offset stays pending
+                    Resolved::Struct { id, .. } => Ok(Ty::KPtr { id, root, path, off }),
+                    Resolved::PtrToStruct { id, name } => {
+                        self.emit_kernel_read(&root, &path, off, 8);
+                        Ok(Ty::KPtr { id, root: name, path: String::new(), off: 0 })
                     }
                     Resolved::PtrToChar => {
-                        self.emit_kernel_read(&sname, &field.name, off, 8);
+                        self.emit_kernel_read(&root, &path, off, 8);
                         Ok(Ty::KCharPtr)
                     }
                     Resolved::PtrToOther => {
-                        self.emit_kernel_read(&sname, &field.name, off, 8);
+                        self.emit_kernel_read(&root, &path, off, 8);
                         Ok(Ty::Uint(8))
                     }
                     Resolved::Int { bytes, big_endian, .. } => {
-                        self.emit_kernel_read(&sname, &field.name, off, bytes);
+                        self.emit_kernel_read(&root, &path, off, bytes);
                         if big_endian && bytes >= 2 {
                             self.prog.push(bswap(Reg::R0, (bytes * 8) as u8));
                         }
@@ -1467,7 +1470,7 @@ impl Cg<'_> {
                     Resolved::Array { elem_bytes: 1, .. } => {
                         let idx = self.prog.len();
                         self.prog.push(alu64_imm(AluOp::Add, Reg::R0, off));
-                        self.relocs.push((idx, sname.clone(), field.name.clone()));
+                        self.relocs.push((idx, root, path));
                         Ok(Ty::KCharPtr)
                     }
                     Resolved::Array { .. } | Resolved::Other => Err(format!("field `{}` has a type honey can't read", field.name)),
@@ -2042,9 +2045,9 @@ impl Cg<'_> {
     /// plain loads (byte-swapped when the kernel declares the field `__be*`);
     /// embedded structs are views at a deeper offset; 6/16-byte arrays and
     /// `in6_addr` are blobs (handled by `pkt_blob` at let/emit sites).
-    fn pkt_field(&mut self, sname: &str, base: Reg, poff: i16, field: &str) -> Result<Ty, String> {
+    fn pkt_field(&mut self, id: u32, base: Reg, poff: i16, field: &str) -> Result<Ty, String> {
         let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
-        let member = btf.member(sname, field).ok_or_else(|| format!("struct `{sname}` has no field `{field}`"))?;
+        let member = btf.member_of(id, field).ok_or_else(|| format!("struct `{}` has no field `{field}`", self.struct_name(id)))?;
         if member.bitfield() {
             // Load the smallest container holding the bits, then shift and
             // mask. BTF bit offsets use little-endian numbering, which is
@@ -2078,10 +2081,10 @@ impl Cg<'_> {
                 }
                 Ok(Ty::Uint(bytes))
             }
-            Resolved::Struct { name } if name == "in6_addr" => Err("`in6_addr` is a 16-byte value: bind it with `let` or emit it".into()),
+            Resolved::Struct { name, .. } if name == "in6_addr" => Err("`in6_addr` is a 16-byte value: bind it with `let` or emit it".into()),
             // an embedded struct: a view at a deeper offset from the same base
-            Resolved::Struct { name } if base == Reg::R9 => Ok(Ty::PktDyn(name, off)),
-            Resolved::Struct { name } => Ok(Ty::PktPtr(name, off)),
+            Resolved::Struct { id, .. } if base == Reg::R9 => Ok(Ty::PktDyn(id, off)),
+            Resolved::Struct { id, .. } => Ok(Ty::PktPtr(id, off)),
             Resolved::Array { elem_bytes: 1, len: 6 | 16 } => Err(format!("`{field}` is a byte blob: bind it with `let` or emit it directly")),
             _ => Err(format!("field `{field}` has a type honey can't read from a packet")),
         }
@@ -2194,43 +2197,55 @@ impl Cg<'_> {
         Ok(Ty::Bool)
     }
 
-    /// If `e` is `pkt.ipv6(off)` / `pkt.mac(off)` — or a blob-typed field of a
-    /// packet view — return (width, packet offset).
-    fn pkt_blob(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
-        self.pkt_blob_static(e)
+    /// The BTF id of a named struct, or an error naming it.
+    fn struct_id(&self, name: &str) -> Result<u32, String> {
+        self.sh.btf.and_then(|b| b.struct_id(name)).ok_or_else(|| format!("unknown struct `{name}` (need --btf)"))
     }
 
-    /// Blob fields of a *dynamic* view: (width, offset from R9).
-    fn pkt_blob_with_base(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
-        if let ExprKind::Field { expr, field } = &e.kind
-            && let ExprKind::Ident(n) = &expr.kind
-            && let Some(Local { ty: Ty::PktDyn(sname, poff), .. }) = self.lookup(n).cloned()
-        {
-            let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
-            let member = btf.member(&sname, &field.name).ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
-            let off = poff + member.offset_bytes as i16;
-            return Ok(match btf.resolve(member.type_id) {
-                Resolved::Array { elem_bytes: 1, len: 6 } => Some((6, off)),
-                Resolved::Array { elem_bytes: 1, len: 16 } => Some((16, off)),
-                Resolved::Struct { name } if name == "in6_addr" => Some((16, off)),
-                _ => None,
-            });
+    /// A struct's name for messages (`?` for an anonymous one).
+    fn struct_name(&self, id: u32) -> String {
+        match self.sh.btf.and_then(|b| b.type_name(id)) {
+            Some(n) if !n.is_empty() => n,
+            _ => "?".into(),
         }
-        Ok(None)
     }
 
-    fn pkt_blob_static(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
+    /// Resolve an expression that names a packet view without emitting
+    /// code: a view local, or an embedded-struct field chain on one. Gives
+    /// (BTF type id, base register, offset from that register).
+    fn view_of(&self, e: &Expr) -> Result<Option<(u32, Reg, i16)>, String> {
+        match &e.kind {
+            ExprKind::Ident(n) => Ok(match self.lookup(n).map(|l| l.ty.clone()) {
+                Some(Ty::PktPtr(id, off)) => Some((id, Reg::R7, off)),
+                Some(Ty::PktDyn(id, off)) => Some((id, Reg::R9, off)),
+                _ => None,
+            }),
+            ExprKind::Field { expr, field } => {
+                let Some((id, base, off)) = self.view_of(expr)? else { return Ok(None) };
+                let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
+                let member = btf.member_of(id, &field.name).ok_or_else(|| format!("struct `{}` has no field `{}`", self.struct_name(id), field.name))?;
+                Ok(match btf.resolve(member.type_id) {
+                    Resolved::Struct { id, .. } => Some((id, base, off + member.offset_bytes as i16)),
+                    _ => None,
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// If `e` is `pkt.ipv6(off)` / `pkt.mac(off)` — or a blob-typed field of a
+    /// packet view — return (width, base register, offset from it).
+    fn pkt_blob(&self, e: &Expr) -> Result<Option<(u32, Reg, i16)>, String> {
         if let ExprKind::Field { expr, field } = &e.kind
-            && let ExprKind::Ident(n) = &expr.kind
-            && let Some(Local { ty: Ty::PktPtr(sname, poff), .. }) = self.lookup(n).cloned()
+            && let Some((id, base, poff)) = self.view_of(expr)?
         {
             let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
-            let member = btf.member(&sname, &field.name).ok_or_else(|| format!("struct `{sname}` has no field `{}`", field.name))?;
+            let member = btf.member_of(id, &field.name).ok_or_else(|| format!("struct `{}` has no field `{}`", self.struct_name(id), field.name))?;
             let off = poff + member.offset_bytes as i16;
             return Ok(match btf.resolve(member.type_id) {
-                Resolved::Array { elem_bytes: 1, len: 6 } => Some((6, off)),
-                Resolved::Array { elem_bytes: 1, len: 16 } => Some((16, off)),
-                Resolved::Struct { name } if name == "in6_addr" => Some((16, off)),
+                Resolved::Array { elem_bytes: 1, len: 6 } => Some((6, base, off)),
+                Resolved::Array { elem_bytes: 1, len: 16 } => Some((16, base, off)),
+                Resolved::Struct { name, .. } if name == "in6_addr" => Some((16, base, off)),
                 _ => None,
             });
         }
@@ -2250,7 +2265,7 @@ impl Cg<'_> {
             return Err(format!("`pkt.{}` takes one constant offset", method.name));
         };
         let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
-        Ok(Some((width, o)))
+        Ok(Some((width, Reg::R7, o)))
     }
 
     /// Copy `n` bytes from `[src + soff]` to `[dst + doff]` in 8/4/2/1-byte
@@ -2259,9 +2274,9 @@ impl Cg<'_> {
     /// `view.field = value`: store a scalar (swapped back to network order
     /// when the kernel declares it `__be*`) or copy a 6/16-byte blob into
     /// the packet at `[base + poff + field]`.
-    fn pkt_write(&mut self, sname: &str, base: Reg, poff: i16, field: &str, value: &Expr) -> Result<(), String> {
+    fn pkt_write(&mut self, id: u32, base: Reg, poff: i16, field: &str, value: &Expr) -> Result<(), String> {
         let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
-        let member = btf.member(sname, field).ok_or_else(|| format!("struct `{sname}` has no field `{field}`"))?;
+        let member = btf.member_of(id, field).ok_or_else(|| format!("struct `{}` has no field `{field}`", self.struct_name(id)))?;
         if member.bitfield() {
             return Err(format!("cannot write the bitfield `{field}`"));
         }
@@ -2282,7 +2297,7 @@ impl Cg<'_> {
                 return Ok(());
             }
             Resolved::Array { elem_bytes: 1, len: n @ (6 | 16) } => n,
-            Resolved::Struct { name } if name == "in6_addr" => 16,
+            Resolved::Struct { name, .. } if name == "in6_addr" => 16,
             _ => return Err(format!("field `{field}` has a type honey can't write to a packet")),
         };
         // A blob: from a literal, a blob local, or another packet field.
@@ -2301,18 +2316,11 @@ impl Cg<'_> {
             self.copy_bytes(Reg::R10, soff, base, off, blob);
             return Ok(());
         }
-        if let Some((width, soff)) = self.pkt_blob_with_base(value)? {
+        if let Some((width, sbase, soff)) = self.pkt_blob(value)? {
             if width != blob {
                 return Err(format!("cannot write a {width}-byte value into the {blob}-byte field `{field}`"));
             }
-            self.copy_bytes(Reg::R9, soff, base, off, blob);
-            return Ok(());
-        }
-        if let Some((width, soff)) = self.pkt_blob_static(value)? {
-            if width != blob {
-                return Err(format!("cannot write a {width}-byte value into the {blob}-byte field `{field}`"));
-            }
-            self.copy_bytes(Reg::R7, soff, base, off, blob);
+            self.copy_bytes(sbase, soff, base, off, blob);
             return Ok(());
         }
         Err(format!("`{field}` is a byte blob: write it from the packet, a blob local, or a literal"))
@@ -2347,12 +2355,12 @@ impl Cg<'_> {
     /// against data_end; a truncated packet is passed. Scratch: R1 = offset
     /// from the header, R2 = header length, R3 = pointer, R4 = option
     /// length, R5 = option kind / temporary.
-    fn emit_tcp_opt(&mut self, base: Reg, poff: i16, kind: i32) -> Result<(), String> {
+    fn emit_tcp_opt(&mut self, id: u32, base: Reg, poff: i16, kind: i32) -> Result<(), String> {
         let found = self.prog.new_label();
         let none = self.prog.new_label();
         let done = self.prog.new_label();
         // R2 = doff * 4 (the bitfield read leaves doff in R0)
-        self.pkt_field("tcphdr", base, poff, "doff")?;
+        self.pkt_field(id, base, poff, "doff")?;
         self.prog.push(mov64_reg(Reg::R2, Reg::R0));
         self.prog.push(alu64_imm(AluOp::Lsh, Reg::R2, 2));
         self.prog.push(mov64_imm(Reg::R1, 20));
@@ -2439,9 +2447,9 @@ impl Cg<'_> {
     /// ones'-complement sum is byte-order independent, so the words are
     /// summed and stored as they sit on the wire. Scratch: R1 = sum,
     /// R2 = header length, R3 = pointer, R4 = temporary.
-    fn emit_ip_csum(&mut self, base: Reg, poff: i16) -> Result<(), String> {
+    fn emit_ip_csum(&mut self, id: u32, base: Reg, poff: i16) -> Result<(), String> {
         let fold = self.prog.new_label();
-        self.pkt_field("iphdr", base, poff, "ihl")?;
+        self.pkt_field(id, base, poff, "ihl")?;
         self.prog.push(mov64_reg(Reg::R2, Reg::R0));
         self.prog.push(alu64_imm(AluOp::Lsh, Reg::R2, 2));
         self.prog.push(mov64_reg(Reg::R3, base));
