@@ -66,7 +66,7 @@ Two of the three example programs compile and run in-kernel:
 |------------------------------|---------------------------------------------------------|
 | `examples/exec.hny`          | runs: emit an event with builtin fields                 |
 | `examples/exec_burst.hny`    | runs: `const`, `hash` map get/insert, `if let`, arithmetic, threshold compare |
-| `examples/sensitive_open.hny`| parses only: needs `for`, `read_user_str`, string compare (stage 3c) |
+| `examples/sensitive_open.hny`| runs: `arg(n)`, `read_user_str` into `str<N>`, `starts_with`, `byte_at`, bounded (unrolled) `for`, bit tests |
 
 Supported: `const` integer literals; `map` (`hash<K, V>`, `array<V>`) with
 `.get`, `.insert`, `.delete`; `let`, assignment, `if`/`else`,
@@ -74,9 +74,15 @@ Supported: `const` integer literals; `map` (`hash<K, V>`, `array<V>`) with
 nullary builtins (`pid tgid tid uid gid ktime`), `comm()` as an emit field,
 `*ptr`, unsigned arithmetic/bitwise/comparison, `&&`/`||`/`!`.
 
-Not yet (clear "not yet" errors, never unverifiable bytecode): `for`, string
-values and `read_user_str`, `as` casts, signed comparisons, writing through a
-map pointer, `field.access`, indexing.
+Bounded `for` loops are **fully unrolled**: both ends must be compile-time
+constants, so the verifier sees straight-line code with no back-edge. The loop
+variable is a constant inside the body. Strings are fixed `str<N>` stack
+buffers; `read_user_str` reads into one, `starts_with`/`byte_at` read out of
+one, and an `emit` copies one into the record.
+
+Not yet (clear "not yet" errors, never unverifiable bytecode): `as` casts,
+signed comparisons, `return <value>`, writing through a map pointer, dynamic
+loop bounds, `field.access` beyond builtins, indexing.
 
 ### How values move (read `codegen.rs` with this in mind)
 
@@ -91,6 +97,8 @@ map pointer, `field.access`, indexing.
   leans on a verifier subtlety, and it is exactly the rule stage 4 makes a type.
 - `R6` holds the ring-buffer record during an `emit`; helper calls preserve
   it, so field expressions can call maps and builtins freely.
+- The tracepoint context pointer (R1 at entry) is spilled to a stack slot in
+  the prologue, so `arg(n)` can read `*(ctx + 16 + 8n)` after R1 is reused.
 - Stack use is tracked and the compiler refuses anything over 512 bytes.
 
 ## The verifier is your test oracle

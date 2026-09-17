@@ -42,28 +42,28 @@ const EXEC: &str = include_str!("../../../examples/exec.hny");
 
 #[test]
 fn exec_compiles_to_the_expected_program() {
-    let expected = "
-   0: ld64 r1, map_fd(0)
-   2: mov r2, 24
-   3: mov r3, 0
-   4: call 131
-   5: if r0 == 0 goto +14
-   6: mov r6, r0
-   7: call 14
-   8: rsh r0, 32
-   9: stx32 [r6 +0], r0
-  10: call 15
-  11: mov32 r0, r0
-  12: stx32 [r6 +4], r0
-  13: mov r1, r6
-  14: add r1, 8
-  15: mov r2, 16
-  16: call 16
-  17: mov r1, r6
-  18: mov r2, 0
-  19: call 132
-  20: mov r0, 0
-  21: exit
+    let expected = "\n   0: stx64 [r10 -8], r1
+   1: ld64 r1, map_fd(0)
+   3: mov r2, 24
+   4: mov r3, 0
+   5: call 131
+   6: if r0 == 0 goto +14
+   7: mov r6, r0
+   8: call 14
+   9: rsh r0, 32
+  10: stx32 [r6 +0], r0
+  11: call 15
+  12: mov32 r0, r0
+  13: stx32 [r6 +4], r0
+  14: mov r1, r6
+  15: add r1, 8
+  16: mov r2, 16
+  17: call 16
+  18: mov r1, r6
+  19: mov r2, 0
+  20: call 132
+  21: mov r0, 0
+  22: exit
 ";
     assert_eq!(asm(EXEC), expected.trim_start_matches('\n'));
 }
@@ -73,8 +73,8 @@ fn bytecode_is_a_whole_number_of_instructions() {
     let prog = parse(EXEC).unwrap();
     let c = compile(&prog).unwrap();
     assert_eq!(c.bytecode.len() % 8, 0);
-    // 22 instruction slots (the ld_map_fd counts as two 8-byte slots).
-    assert_eq!(c.bytecode.len(), 22 * 8);
+    // 23 instruction slots (the ld_map_fd counts as two 8-byte slots).
+    assert_eq!(c.bytecode.len(), 23 * 8);
 }
 
 #[test]
@@ -83,9 +83,9 @@ fn drop_branch_lands_on_the_final_exit() {
     // final `mov r0, 0` right before `exit`. If slot/label arithmetic were
     // off by one this would silently run a helper with a null pointer.
     let text = asm(EXEC);
-    assert!(text.contains("5: if r0 == 0 goto +14"), "{text}");
-    assert!(text.contains("20: mov r0, 0"), "{text}");
-    assert!(text.contains("21: exit"), "{text}");
+    assert!(text.contains("6: if r0 == 0 goto +14"), "{text}");
+    assert!(text.contains("21: mov r0, 0"), "{text}");
+    assert!(text.contains("22: exit"), "{text}");
 }
 
 #[test]
@@ -120,8 +120,8 @@ fn uid_field_high_half_is_not_shifted() {
 fn unsupported_constructs_report_clearly() {
     let probe = |body: &str| format!("event E {{ a: u32 }} probe tracepoint(\"s\",\"n\") {{ {body} emit E {{ a: pid() }}; }}");
     let cases = [
-        (probe("for i in 0..4 { }"), "for"),
         (probe("let x = 1 as u8;"), "as"),
+        (probe("return 7;"), "return"),
         ("event E { a: u32 }".to_string(), "no probe"),
     ];
     for (src, needle) in cases {
@@ -206,4 +206,74 @@ fn stack_usage_is_tracked() {
     let prog = parse(EXEC_BURST).unwrap();
     let c = compile(&prog).unwrap();
     assert!(c.stack_bytes >= 24 && c.stack_bytes.is_multiple_of(8), "{}", c.stack_bytes);
+}
+
+// ------------------------------------------------ stage 3c: strings + for
+
+const SENSITIVE: &str = include_str!("../../../examples/sensitive_open.hny");
+
+#[test]
+fn sensitive_open_compiles() {
+    let prog = parse(SENSITIVE).unwrap();
+    let c = compile(&prog).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(c.event.name, "SensitiveOpen");
+    // path is a str<64> field.
+    let path = c.event.fields.iter().find(|f| f.name == "path").unwrap();
+    assert_eq!(path.size, 64);
+    assert!(c.stack_bytes <= 512, "stack {}", c.stack_bytes);
+}
+
+#[test]
+fn context_pointer_is_saved_at_entry() {
+    // First instruction must spill R1 (the ctx) so arg(n) can read it later.
+    let text = asm(SENSITIVE);
+    assert!(text.starts_with("   0: stx64 [r10 -8], r1"), "{}", &text[..40]);
+}
+
+#[test]
+fn arg_reads_context_at_the_right_offset() {
+    // arg(1) on openat -> load ctx, then ldx [ctx + 24].
+    let text = asm(SENSITIVE);
+    assert!(text.contains("ldx64 r0, [r0 +24]"), "arg(1) should read ctx+24\n{text}");
+}
+
+#[test]
+fn starts_with_is_unrolled_byte_compares() {
+    // "/etc/shadow" is 11 bytes -> 11 byte loads guarding the prefix. Check
+    // the first two bytes: '/' = 47, 'e' = 101.
+    let text = asm(SENSITIVE);
+    assert!(text.contains("if r0 != 47 goto"), "{text}");
+    assert!(text.contains("if r0 != 101 goto"), "{text}");
+}
+
+#[test]
+fn for_loop_is_fully_unrolled() {
+    // `for i in 0..4 { if path.byte_at(i) == 0 { return; } }` unrolls to four
+    // byte loads at offsets 0..3 from the path buffer. There must be no
+    // backward jump (no loop) in the program.
+    let text = asm(SENSITIVE);
+    for line in text.lines() {
+        if let Some(rest) = line.split("goto ").nth(1) {
+            let off: i64 = rest.trim().trim_start_matches('+').parse().unwrap_or(0);
+            assert!(off >= 0, "unexpected backward jump (a real loop): {line}");
+        }
+    }
+}
+
+#[test]
+fn for_bounds_must_be_constant() {
+    let src = "event E { a: u32 } probe tracepoint(\"s\",\"n\") { let n = pid(); for i in 0..n { } emit E { a: pid() }; }";
+    let prog = parse(src).unwrap();
+    let err = compile(&prog).unwrap_err();
+    assert!(err.contains("constant"), "{err}");
+}
+
+#[test]
+fn every_example_compiles_and_verifies_shape() {
+    for (name, src) in [("exec", EXEC), ("exec_burst", EXEC_BURST), ("sensitive_open", SENSITIVE)] {
+        let prog = parse(src).unwrap();
+        let c = compile(&prog).unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        assert_eq!(c.bytecode.len() % 8, 0, "{name}");
+        assert!(c.stack_bytes <= 512, "{name} stack {}", c.stack_bytes);
+    }
 }

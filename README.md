@@ -12,11 +12,12 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 }
 ```
 
-Status: **stages 1-3b working end to end.** `exec.hny` and `exec_burst.hny` compile
-to eBPF bytecode the kernel verifier accepts; the loader prints live events. That
-covers events, hash maps, constants, `if let`, arithmetic, and thresholds.
-Next: stage 3c (bounded `for`, strings) for `sensitive_open.hny`, then stage 4
-(verifier-aware types).
+Status: **all three example probes run in-kernel.** `exec.hny`, `exec_burst.hny`,
+and `sensitive_open.hny` compile to eBPF bytecode the verifier accepts, and the
+loader prints live events. That covers events, hash/array maps, constants,
+`if`/`if let`, arithmetic, thresholds, bounded (unrolled) `for`, `arg(n)`,
+`read_user_str`, and string matching. Next: stage 4 (verifier-aware types) —
+making these safety rules type errors at your source line.
 
 ## Layout
 
@@ -33,7 +34,7 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (13)
+  tests/codegen.rs   stage 3 acceptance tests (20)
 linux/               the Linux side (build + run against a real kernel)
   loader.c           loads bytecode, attaches to a tracepoint, reads events
   honey-linux        run a command in the Docker Linux environment
@@ -46,13 +47,15 @@ examples/*.hny      programs the compiler must eventually accept
 ## Build & test
 
 ```bash
-cargo test                                  # 123 tests
+cargo test                                  # 130 tests
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
 cargo run -- build examples/exec.hny -o build/exec   # write bytecode + manifest
 
-# run it against a real kernel (needs Docker Desktop):
-linux/honey-linux ./linux/run.sh build/exec.bin build/exec.json
+# run one against a real kernel (needs Docker Desktop):
+cargo run -- build examples/sensitive_open.hny -o build/sensitive
+linux/honey-linux ./linux/run.sh build/sensitive.bin build/sensitive.json
+#   -> flags every open of /etc/shadow or /etc/sudoers, with the caller
 ```
 
 Stages 1–2 run entirely on macOS. Stage 3 (loading bytecode into a kernel)

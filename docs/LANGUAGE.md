@@ -266,7 +266,7 @@ Verifier-safety rules the type checker enforces (this is the research bit):
 |-------|------------------------------------------------------------------------|-----------|
 | 1     | Lexer. `cargo test` green in `crates/honeyc`.                           | macOS     |
 | 2     | Parser → AST. Pretty-printer for round-trip tests.                     | macOS     |
-| 3     | Bytecode emitter + disassembler; C loader. Done: exec and exec_burst run in-kernel (maps, control flow, arithmetic). Next: 3c bounded `for` + strings for sensitive_open. | Docker Linux |
+| 3     | Bytecode emitter + disassembler; C loader. Done: all three examples run in-kernel (maps, control flow, arithmetic, bounded `for`, strings, `arg`). | Docker Linux |
 | 4     | Verifier-aware type checker: the rules in §5. Illegal-to-verify = illegal-to-typecheck. | both |
 
 Non-goals for v1: enforcement (LSM), networking (XDP), CO-RE/BTF relocation,
