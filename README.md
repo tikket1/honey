@@ -12,14 +12,14 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 }
 ```
 
-Status: **stage 1 (lexer) in progress.** See [docs/STAGE-1.md](docs/STAGE-1.md).
+Status: **stage 1 (lexer) complete.** Next: stage 2, the parser.
 
 ## Layout
 
 ```
 crates/honeyc/        the compiler (Rust, no dependencies)
   src/token.rs       token vocabulary — the lexer/parser contract
-  src/lexer.rs       stage 1 ← you are here
+  src/lexer.rs       stage 1, done
   src/main.rs        `honeyc file.hny`
   tests/lexer.rs     stage 1 acceptance tests
 docs/LANGUAGE.md     language reference (§3 is normative for stage 1)
@@ -30,7 +30,7 @@ examples/*.hny      programs the compiler must eventually accept
 ## Build & test
 
 ```bash
-cargo test                                  # all tests (all failing until stage 1 is done)
+cargo test                                  # 50 lexer tests
 cargo run -- examples/exec.hny             # dump tokens
 ```
 
