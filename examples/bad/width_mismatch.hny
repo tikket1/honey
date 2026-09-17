@@ -1,0 +1,12 @@
+// error: mismatched types: expected `u32`, found `u64`
+//
+// The map's key is u32; ktime() is u64. In C this silently truncates. honey
+// has no implicit conversions, so it is a type error.
+
+map seen: hash<u32, u64>[64];
+event E { n: u64 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    seen.insert(ktime(), 1);
+    emit E { n: 1 };
+}

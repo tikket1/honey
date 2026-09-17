@@ -1,0 +1,13 @@
+// error: `n` is a runtime value, not a constant
+//
+// The verifier must prove every loop terminates. A bound that depends on a
+// runtime value can't be proven, so honey requires constant bounds.
+
+event E { i: u64 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let n = pid();
+    for i in 0..n {
+        emit E { i: 1 };
+    }
+}

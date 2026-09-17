@@ -1,0 +1,12 @@
+// error: `read_user_str` needs a bounded destination
+//
+// bpf_probe_read_user_str needs to know how many bytes it may write. In C
+// you pass a buffer and a size and hope they agree. In honey the declared
+// `str<N>` *is* the size, so it can't be wrong — and can't be omitted.
+
+event Open { path: str<64> }
+
+probe tracepoint("syscalls", "sys_enter_openat") {
+    let path = read_user_str(arg(1));
+    emit Open { path: path };
+}

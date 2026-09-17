@@ -1,0 +1,12 @@
+// error: loop would run 1000 times; the limit is 64
+//
+// Bounded, but honey unrolls loops, and 1000 copies of the body would blow
+// the verifier's instruction budget. The limit is a compile-time error.
+
+event E { i: u64 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    for i in 0..1000 {
+        emit E { i: 1 };
+    }
+}

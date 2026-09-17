@@ -1,0 +1,324 @@
+//! Stage 4 tests: the verifier-aware type checker.
+//!
+//! The headline check is `every_bad_example_fails_where_it_should`: each
+//! file in `examples/bad/` starts with `// error: <text>` and must produce a
+//! diagnostic containing that text. Those files are the demo of the whole
+//! idea — verifier rejections turned into source-line errors.
+
+use honeyc::parser::parse;
+use honeyc::token::Span;
+use honeyc::typeck::{check, Diag};
+
+fn diags(src: &str) -> Vec<Diag> {
+    let prog = parse(src).unwrap_or_else(|e| panic!("parse failed: {e:?}"));
+    match check(&prog) {
+        Ok(ok) => panic!("expected type errors, got ok ({} bytes stack)", ok.stack_bytes),
+        Err(d) => d,
+    }
+}
+
+fn ok(src: &str) -> u32 {
+    let prog = parse(src).unwrap();
+    match check(&prog) {
+        Ok(c) => c.stack_bytes,
+        Err(d) => panic!("expected ok, got: {:#?}", d),
+    }
+}
+
+/// Wrap statements in a minimal program with a map, an event, and a probe.
+fn probe(body: &str) -> String {
+    format!(
+        "map m: hash<u32, u64>[8];\nevent E {{ a: u64, b: bool }}\nprobe tracepoint(\"syscalls\", \"sys_enter_execve\") {{\n{body}\n}}"
+    )
+}
+
+fn first_message(src: &str) -> String {
+    diags(src).remove(0).message
+}
+
+// ------------------------------------------------------- the bad examples
+
+#[test]
+fn every_bad_example_fails_where_it_should() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/bad");
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("hny") {
+            continue;
+        }
+        n += 1;
+        let src = std::fs::read_to_string(&path).unwrap();
+        let expected = src
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("// error: "))
+            .unwrap_or_else(|| panic!("{}: first line must be `// error: ...`", path.display()));
+        let prog = parse(&src).unwrap_or_else(|e| panic!("{}: parse failed: {e:?}", path.display()));
+        let ds = match check(&prog) {
+            Ok(_) => panic!("{}: expected a type error, but it passed", path.display()),
+            Err(d) => d,
+        };
+        assert!(
+            ds.iter().any(|d| d.message.contains(expected)),
+            "{}: expected an error containing {expected:?}, got:\n{:#?}",
+            path.display(),
+            ds.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+    assert!(n >= 10, "expected the bad examples to exist, found {n}");
+}
+
+#[test]
+fn every_good_example_passes() {
+    for (name, src) in [
+        ("exec", include_str!("../../../examples/exec.hny")),
+        ("exec_burst", include_str!("../../../examples/exec_burst.hny")),
+        ("sensitive_open", include_str!("../../../examples/sensitive_open.hny")),
+    ] {
+        let prog = parse(src).unwrap();
+        if let Err(d) = check(&prog) {
+            panic!("examples/{name}.hny should typecheck, got {d:#?}");
+        }
+    }
+}
+
+#[test]
+fn errors_are_reported_together_not_first_only() {
+    let src = include_str!("../../../examples/bad/multiple_errors.hny");
+    let ds = diags(src);
+    let msgs: Vec<&str> = ds.iter().map(|d| d.message.as_str()).collect();
+    assert!(msgs.iter().any(|m| m.contains("cannot dereference")), "{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("unknown name `nope`")), "{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("expected `bool`")), "{msgs:?}");
+    // and no cascade from the unknown name
+    assert!(!msgs.iter().any(|m| m.contains("no value to bind")), "{msgs:?}");
+}
+
+// --------------------------------------------------- checked map lookups
+
+#[test]
+fn deref_of_option_points_at_the_deref_with_a_fix() {
+    let src = probe("    let p = m.get(pid());\n    let n = *p;\n    emit E { a: n, b: true };");
+    let ds = diags(&src);
+    assert_eq!(ds.len(), 1, "{ds:#?}");
+    assert!(ds[0].message.contains("cannot dereference `Option<&u64>`"));
+    assert!(ds[0].help.as_deref().unwrap().contains("if let Some"));
+    // span covers exactly `*p`
+    let start = src.find("*p").unwrap();
+    assert_eq!(ds[0].span, Span::new(start, start + 2));
+}
+
+#[test]
+fn if_let_some_gives_a_checked_pointer_in_scope_only() {
+    // inside: fine
+    ok(&probe("    if let Some(v) = m.get(pid()) { emit E { a: *v, b: true }; }"));
+    // outside: not in scope
+    let msg = first_message(&probe("    if let Some(v) = m.get(pid()) { }\n    emit E { a: *v, b: true };"));
+    assert!(msg.contains("unknown name `v`"), "{msg}");
+}
+
+#[test]
+fn if_let_none_is_allowed_and_binds_nothing() {
+    ok(&probe("    if let None = m.get(pid()) { emit E { a: 1, b: false }; }"));
+    let msg = first_message(&probe("    if let None(x) = m.get(pid()) { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`None` takes no binding"), "{msg}");
+}
+
+#[test]
+fn if_let_on_a_non_option_is_rejected() {
+    let msg = first_message(&probe("    let x = 1;\n    if let Some(v) = x { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`if let` needs an `Option<&V>`"), "{msg}");
+}
+
+#[test]
+fn option_cannot_be_stored_where_a_value_is_expected() {
+    let ds = diags(&probe("    m.insert(pid(), m.get(pid()));\n    emit E { a: 1, b: true };"));
+    assert!(ds[0].message.contains("expected `u64`, found `Option<&u64>`"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("if let Some"));
+}
+
+#[test]
+fn map_key_and_value_types_are_enforced() {
+    let msg = first_message(&probe("    m.insert(ktime(), 1);\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("expected `u32`, found `u64`"), "{msg}");
+    let msg = first_message(&probe("    m.insert(pid(), true);\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("expected `u64`, found `bool`"), "{msg}");
+}
+
+#[test]
+fn writing_through_a_map_pointer_is_rejected_with_a_hint() {
+    let ds = diags(&probe("    if let Some(v) = m.get(pid()) { *v = 3; }\n    emit E { a: 1, b: true };"));
+    assert!(ds[0].message.contains("writing through a map pointer"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("map.insert"));
+}
+
+// ----------------------------------------------------------- bounded loops
+
+#[test]
+fn loop_bounds_must_be_constants() {
+    let ds = diags(&probe("    let n = pid();\n    for i in 0..n { }\n    emit E { a: 1, b: true };"));
+    assert!(ds[0].message.contains("`n` is a runtime value, not a constant"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("bounded"));
+}
+
+#[test]
+fn loop_bounds_may_be_consts_and_arithmetic() {
+    let src = format!("const N: u64 = 4;\n{}", probe("    for i in 0..N + 2 { }\n    emit E { a: 1, b: true };"));
+    ok(&src);
+}
+
+#[test]
+fn loop_limit_and_reversed_range() {
+    let msg = first_message(&probe("    for i in 0..65 { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("65 times; the limit is 64"), "{msg}");
+    let msg = first_message(&probe("    for i in 5..2 { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("end is before start"), "{msg}");
+}
+
+#[test]
+fn loop_variable_is_a_constant_usable_as_an_index() {
+    let src = "event E { b: u8 }\nprobe tracepoint(\"syscalls\", \"sys_enter_openat\") {\n    let s: str<8> = read_user_str(arg(1));\n    for i in 0..8 { emit E { b: s.byte_at(i) }; }\n}";
+    ok(src);
+}
+
+// ----------------------------------------------------------- bounded reads
+
+#[test]
+fn read_user_str_requires_a_declared_bound() {
+    let src = "event E { p: str<16> }\nprobe tracepoint(\"syscalls\", \"sys_enter_openat\") {\n    let p = read_user_str(arg(1));\n    emit E { p: p };\n}";
+    let ds = diags(src);
+    assert_eq!(ds.len(), 1, "no cascade expected: {ds:#?}");
+    assert!(ds[0].message.contains("needs a bounded destination"));
+    assert!(ds[0].help.as_deref().unwrap().contains("str<N>"));
+}
+
+#[test]
+fn string_reads_are_range_checked() {
+    let base = "event E { b: u8 }\nprobe tracepoint(\"syscalls\", \"sys_enter_openat\") {\n    let s: str<16> = read_user_str(arg(1));\n";
+    ok(&format!("{base}    emit E {{ b: s.byte_at(15) }};\n}}"));
+    let msg = first_message(&format!("{base}    emit E {{ b: s.byte_at(16) }};\n}}"));
+    assert!(msg.contains("`byte_at(16)` is outside `str<16>`"), "{msg}");
+    let msg = first_message(&format!("{base}    let x = s.starts_with(\"/this/prefix/is/too/long\");\n    emit E {{ b: 1 }};\n}}"));
+    assert!(msg.contains("prefix is 24 bytes but `s` is only `str<16>`"), "{msg}");
+}
+
+#[test]
+fn strings_cannot_be_forged_from_literals() {
+    let msg = first_message(&probe("    let s = \"hello\";\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("string literals can only be used as `starts_with`"), "{msg}");
+}
+
+// ------------------------------------------------------------ stack budget
+
+#[test]
+fn stack_usage_is_computed_from_locals() {
+    // 24 bytes: uid (8), n (8), prev (8) — see exec_burst.
+    let prog = parse(include_str!("../../../examples/exec_burst.hny")).unwrap();
+    assert_eq!(check(&prog).unwrap().stack_bytes, 24);
+    // 88: path str<64> (64) + flags (8) + hit (8) + write (8)
+    let prog = parse(include_str!("../../../examples/sensitive_open.hny")).unwrap();
+    assert_eq!(check(&prog).unwrap().stack_bytes, 88);
+}
+
+#[test]
+fn stack_is_peak_across_sibling_scopes_not_sum() {
+    // Two sibling `if` blocks each with a 128-byte string reuse the same
+    // stack, so the peak is 128 + the outer local, not 256 + it.
+    let src = "event E { b: u8 }\nprobe tracepoint(\"syscalls\", \"sys_enter_openat\") {\n    let x = 1;\n    if x == 1 { let a: str<128> = read_user_str(arg(1)); emit E { b: a.byte_at(0) }; }\n    if x == 2 { let b: str<128> = read_user_str(arg(1)); emit E { b: b.byte_at(0) }; }\n}";
+    assert_eq!(ok(src), 136);
+}
+
+#[test]
+fn stack_overflow_is_a_type_error_with_the_numbers() {
+    let src = "event E { b: u8 }\nprobe tracepoint(\"syscalls\", \"sys_enter_openat\") {\n    let a: str<256> = read_user_str(arg(1));\n    let b: str<256> = read_user_str(arg(1));\n    emit E { b: a.byte_at(0) };\n}";
+    let ds = diags(src);
+    assert!(ds[0].message.contains("512 bytes of stack"), "{ds:#?}");
+    assert!(ds[0].message.contains("leaves 472"), "{ds:#?}");
+}
+
+// --------------------------------------------------------- ordinary typing
+
+#[test]
+fn integer_literals_adapt_but_widths_never_convert() {
+    ok(&probe("    let a: u8 = 200;\n    let b = a + 1;\n    emit E { a: 1, b: true };"));
+    let msg = first_message(&probe("    let a: u8 = 300;\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("300 does not fit in `u8`"), "{msg}");
+    let ds = diags(&probe("    let a: u8 = 1;\n    let c = a + ktime();\n    emit E { a: 1, b: true };"));
+    assert!(ds[0].message.contains("mismatched integer widths: `u8` + `u64`"), "{ds:#?}");
+}
+
+#[test]
+fn conditions_must_be_bool() {
+    let msg = first_message(&probe("    if pid() { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`if` condition must be `bool`, found `u32`"), "{msg}");
+    let msg = first_message(&probe("    let x = true && 1;\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`&&` needs `bool` operands, found `{integer}`"), "{msg}");
+}
+
+#[test]
+fn immutability_is_enforced() {
+    let ds = diags(&probe("    let n = 0;\n    n = 1;\n    emit E { a: n, b: true };"));
+    assert!(ds[0].message.contains("cannot assign to `n`: it is not mutable"));
+    assert!(ds[0].help.as_deref().unwrap().contains("let mut n"));
+    ok(&probe("    let mut n = 0;\n    n = 1;\n    emit E { a: n, b: true };"));
+}
+
+#[test]
+fn emit_fields_are_checked_completely() {
+    let msg = first_message(&probe("    emit E { a: 1 };"));
+    assert!(msg.contains("missing field `b`"), "{msg}");
+    let msg = first_message(&probe("    emit E { a: 1, b: true, c: 2 };"));
+    assert!(msg.contains("has no field `c`"), "{msg}");
+    let msg = first_message(&probe("    emit E { a: 1, a: 2, b: true };"));
+    assert!(msg.contains("given twice"), "{msg}");
+    let msg = first_message(&probe("    emit E { a: true, b: true };"));
+    assert!(msg.contains("expected `u64`, found `bool`"), "{msg}");
+    let msg = first_message(&probe("    emit Nope { a: 1 };"));
+    assert!(msg.contains("unknown event `Nope`"), "{msg}");
+}
+
+#[test]
+fn comm_only_as_an_emit_field() {
+    ok("event X { c: str<16> }\nprobe tracepoint(\"syscalls\", \"sys_enter_execve\") { emit X { c: comm() }; }");
+    let msg = first_message(&probe("    let c = comm();\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`comm()` can only be used directly as an `emit` field"), "{msg}");
+    let msg = first_message(&probe("    emit E { a: comm(), b: true };"));
+    assert!(msg.contains("`comm()` is a string; field `a` is `u64`"), "{msg}");
+}
+
+#[test]
+fn builtins_and_args_are_validated() {
+    let msg = first_message(&probe("    let x = nonsense();\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("unknown builtin `nonsense`"), "{msg}");
+    let msg = first_message(&probe("    let x = pid(1);\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("wrong number of arguments to `pid()`"), "{msg}");
+    let msg = first_message(&probe("    let x = arg(6);\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("`arg(6)`: syscall tracepoints have arguments 0 to 5"), "{msg}");
+    ok(&probe("    let x = arg(5);\n    emit E { a: x, b: true };"));
+}
+
+#[test]
+fn unsupported_v1_constructs_have_hints() {
+    let ds = diags(&probe("    let x = pid() as u64;\n    emit E { a: 1, b: true };"));
+    assert!(ds[0].message.contains("`as` casts are not supported"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("let x: u64"));
+    let msg = first_message(&probe("    return 1;"));
+    assert!(msg.contains("bare `return;`"), "{msg}");
+}
+
+#[test]
+fn declarations_are_validated() {
+    let msg = first_message("map m: tree<u32, u64>[8];\nevent E { a: u64 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }");
+    assert!(msg.contains("unknown map kind `tree`"), "{msg}");
+    let msg = first_message("event E { a: u64, a: u8 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }");
+    assert!(msg.contains("duplicate field `a`"), "{msg}");
+    let msg = first_message("const N: u8 = 300;\nevent E { a: u64 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }");
+    assert!(msg.contains("300 does not fit in `u8`"), "{msg}");
+    let msg = first_message("event E { a: u64 }\nprobe kprobe(\"do_sys_open\") { emit E { a: 1 }; }");
+    assert!(msg.contains("unsupported probe kind `kprobe`"), "{msg}");
+    let msg = first_message("event E { a: u64 }");
+    assert!(msg.contains("program has no `probe`"), "{msg}");
+    let msg = first_message("event E { a: u64 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }\nprobe tracepoint(\"s\", \"m\") { emit E { a: 1 }; }");
+    assert!(msg.contains("only one `probe`"), "{msg}");
+}

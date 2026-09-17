@@ -1,0 +1,14 @@
+// error: unknown name `v`
+//
+// The checked pointer only exists inside the `if let` body. Using it
+// afterwards is exactly the pattern the verifier calls "pointer used after
+// its null check went out of scope"; here it is simply not in scope.
+
+map m: hash<u32, u64>[64];
+event E { n: u64 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    if let Some(v) = m.get(pid()) {
+    }
+    emit E { n: *v };
+}

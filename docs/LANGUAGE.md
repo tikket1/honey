@@ -219,31 +219,31 @@ primary      = INT | STR | "true" | "false" | IDENT | "(" expr ")" ;
 Precedence, lowest to highest: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`,
 `&`, `<< >>`, `+ -`, `* / %`, `as`, unary, postfix. Same as Rust.
 
-## 5. Types (draft — stage 4 owns the interesting parts)
+## 5. Types (normative — stage 4)
 
 | Type                    | Notes                                                    |
 |-------------------------|----------------------------------------------------------|
-| `u8 u16 u32 u64`        | Unsigned. BPF registers are 64-bit; narrower = masked.    |
-| `i8 i16 i32 i64`        | Signed.                                                   |
-| `bool`                  | 0 or 1 in a register.                                     |
-| `str<N>`                | Fixed-capacity, NUL-padded byte string on the BPF stack.  |
-| `hash<K, V>`, `array<V>`| Map kinds. Only valid in `map` declarations.              |
-| `Option<&V>`            | Result of `map.get`. Must be matched before use.          |
-| `ptr<T>` *(later)*      | Raw kernel/user pointer; only readable via bounded helpers.|
+| `u8 u16 u32 u64`        | Unsigned. No implicit conversions between widths; an unsuffixed literal adapts to the width it meets and is range-checked. |
+| `bool`                  | Conditions must be `bool`; `&& \|\| !` take `bool`.       |
+| `str<N>`                | Fixed-capacity byte string on the BPF stack, 1 ≤ N ≤ 256. Only `read_user_str` (and `comm()` in an `emit`) can produce one. |
+| `hash<K, V>`, `array<V>`| Map kinds, only in `map` declarations. K and V are integers or bool. |
+| `Option<&V>`            | The result of `map.get`. Not user-writable. Must be matched with `if let Some(v)` / `if let None`. |
+| `&V`                    | A checked pointer, only bound by `if let Some(v)` and only inside that block. `*v` reads it. |
 
-Verifier-safety rules the type checker enforces (this is the research bit):
+Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 
 - **Bounded loops only.** `for i in a..b` requires `a` and `b` to be
-  compile-time constants and `b - a` below a fixed limit. There is no `while`.
-- **Checked map access.** `map.get(k)` returns `Option<&V>`; the only way to
-  read the value is `if let Some(v) = …`. This is exactly the null check the
-  verifier insists on, moved to compile time.
-- **Bounded reads.** `read_user_str(p)` needs a `str<N>` destination, so the
-  bound `N` is always known to the helper call.
-- **Stack budget.** BPF gives 512 bytes of stack. The sum of all locals'
-  sizes in a probe is checked at compile time; exceeding it is a type error.
-- **No pointer arithmetic** in v1. Pointers come from helpers and go to
-  helpers.
+  compile-time constants (literals, `const`s, loop variables, and `+ - * | & <<`
+  over them) with `b - a ≤ 64`. There is no `while`.
+- **Checked map access.** `map.get(k)` is `Option<&V>`; `*` on it is an error,
+  and the `Some(v)` binding does not outlive its `if`.
+- **Bounded reads.** `read_user_str(p)` must initialise `let s: str<N>`;
+  `s.byte_at(i)` needs constant `i < N`; `s.starts_with("...")` needs a literal
+  no longer than `N`.
+- **Stack budget.** Locals are 8 bytes (scalars, pointers) or `N` rounded to 8
+  (`str<N>`), summed along each scope path. Peak + 40 bytes reserve ≤ 512.
+- **No pointer writes** in v1: `*p = v` is rejected, use `map.insert`.
+- **Immutability.** Assignment needs `let mut`.
 
 ## 6. Builtins (draft — stage 3 makes them real)
 
@@ -267,7 +267,7 @@ Verifier-safety rules the type checker enforces (this is the research bit):
 | 1     | Lexer. `cargo test` green in `crates/honeyc`.                           | macOS     |
 | 2     | Parser → AST. Pretty-printer for round-trip tests.                     | macOS     |
 | 3     | Bytecode emitter + disassembler; C loader. Done: all three examples run in-kernel (maps, control flow, arithmetic, bounded `for`, strings, `arg`). | Docker Linux |
-| 4     | Verifier-aware type checker: the rules in §5. Illegal-to-verify = illegal-to-typecheck. | both |
+| 4     | Verifier-aware type checker: the rules in §5. Done: `honeyc check`, all errors at source lines, `examples/bad/` demonstrates each rule. | macOS |
 
 Non-goals for v1: enforcement (LSM), networking (XDP), CO-RE/BTF relocation,
 anything that needs a heap.

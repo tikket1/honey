@@ -1,0 +1,9 @@
+// error: cannot assign to `n`: it is not mutable
+
+event E { n: u64 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let n = 0;
+    n = n + 1;
+    emit E { n: n };
+}

@@ -1,0 +1,10 @@
+// error: `emit Exec` is missing field `comm`
+//
+// Every field of an event must be set: the loader decodes the record by
+// the event's layout, and an unset field would be uninitialised stack.
+
+event Exec { pid: u32, comm: str<16> }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    emit Exec { pid: pid() };
+}

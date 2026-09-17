@@ -1,0 +1,13 @@
+// error: unknown name `nope`
+//
+// honey reports every error in the file, not just the first.
+
+map m: hash<u32, u64>[8];
+event E { a: u64, b: bool }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let p = m.get(pid());
+    let x = *p;
+    let y = nope;
+    emit E { a: x, b: 7 };
+}

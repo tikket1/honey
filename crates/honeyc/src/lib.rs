@@ -9,7 +9,8 @@
 //! - `pretty`  : AST → text, for debugging and round-trip tests
 //! - `bpf`     : eBPF instruction encoding + disassembly (the machine)
 //! - `layout`  : event record byte layout
-//! - `codegen` : stage 3, AST → BPF bytecode (first slice)
+//! - `typeck`  : stage 4, the verifier-aware type checker (runs before codegen)
+//! - `codegen` : stage 3, AST → BPF bytecode
 
 pub mod ast;
 pub mod bpf;
@@ -19,3 +20,4 @@ pub mod lexer;
 pub mod parser;
 pub mod pretty;
 pub mod token;
+pub mod typeck;

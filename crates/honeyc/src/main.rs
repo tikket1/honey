@@ -1,9 +1,10 @@
 //! honeyc command line.
 //!
 //!   honeyc <file.hny>                 parse and pretty-print
+//!   honeyc check <file.hny>           type-check only (verifier rules, at your source line)
 //!   honeyc --tokens <file.hny>        dump the token stream
-//!   honeyc --asm <file.hny>           compile and show BPF assembly
-//!   honeyc build <file.hny> -o <out>  write <out>.bin (bytecode) + <out>.json (manifest)
+//!   honeyc --asm <file.hny>           check, compile, and show BPF assembly
+//!   honeyc build <file.hny> -o <out>  check, compile, write <out>.bin + <out>.json
 
 use std::{env, fs, process};
 
@@ -16,11 +17,13 @@ fn main() {
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
     let code = match strs.as_slice() {
         ["--tokens", path] => cmd_tokens(path),
+        ["check", path] => cmd_check(path),
         ["--asm", path] => cmd_asm(path),
         ["build", path, "-o", out] => cmd_build(path, out),
         [path] if !path.starts_with('-') => cmd_pretty(path),
         _ => {
             eprintln!("usage: honeyc [--tokens|--asm] <file.hny>");
+            eprintln!("       honeyc check <file.hny>");
             eprintln!("       honeyc build <file.hny> -o <out>");
             2
         }
@@ -68,6 +71,27 @@ fn cmd_pretty(path: &str) -> i32 {
     }
 }
 
+fn cmd_check(path: &str) -> i32 {
+    let src = read(path);
+    let program = match honeyc::parser::parse(&src) {
+        Ok(p) => p,
+        Err(e) => {
+            report(path, &src, e.span().start, &e.message());
+            return 1;
+        }
+    };
+    match honeyc::typeck::check(&program) {
+        Ok(ok) => {
+            eprintln!("{path}: ok ({} bytes of stack)", ok.stack_bytes);
+            0
+        }
+        Err(diags) => {
+            report_diags(path, &src, &diags);
+            1
+        }
+    }
+}
+
 fn cmd_asm(path: &str) -> i32 {
     let src = read(path);
     match compile(path, &src) {
@@ -102,7 +126,7 @@ fn cmd_build(path: &str, out: &str) -> i32 {
     0
 }
 
-/// Lex, parse, and run codegen; report errors against the source.
+/// Lex, parse, type-check, and run codegen; report errors against the source.
 fn compile(path: &str, src: &str) -> Option<Compiled> {
     let program = match honeyc::parser::parse(src) {
         Ok(p) => p,
@@ -111,6 +135,10 @@ fn compile(path: &str, src: &str) -> Option<Compiled> {
             return None;
         }
     };
+    if let Err(diags) = honeyc::typeck::check(&program) {
+        report_diags(path, src, &diags);
+        return None;
+    }
     match codegen::compile(&program) {
         Ok(c) => Some(c),
         Err(msg) => {
@@ -195,6 +223,16 @@ fn jstr(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn report_diags(path: &str, src: &str, diags: &[honeyc::typeck::Diag]) {
+    for d in diags {
+        report(path, src, d.span.start, &d.message);
+        if let Some(h) = &d.help {
+            eprintln!("    help: {h}");
+        }
+    }
+    eprintln!("{path}: {} error{}", diags.len(), if diags.len() == 1 { "" } else { "s" });
 }
 
 /// Print `path:line:col: error: message` plus the offending source line.

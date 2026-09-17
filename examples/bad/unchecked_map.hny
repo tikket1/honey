@@ -1,0 +1,14 @@
+// error: cannot dereference `Option<&u64>`
+//
+// In C this loads fine and the verifier rejects it with
+// "R0 invalid mem access 'map_value_or_null'" at some instruction number.
+// honey refuses at the `*prev` and tells you how to fix it.
+
+map execs: hash<u32, u64>[1024];
+event Burst { uid: u32, count: u64 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let prev = execs.get(uid());
+    let n = *prev + 1;
+    emit Burst { uid: uid(), count: n };
+}

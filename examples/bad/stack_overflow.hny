@@ -1,0 +1,13 @@
+// error: probe needs 512 bytes of stack for its locals; the BPF limit leaves 472
+//
+// The BPF stack is 512 bytes. Two 256-byte buffers already exceed what is
+// left after the compiler's own bookkeeping. The verifier would say
+// "invalid write to stack R10 off=-520"; honey says it at the declaration.
+
+event Open { a: str<256>, b: str<256> }
+
+probe tracepoint("syscalls", "sys_enter_openat") {
+    let a: str<256> = read_user_str(arg(1));
+    let b: str<256> = read_user_str(arg(1));
+    emit Open { a: a, b: b };
+}
