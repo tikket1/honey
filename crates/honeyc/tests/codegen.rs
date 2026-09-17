@@ -528,3 +528,27 @@ fn exec_shell_example_compiles() {
     let c = compile(&prog, Arch::Aarch64).unwrap();
     assert_eq!(c.events[0].name, "Shell");
 }
+
+// ------------------------------------------------------------ usdt & ipv4
+
+#[test]
+fn usdt_program_kind() {
+    let src = "event E { p: u32 } probe usdt(\"/work/linux/usdt_demo:honey:tick\") { emit E { p: pid() }; }";
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert!(matches!(&c.programs[0].kind, honeyc::codegen::ProbeKind::Usdt { target } if target.ends_with(":honey:tick")));
+    assert_eq!(c.programs[0].name, "usdt:/work/linux/usdt_demo:honey:tick");
+}
+
+#[test]
+fn ipv4_field_is_four_bytes_stored_as_a_word() {
+    let src = "event E { src: ipv4, ttl: u8 } probe xdp(\"lo\") { emit E { src: pkt.u32(26), ttl: pkt.u8(22) }; }";
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    let f = &c.events[0].fields[0];
+    assert_eq!(f.kind, honeyc::layout::FieldKind::Ipv4);
+    assert_eq!((f.offset, f.size), (0, 4));
+    assert_eq!(c.events[0].size, 8, "ipv4@0 (4) + ttl@4 (1) rounds to 8");
+    let text = disasm_bytes(&c.programs[0].bytecode);
+    assert!(text.contains("stx32 [r6 +8], r0"), "ipv4 stored as a 32-bit word past the header\n{text}");
+}

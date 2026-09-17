@@ -12,9 +12,10 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 }
 ```
 
-Status: **v1 pipeline complete: tracepoints, kprobes (with kernel struct-field
-reads), uprobes, LSM enforcement, XDP packet filtering, sampling, multi-probe
-programs, and JSON output.** Every example
+Status: **v1 complete: tracepoints, kprobes (with kernel struct-field reads),
+uprobes and USDT markers, LSM enforcement, XDP packet filtering, sampling,
+string equality, multi-probe programs, and JSON output with typed fields
+(`ipv4` prints as a dotted quad).** Every example
 compiles to eBPF bytecode the kernel verifier accepts and the loader prints live
 events (text, or `--json` for a log pipeline). The stage 4 type checker turns every verifier rule into an error
 at your source line; `examples/bad/` holds one program per rule, each rejected with a
@@ -65,11 +66,12 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (40)
-  tests/typeck.rs    stage 4 acceptance tests (51)
+  tests/codegen.rs   stage 3 acceptance tests (42)
+  tests/typeck.rs    stage 4 acceptance tests (53)
   tests/kernel_fields.rs  struct-field read tests (10, synthetic BTF)
 linux/               the Linux side (build + run against a real kernel)
-  loader.c           loads bytecode, attaches to a tracepoint, reads events
+  loader.c           loads bytecode, attaches (tracepoint/kprobe/uprobe/usdt/lsm/xdp), reads events
+  usdt_demo.c        a program with a USDT marker + semaphore, for the usdt example
   honey-linux        run a command in the Docker Linux environment
   run.sh             build the loader, then load + run a compiled program
 docs/LANGUAGE.md     language reference (§3 is normative for stage 1)
@@ -81,7 +83,7 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 214 tests
+cargo test                                  # 218 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
@@ -100,7 +102,7 @@ linux/honey-linux ./linux/run.sh --json build/fop.bin build/fop.json
 # packets: drop ICMP on loopback and watch ping fail
 cargo run -- build examples/icmp_drop.hny -o build/icmp
 linux/honey-linux ./linux/run.sh --json build/icmp.bin build/icmp.json
-#   -> {"event":"Dropped","src":2130706433,"dst":2130706433,"ttl":64}
+#   -> {"event":"Dropped","src":"127.0.0.1","dst":"127.0.0.1","ttl":64}
 
 # userspace: trace env-var lookups via a uprobe on libc getenv
 cargo run -- build examples/getenv_trace.hny -o build/getenv
@@ -123,8 +125,8 @@ buffers.
    budget, bounded reads: illegal-to-verify becomes illegal-to-typecheck.
 
 All four stages are in place, plus kprobes/kretprobes and multi-probe programs.
-What comes next is polish (USDT probes, IP address formatting in the loader)
-on the same skeleton.
+The v1 feature list is done. Natural next steps: USDT argument access, IPv6
+and MAC field types, and a `honey run` one-shot command that builds and loads.
 
 ## Prior art
 

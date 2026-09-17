@@ -17,8 +17,8 @@
 //   ... then `ping 127.0.0.1` in the environment gets 100% loss.
 
 event Dropped {
-    src: u32,
-    dst: u32,
+    src: ipv4,   // printed as a dotted quad
+    dst: ipv4,
     ttl: u8,
 }
 

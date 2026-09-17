@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zlib1g-dev \
         iputils-ping \
         iproute2 \
+        systemtap-sdt-dev \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

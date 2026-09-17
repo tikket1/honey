@@ -104,6 +104,8 @@ pub enum ProbeKind {
     Uprobe { target: String },
     /// A uretprobe on a userspace function return (`path:symbol`).
     Uretprobe { target: String },
+    /// A USDT marker in a user binary (`path:provider:name`).
+    Usdt { target: String },
 }
 
 const XDP_DROP: i32 = 1;
@@ -193,6 +195,7 @@ impl Ty {
             ("u32", []) => Ok(Ty::Uint(4)),
             ("u64", []) => Ok(Ty::Uint(8)),
             ("i64", []) => Ok(Ty::I64),
+            ("ipv4", []) => Ok(Ty::Uint(4)),
             ("bool", []) => Ok(Ty::Bool),
             ("ptr", [TypeArg::Type(inner)]) => Ok(Ty::KPtr(inner.name.name.clone())),
             (other, _) => Err(format!("type `{other}` is not supported in codegen")),
@@ -327,6 +330,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ("xdp", [i]) => ProbeKind::Xdp { interface: i.clone() },
             ("uprobe", [t]) => ProbeKind::Uprobe { target: t.clone() },
             ("uretprobe", [t]) => ProbeKind::Uretprobe { target: t.clone() },
+            ("usdt", [t]) => ProbeKind::Usdt { target: t.clone() },
             (k, a) => return Err(format!("probe `{k}` with {} argument(s) is not supported", a.len())),
         };
         let name = match &kind {
@@ -337,6 +341,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
             ProbeKind::Xdp { interface } => format!("xdp:{interface}"),
             ProbeKind::Uprobe { target } => format!("uprobe:{target}"),
             ProbeKind::Uretprobe { target } => format!("uretprobe:{target}"),
+            ProbeKind::Usdt { target } => format!("usdt:{target}"),
         };
         let (bytecode, stack_bytes, relocs) = compile_probe(&sh, &kind, p, &mut sample_next)?;
         programs.push(CompiledProbe { name, kind, bytecode, stack_bytes, relocs });
@@ -976,6 +981,7 @@ impl Cg<'_> {
             }
             let size = match fl.kind {
                 FieldKind::Uint(w) | FieldKind::Sint(w) => Ty::Uint(w).mem_size(),
+                FieldKind::Ipv4 => Size::W,
                 FieldKind::Bool => Size::B,
                 FieldKind::Str(_) => unreachable!(),
             };
@@ -1351,6 +1357,9 @@ impl Cg<'_> {
                     }
                     ProbeKind::Xdp { .. } => {
                         return Err("`arg()` is not available in an xdp probe".into());
+                    }
+                    ProbeKind::Usdt { .. } => {
+                        return Err("`arg()` is not available in a usdt probe yet".into());
                     }
                 };
                 self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot));

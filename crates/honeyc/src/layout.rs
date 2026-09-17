@@ -31,6 +31,8 @@ pub enum FieldKind {
     Uint(u32),
     /// A signed integer of the given byte width (8).
     Sint(u32),
+    /// A 4-byte IPv4 address in host order; the loader prints a dotted quad.
+    Ipv4,
     /// A fixed-capacity string of `N` bytes.
     Str(u32),
     Bool,
@@ -40,6 +42,7 @@ impl FieldKind {
     fn align(&self) -> u32 {
         match self {
             FieldKind::Uint(w) | FieldKind::Sint(w) => *w,
+            FieldKind::Ipv4 => 4,
             FieldKind::Str(_) => 1,
             FieldKind::Bool => 1,
         }
@@ -48,6 +51,7 @@ impl FieldKind {
     fn size(&self) -> u32 {
         match self {
             FieldKind::Uint(w) | FieldKind::Sint(w) => *w,
+            FieldKind::Ipv4 => 4,
             FieldKind::Str(n) => *n,
             FieldKind::Bool => 1,
         }
@@ -83,6 +87,7 @@ fn field_kind(name: &str, args: &[TypeArg]) -> Option<FieldKind> {
         "u32" => Some(FieldKind::Uint(4)),
         "u64" => Some(FieldKind::Uint(8)),
         "i64" => Some(FieldKind::Sint(8)),
+        "ipv4" => Some(FieldKind::Ipv4),
         "bool" => Some(FieldKind::Bool),
         "str" => match args {
             [TypeArg::Int(n)] => Some(FieldKind::Str(*n as u32)),

@@ -1,0 +1,7 @@
+// error: usdt target must be `path:provider:name`
+
+event E { p: u32 }
+
+probe usdt("/usr/bin/python3:function__entry") {
+    emit E { p: pid() };
+}

@@ -110,6 +110,21 @@ symbol and converting the symbol's virtual address to a file offset via the
 containing `PT_LOAD` segment. `arg(n)` reads `pt_regs` like a kprobe, and
 because the arguments are user pointers, `read_user_str` works on them.
 
+### USDT markers
+
+A `usdt` probe is a uprobe at a marker address the loader reads from the
+binary's `.note.stapsdt` notes (libelf `gelf_getnote`): each note carries the
+marker's address, the link-time address of `.stapsdt.base` (if that section
+moved, the marker moved by the same amount), an optional semaphore address,
+and `provider\0name\0args\0`. Addresses are converted to file offsets via
+`PT_LOAD`. When there is a semaphore, its file offset goes into the perf
+attr's `config` bits 32..63 (`ref_ctr_offset`) and the kernel increments the
+counter in every process running the binary while the probe is attached —
+`linux/usdt_demo.c` prints "probe enabled" exactly then.
+
+The loader prints `ipv4` fields as dotted quads; honey byte-swapped the value
+on read, so the high byte is the first octet.
+
 ### Sampling
 
 `sample(N)` compiles to a lookup-increment-modulo against a hidden

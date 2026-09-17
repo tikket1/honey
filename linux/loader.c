@@ -91,7 +91,7 @@ static long json_int_in(const char *from, const char *limit, const char *key, lo
 
 // ------------------------------------------------------------- data model
 
-enum kind { K_UINT, K_INT, K_STR, K_BOOL };
+enum kind { K_UINT, K_INT, K_STR, K_BOOL, K_IPV4 };
 
 struct field {
     char name[32];
@@ -295,6 +295,120 @@ static int attach_uprobe(const char *target, int retprobe, int prog_fd) {
     return pfd;
 }
 
+// USDT (user statically-defined tracing) markers are recorded in the ELF
+// `.note.stapsdt` section: one note per marker with the marker's address, the
+// address of `.stapsdt.base` at link time (so we can correct for prelinking),
+// an optional semaphore address, and "provider\0name\0args\0". Attaching is
+// a uprobe at the marker's file offset; if there is a semaphore, the kernel
+// increments it in the process while the probe is attached ("ref_ctr"), which
+// is how the program knows to prepare the marker's arguments.
+struct usdt_note {
+    uint64_t pc, base, sema;
+};
+
+static int elf_find_usdt(const char *path, const char *provider, const char *name, struct usdt_note *out) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "usdt: cannot open %s: %s\n", path, strerror(errno)); return -1; }
+    if (elf_version(EV_CURRENT) == EV_NONE) { close(fd); return -1; }
+    Elf *e = elf_begin(fd, ELF_C_READ, NULL);
+    if (!e) { close(fd); return -1; }
+    size_t shstrndx = 0;
+    elf_getshdrstrndx(e, &shstrndx);
+
+    int found = 0;
+    uint64_t base_sec_addr = 0;
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(e, scn)) != NULL) {
+        GElf_Shdr sh;
+        if (!gelf_getshdr(scn, &sh)) continue;
+        const char *sname = elf_strptr(e, shstrndx, sh.sh_name);
+        if (sname && strcmp(sname, ".stapsdt.base") == 0) base_sec_addr = sh.sh_addr;
+        if (sh.sh_type != SHT_NOTE || !sname || strcmp(sname, ".note.stapsdt") != 0) continue;
+        Elf_Data *data = elf_getdata(scn, NULL);
+        if (!data) continue;
+        size_t off = 0, name_off, desc_off;
+        GElf_Nhdr nh;
+        while (!found && (off = gelf_getnote(data, off, &nh, &name_off, &desc_off)) > 0) {
+            if (nh.n_type != 3 || strcmp((char *)data->d_buf + name_off, "stapsdt") != 0) continue;
+            const uint8_t *d = (const uint8_t *)data->d_buf + desc_off;
+            if (nh.n_descsz < 24) continue;
+            struct usdt_note n = {0};
+            memcpy(&n.pc, d, 8); memcpy(&n.base, d + 8, 8); memcpy(&n.sema, d + 16, 8);
+            const char *prov = (const char *)d + 24;
+            const char *nm = prov + strlen(prov) + 1;
+            if (strcmp(prov, provider) == 0 && strcmp(nm, name) == 0) { *out = n; found = 1; }
+        }
+    }
+    // Prelink correction: if .stapsdt.base moved, the marker moved with it.
+    if (found && base_sec_addr && out->base && base_sec_addr != out->base) {
+        out->pc += base_sec_addr - out->base;
+        if (out->sema) out->sema += base_sec_addr - out->base;
+    }
+    elf_end(e);
+    close(fd);
+    if (!found) fprintf(stderr, "usdt: no marker `%s:%s` in %s (readelf -n shows its stapsdt notes)\n", provider, name, path);
+    return found ? 0 : -1;
+}
+
+static long elf_vaddr_to_offset(const char *path, uint64_t vaddr) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    Elf *e = elf_begin(fd, ELF_C_READ, NULL);
+    long off = -1;
+    size_t phnum = 0;
+    if (e && elf_getphdrnum(e, &phnum) == 0) {
+        for (size_t i = 0; i < phnum; i++) {
+            GElf_Phdr ph;
+            if (gelf_getphdr(e, i, &ph) && ph.p_type == PT_LOAD
+                && vaddr >= ph.p_vaddr && vaddr < ph.p_vaddr + ph.p_memsz) {
+                off = (long)(vaddr - ph.p_vaddr + ph.p_offset);
+                break;
+            }
+        }
+    }
+    if (e) elf_end(e);
+    close(fd);
+    return off;
+}
+
+static int attach_usdt(const char *target, int prog_fd) {
+    // target is "path:provider:name"
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", target);
+    char *name = strrchr(buf, ':');
+    if (!name) { fprintf(stderr, "usdt: target must be path:provider:name\n"); return -1; }
+    *name++ = 0;
+    char *provider = strrchr(buf, ':');
+    if (!provider) { fprintf(stderr, "usdt: target must be path:provider:name\n"); return -1; }
+    *provider++ = 0;
+    const char *path = buf;
+
+    struct usdt_note n = {0};
+    if (elf_find_usdt(path, provider, name, &n) < 0) return -1;
+    long pc_off = elf_vaddr_to_offset(path, n.pc);
+    if (pc_off < 0) { fprintf(stderr, "usdt: marker address %#llx is not in a loadable segment\n", (unsigned long long)n.pc); return -1; }
+    long sema_off = n.sema ? elf_vaddr_to_offset(path, n.sema) : 0;
+
+    int pmu = uprobe_pmu_type();
+    if (pmu < 0) { fprintf(stderr, "kernel has no uprobe perf PMU\n"); return -1; }
+    struct perf_event_attr attr = {0};
+    attr.type = pmu;
+    attr.size = sizeof(attr);
+    attr.config1 = (uint64_t)(uintptr_t)path;
+    attr.config2 = (uint64_t)pc_off;
+    // ref_ctr_offset: the semaphore's file offset, in config bits 32..63.
+    if (sema_off > 0) attr.config |= ((uint64_t)sema_off) << 32;
+    attr.sample_period = 1;
+    attr.wakeup_events = 1;
+    int pfd = perf_open(&attr);
+    if (pfd < 0) { fprintf(stderr, "perf_event_open(usdt %s:%s:%s @ %#lx): %s\n", path, provider, name, pc_off, strerror(errno)); return -1; }
+    if (ioctl(pfd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) { perror("SET_BPF"); return -1; }
+    if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) < 0) { perror("ENABLE"); return -1; }
+    fprintf(stderr, "  resolved %s:%s:%s -> marker offset %#lx%s\n", path, provider, name, pc_off,
+            sema_off > 0 ? " (with semaphore)" : "");
+    return pfd;
+}
+
 // XDP programs attach to a network interface, not to a perf event, and they
 // stay attached after the loader exits unless detached. Generic ("skb") mode
 // works on any device, including veth and loopback, at the cost of running
@@ -396,6 +510,12 @@ static int on_event(void *vctx, void *data, size_t len) {
             case K_UINT: { uint64_t v = 0; memcpy(&v, p, f->size); printf("%llu", (unsigned long long)v); break; }
             case K_INT:  { int64_t v = 0; memcpy(&v, p, f->size); if (f->size == 4) v = (int32_t)v; printf("%lld", (long long)v); break; }
             case K_BOOL: printf("%s", *p ? "true" : "false"); break;
+            case K_IPV4: {
+                // host-order u32 (honey byte-swapped it on read): first octet is the high byte
+                uint32_t v = 0; memcpy(&v, p, 4);
+                printf("\"%u.%u.%u.%u\"", (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255);
+                break;
+            }
             case K_STR:
                 putchar('"');
                 for (uint32_t j = 0; j < f->size && p[j]; j++) {
@@ -424,6 +544,8 @@ static int on_event(void *vctx, void *data, size_t len) {
         case K_UINT: { uint64_t v = 0; memcpy(&v, p, f->size); printf("%llu", (unsigned long long)v); break; }
         case K_INT:  { int64_t v = 0; memcpy(&v, p, f->size); if (f->size == 4) v = (int32_t)v; printf("%lld", (long long)v); break; }
         case K_BOOL: printf("%s", *p ? "true" : "false"); break;
+        case K_IPV4: { uint32_t v = 0; memcpy(&v, p, 4);
+                       printf("%u.%u.%u.%u", (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255); break; }
         case K_STR:  printf("%.*s", (int)f->size, (const char *)p); break;
         }
     }
@@ -560,7 +682,8 @@ int main(int argc, char **argv) {
             json_str_in(fp, limit, "kind", kind, sizeof kind);
             f->kind = strcmp(kind, "str") == 0 ? K_STR
                     : strcmp(kind, "bool") == 0 ? K_BOOL
-                    : strcmp(kind, "int") == 0 ? K_INT : K_UINT;
+                    : strcmp(kind, "int") == 0 ? K_INT
+                    : strcmp(kind, "ipv4") == 0 ? K_IPV4 : K_UINT;
             ev->n_fields++;
             fp = strstr(after, "\"name\":");
         }
@@ -647,7 +770,8 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        int is_uprobe = strcmp(pr->type, "uprobe") == 0 || strcmp(pr->type, "uretprobe") == 0;
+        int is_usdt = strcmp(pr->type, "usdt") == 0;
+        int is_uprobe = strcmp(pr->type, "uprobe") == 0 || strcmp(pr->type, "uretprobe") == 0 || is_usdt;
         int is_kprobe = strcmp(pr->type, "kprobe") == 0 || strcmp(pr->type, "kretprobe") == 0;
         // uprobe/kprobe programs share BPF_PROG_TYPE_KPROBE.
         enum bpf_prog_type pt = (is_kprobe || is_uprobe) ? BPF_PROG_TYPE_KPROBE : BPF_PROG_TYPE_TRACEPOINT;
@@ -660,7 +784,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         int pfd;
-        if (is_uprobe)
+        if (is_usdt)
+            pfd = attach_usdt(pr->target, prog_fd);
+        else if (is_uprobe)
             pfd = attach_uprobe(pr->target, strcmp(pr->type, "uretprobe") == 0, prog_fd);
         else if (is_kprobe)
             pfd = attach_kprobe(pr->function, strcmp(pr->type, "kretprobe") == 0, prog_fd);

@@ -67,6 +67,9 @@ impl Ty {
             ("u32", []) => Ok(Ty::U32),
             ("u64", []) => Ok(Ty::U64),
             ("i64", []) => Ok(Ty::I64),
+            // An IPv4 address is a u32 to the type system; the loader prints it
+            // as a dotted quad.
+            ("ipv4", []) => Ok(Ty::U32),
             ("bool", []) => Ok(Ty::Bool),
             ("str", [TypeArg::Int(n)]) => {
                 if *n == 0 || *n > 256 {
@@ -165,6 +168,8 @@ enum ProbeKind {
     Uprobe,
     /// A uretprobe on a userspace function return.
     Uretprobe,
+    /// A USDT marker (`provider:name`) compiled into a user binary.
+    Usdt,
 }
 
 // ----------------------------------------------------------------- checker
@@ -389,6 +394,11 @@ impl Checker<'_> {
                 self.error(p.span, format!("`{}` takes one string argument: `\"/path/to/binary:symbol\"`", p.kind.name));
                 None
             }
+            ("usdt", 1) => Some(ProbeKind::Usdt),
+            ("usdt", _) => {
+                self.error(p.span, "`usdt` takes one string argument: `\"/path/to/binary:provider:name\"`");
+                None
+            }
             ("xdp", _) => {
                 self.error(p.span, "`xdp` takes one string argument: the interface name, e.g. `xdp(\"eth0\")`");
                 None
@@ -405,7 +415,7 @@ impl Checker<'_> {
                 self.error_help(
                     p.kind.span,
                     format!("unsupported probe kind `{other}`"),
-                    "use `tracepoint`, `kprobe`, `kretprobe`, `lsm`, `xdp`, `uprobe`, or `uretprobe`",
+                    "use `tracepoint`, `kprobe`, `kretprobe`, `lsm`, `xdp`, `uprobe`, `uretprobe`, or `usdt`",
                 );
                 None
             }
@@ -421,6 +431,16 @@ impl Checker<'_> {
                 p.span,
                 "uprobe target must be `path:symbol`",
                 "for example `uprobe(\"/lib/x86_64-linux-gnu/libc.so.6:getenv\")`",
+            );
+        }
+        if kind == Some(ProbeKind::Usdt)
+            && let [target] = p.args.as_slice()
+            && target.matches(':').count() < 2
+        {
+            self.error_help(
+                p.span,
+                "usdt target must be `path:provider:name`",
+                "for example `usdt(\"/usr/bin/python3:python:function__entry\")`",
             );
         }
         self.probe_kind = kind;
@@ -999,6 +1019,13 @@ impl Checker<'_> {
                 Ty::Str(16)
             }
             ("arg", [idx]) => {
+                if self.probe_kind == Some(ProbeKind::Usdt) {
+                    self.error_help(
+                        span,
+                        "`arg()` is not available in a `usdt` probe yet",
+                        "USDT arguments live in registers or stack slots described per probe; honey v1 gives you the marker plus process context (`pid()`, `comm()`, `sample()`)",
+                    );
+                }
                 if matches!(self.probe_kind, Some(ProbeKind::Kretprobe) | Some(ProbeKind::Uretprobe)) {
                     self.error_help(
                         span,

@@ -316,8 +316,8 @@ fn declarations_are_validated() {
     assert!(msg.contains("duplicate field `a`"), "{msg}");
     let msg = first_message("const N: u8 = 300;\nevent E { a: u64 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }");
     assert!(msg.contains("300 does not fit in `u8`"), "{msg}");
-    let msg = first_message("event E { a: u64 }\nprobe usdt(\"/bin/sh\") { emit E { a: 1 }; }");
-    assert!(msg.contains("unsupported probe kind `usdt`"), "{msg}");
+    let msg = first_message("event E { a: u64 }\nprobe perf(\"cycles\") { emit E { a: 1 }; }");
+    assert!(msg.contains("unsupported probe kind `perf`"), "{msg}");
     let msg = first_message("event E { a: u64 }\nprobe kprobe(\"a\", \"b\") { emit E { a: 1 }; }");
     assert!(msg.contains("`kprobe` takes one string argument"), "{msg}");
     let msg = first_message("event E { a: u64 }");
@@ -532,4 +532,28 @@ fn string_vs_non_string_is_an_error() {
     assert!(msg.contains("cannot compare a string literal with `u32`"), "{msg}");
     let msg = first_message(&with_path("    if \"a\" == \"a\" { }\n    emit E { a: 1, b: true };"));
     assert!(msg.contains("two string literals"), "{msg}");
+}
+
+// ------------------------------------------------------------ usdt & ipv4
+
+#[test]
+fn usdt_target_shape_and_context() {
+    ok("event E { p: u32, c: str<16> } probe usdt(\"/usr/bin/python3:python:function__entry\") { emit E { p: pid(), c: comm() }; }");
+    let msg = first_message("event E { p: u32 } probe usdt(\"/usr/bin/python3:function__entry\") { emit E { p: pid() }; }");
+    assert!(msg.contains("usdt target must be `path:provider:name`"), "{msg}");
+    let ds = diags("event E { a: u64 } probe usdt(\"/b:p:n\") { emit E { a: arg(0) }; }");
+    assert!(ds[0].message.contains("`arg()` is not available in a `usdt` probe yet"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("process context"));
+    ok("event E { p: u32 } probe usdt(\"/b:p:n\") { if sample(10) { emit E { p: pid() }; } }");
+}
+
+#[test]
+fn ipv4_is_a_u32_to_the_type_system() {
+    // pkt.u32 (u32) fits an ipv4 field; a u16 does not; a literal adapts.
+    ok("event E { src: ipv4 } probe xdp(\"lo\") { emit E { src: pkt.u32(26) }; }");
+    ok("event E { src: ipv4 } probe xdp(\"lo\") { emit E { src: 2130706433 }; }");
+    let msg = first_message("event E { src: ipv4 } probe xdp(\"lo\") { emit E { src: pkt.u16(12) }; }");
+    assert!(msg.contains("expected `u32`, found `u16`"), "{msg}");
+    // usable as a map value and a local type too
+    ok("map seen: hash<u32, ipv4>[8]\nevent E { a: u32 } probe xdp(\"lo\") { let ip: ipv4 = pkt.u32(26); seen.insert(1, ip); emit E { a: 1 }; }".replace("[8]\n", "[8];\n").as_str());
 }

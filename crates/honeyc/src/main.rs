@@ -256,6 +256,7 @@ fn manifest(c: &Compiled) -> String {
             let (kind, extra) = match &f.kind {
                 FieldKind::Uint(w) => ("uint", format!("\"width\": {w}")),
                 FieldKind::Sint(w) => ("int", format!("\"width\": {w}")),
+                FieldKind::Ipv4 => ("ipv4", "\"width\": 4".to_string()),
                 FieldKind::Str(n) => ("str", format!("\"cap\": {n}")),
                 FieldKind::Bool => ("bool", "\"width\": 1".to_string()),
             };
@@ -284,6 +285,7 @@ fn manifest(c: &Compiled) -> String {
             ProbeKind::Xdp { interface } => format!("\"type\": \"xdp\", \"interface\": {}", jstr(interface)),
             ProbeKind::Uprobe { target } => format!("\"type\": \"uprobe\", \"target\": {}", jstr(target)),
             ProbeKind::Uretprobe { target } => format!("\"type\": \"uretprobe\", \"target\": {}", jstr(target)),
+            ProbeKind::Usdt { target } => format!("\"type\": \"usdt\", \"target\": {}", jstr(target)),
         };
         let comma = if i + 1 < c.programs.len() { "," } else { "" };
         let mut relocs = String::from("[");
