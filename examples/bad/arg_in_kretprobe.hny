@@ -1,0 +1,11 @@
+// error: `arg()` is not available in a `kretprobe`
+//
+// By the time a function returns, its argument registers have been reused.
+// Reading them at return is the classic silent bug in kretprobe code; honey
+// rejects it and points at the kprobe + shared map pattern instead.
+
+event E { p: u64 }
+
+probe kretprobe("do_sys_openat2") {
+    emit E { p: arg(1) };
+}

@@ -5,26 +5,45 @@
 //!   honeyc --tokens <file.hny>        dump the token stream
 //!   honeyc --asm <file.hny>           check, compile, and show BPF assembly
 //!   honeyc build <file.hny> -o <out>  check, compile, write <out>.bin + <out>.json
+//!
+//! `--arch aarch64|x86_64` (default aarch64) selects the kprobe register
+//! layout; it must match the kernel the loader runs on.
 
 use std::{env, fs, process};
 
 use honeyc::bpf;
-use honeyc::codegen::{self, Compiled, MapKind};
+use honeyc::codegen::{self, Arch, Compiled, MapKind, ProbeKind};
 use honeyc::layout::FieldKind;
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    // Pull out `--arch X` wherever it appears.
+    let mut arch = Arch::Aarch64;
+    if let Some(i) = args.iter().position(|a| a == "--arch") {
+        let Some(name) = args.get(i + 1) else {
+            eprintln!("--arch needs a value: aarch64 or x86_64");
+            process::exit(2);
+        };
+        match Arch::parse(name) {
+            Some(a) => arch = a,
+            None => {
+                eprintln!("unknown arch `{name}`: use aarch64 or x86_64");
+                process::exit(2);
+            }
+        }
+        args.drain(i..i + 2);
+    }
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
     let code = match strs.as_slice() {
         ["--tokens", path] => cmd_tokens(path),
         ["check", path] => cmd_check(path),
-        ["--asm", path] => cmd_asm(path),
-        ["build", path, "-o", out] => cmd_build(path, out),
+        ["--asm", path] => cmd_asm(path, arch),
+        ["build", path, "-o", out] => cmd_build(path, out, arch),
         [path] if !path.starts_with('-') => cmd_pretty(path),
         _ => {
-            eprintln!("usage: honeyc [--tokens|--asm] <file.hny>");
+            eprintln!("usage: honeyc [--tokens|--asm] <file.hny> [--arch aarch64|x86_64]");
             eprintln!("       honeyc check <file.hny>");
-            eprintln!("       honeyc build <file.hny> -o <out>");
+            eprintln!("       honeyc build <file.hny> -o <out> [--arch aarch64|x86_64]");
             2
         }
     };
@@ -92,25 +111,35 @@ fn cmd_check(path: &str) -> i32 {
     }
 }
 
-fn cmd_asm(path: &str) -> i32 {
+fn cmd_asm(path: &str, arch: Arch) -> i32 {
     let src = read(path);
-    match compile(path, &src) {
+    match compile(path, &src, arch) {
         Some(c) => {
-            let insns = decode_all(&c.bytecode);
-            print!("{}", bpf::disasm_prog(&insns));
+            for (i, p) in c.programs.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                println!("; {} ({} bytes stack)", p.name, p.stack_bytes);
+                print!("{}", bpf::disasm_prog(&decode_all(&p.bytecode)));
+            }
             0
         }
         None => 1,
     }
 }
 
-fn cmd_build(path: &str, out: &str) -> i32 {
+fn cmd_build(path: &str, out: &str, arch: Arch) -> i32 {
     let src = read(path);
-    let Some(c) = compile(path, &src) else { return 1 };
+    let Some(c) = compile(path, &src, arch) else { return 1 };
 
+    // All programs concatenated; the manifest records each one's offset.
+    let mut bin_bytes = Vec::new();
+    for p in &c.programs {
+        bin_bytes.extend_from_slice(&p.bytecode);
+    }
     let bin = format!("{out}.bin");
     let json = format!("{out}.json");
-    if let Err(e) = fs::write(&bin, &c.bytecode) {
+    if let Err(e) = fs::write(&bin, &bin_bytes) {
         eprintln!("{bin}: {e}");
         return 1;
     }
@@ -119,15 +148,17 @@ fn cmd_build(path: &str, out: &str) -> i32 {
         return 1;
     }
     eprintln!(
-        "wrote {bin} ({} bytes, {} instructions) and {json}",
-        c.bytecode.len(),
-        c.bytecode.len() / 8
+        "wrote {bin} ({} program{}, {} instructions, {}) and {json}",
+        c.programs.len(),
+        if c.programs.len() == 1 { "" } else { "s" },
+        bin_bytes.len() / 8,
+        c.arch.name()
     );
     0
 }
 
 /// Lex, parse, type-check, and run codegen; report errors against the source.
-fn compile(path: &str, src: &str) -> Option<Compiled> {
+fn compile(path: &str, src: &str, arch: Arch) -> Option<Compiled> {
     let program = match honeyc::parser::parse(src) {
         Ok(p) => p,
         Err(e) => {
@@ -139,7 +170,7 @@ fn compile(path: &str, src: &str) -> Option<Compiled> {
         report_diags(path, src, &diags);
         return None;
     }
-    match codegen::compile(&program) {
+    match codegen::compile(&program, arch) {
         Ok(c) => Some(c),
         Err(msg) => {
             eprintln!("{path}: codegen error: {msg}");
@@ -172,43 +203,71 @@ fn decode_all(bytes: &[u8]) -> Vec<bpf::Insn> {
 }
 
 /// Hand-rolled JSON so the compiler keeps its zero-dependency promise.
+///
+/// Key names are chosen so the loader's simple scan-for-key reader never
+/// hits the wrong object: maps use "map", events "event", programs "prog";
+/// only event fields use "name". Sections are in the order maps, events,
+/// programs so the loader can bound each scan by the next section's key.
 fn manifest(c: &Compiled) -> String {
     let mut s = String::new();
     s.push_str("{\n");
     s.push_str(&format!("  \"license\": {},\n", jstr(&c.license)));
-    s.push_str("  \"prog_type\": \"tracepoint\",\n");
-    s.push_str(&format!(
-        "  \"tracepoint\": {{ \"category\": {}, \"name\": {} }},\n",
-        jstr(&c.tracepoint.0),
-        jstr(&c.tracepoint.1)
-    ));
+    s.push_str(&format!("  \"arch\": \"{}\",\n", c.arch.name()));
     s.push_str(&format!("  \"ringbuf_bytes\": {},\n", c.ringbuf_bytes));
+    s.push_str(&format!("  \"record_header\": {},\n", codegen::RECORD_HEADER));
     s.push_str(&format!("  \"stack_bytes\": {},\n", c.stack_bytes));
-    // User maps, index order (index 0 is the ring buffer).
+
     s.push_str("  \"maps\": [\n");
     for (i, m) in c.maps.iter().enumerate() {
         let kind = match m.kind { MapKind::Hash => "hash", MapKind::Array => "array" };
         let comma = if i + 1 < c.maps.len() { "," } else { "" };
         s.push_str(&format!(
-            "    {{ \"index\": {}, \"name\": {}, \"kind\": \"{}\", \"key_size\": {}, \"value_size\": {}, \"max_entries\": {} }}{}\n",
+            "    {{ \"index\": {}, \"map\": {}, \"kind\": \"{}\", \"key_size\": {}, \"value_size\": {}, \"max_entries\": {} }}{}\n",
             i + 1, jstr(&m.name), kind, m.key_size, m.value_size, m.max_entries, comma
         ));
     }
     s.push_str("  ],\n");
-    s.push_str(&format!("  \"event\": {{ \"name\": {}, \"size\": {}, \"fields\": [\n", jstr(&c.event.name), c.event.size));
-    for (i, f) in c.event.fields.iter().enumerate() {
-        let (kind, extra) = match &f.kind {
-            FieldKind::Uint(w) => ("uint", format!("\"width\": {w}")),
-            FieldKind::Str(n) => ("str", format!("\"cap\": {n}")),
-            FieldKind::Bool => ("bool", "\"width\": 1".to_string()),
-        };
-        let comma = if i + 1 < c.event.fields.len() { "," } else { "" };
-        s.push_str(&format!(
-            "    {{ \"name\": {}, \"offset\": {}, \"size\": {}, \"kind\": \"{}\", {} }}{}\n",
-            jstr(&f.name), f.offset, f.size, kind, extra, comma
-        ));
+
+    s.push_str("  \"events\": [\n");
+    for (id, ev) in c.events.iter().enumerate() {
+        s.push_str(&format!("    {{ \"id\": {id}, \"event\": {}, \"size\": {}, \"fields\": [\n", jstr(&ev.name), ev.size));
+        for (i, f) in ev.fields.iter().enumerate() {
+            let (kind, extra) = match &f.kind {
+                FieldKind::Uint(w) => ("uint", format!("\"width\": {w}")),
+                FieldKind::Sint(w) => ("int", format!("\"width\": {w}")),
+                FieldKind::Str(n) => ("str", format!("\"cap\": {n}")),
+                FieldKind::Bool => ("bool", "\"width\": 1".to_string()),
+            };
+            let comma = if i + 1 < ev.fields.len() { "," } else { "" };
+            s.push_str(&format!(
+                "      {{ \"name\": {}, \"offset\": {}, \"size\": {}, \"kind\": \"{}\", {} }}{}\n",
+                jstr(&f.name), f.offset, f.size, kind, extra, comma
+            ));
+        }
+        let comma = if id + 1 < c.events.len() { "," } else { "" };
+        s.push_str(&format!("    ] }}{comma}\n"));
     }
-    s.push_str("  ] }\n}\n");
+    s.push_str("  ],\n");
+
+    s.push_str("  \"programs\": [\n");
+    let mut offset = 0usize;
+    for (i, p) in c.programs.iter().enumerate() {
+        let attach = match &p.kind {
+            ProbeKind::Tracepoint { category, name } => format!(
+                "\"type\": \"tracepoint\", \"category\": {}, \"tracepoint\": {}",
+                jstr(category), jstr(name)
+            ),
+            ProbeKind::Kprobe { function } => format!("\"type\": \"kprobe\", \"function\": {}", jstr(function)),
+            ProbeKind::Kretprobe { function } => format!("\"type\": \"kretprobe\", \"function\": {}", jstr(function)),
+        };
+        let comma = if i + 1 < c.programs.len() { "," } else { "" };
+        s.push_str(&format!(
+            "    {{ \"prog\": {}, {attach}, \"offset\": {offset}, \"insns\": {}, \"stack_bytes\": {} }}{comma}\n",
+            jstr(&p.name), p.bytecode.len() / 8, p.stack_bytes
+        ));
+        offset += p.bytecode.len();
+    }
+    s.push_str("  ]\n}\n");
     s
 }
 

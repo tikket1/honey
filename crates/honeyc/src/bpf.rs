@@ -80,6 +80,10 @@ const JSET: u8 = 0x40;
 const JNE: u8 = 0x50;
 const JLT: u8 = 0xa0;
 const JLE: u8 = 0xb0;
+const JSGT: u8 = 0x60;
+const JSGE: u8 = 0x70;
+const JSLT: u8 = 0xc0;
+const JSLE: u8 = 0xd0;
 const CALL: u8 = 0x80;
 const EXIT: u8 = 0x90;
 
@@ -299,6 +303,8 @@ impl AluOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JmpOp {
     Eq, Ne, Gt, Ge, Lt, Le, Set,
+    /// Signed comparisons (two's-complement interpretation of the operands).
+    Sgt, Sge, Slt, Sle,
 }
 
 impl JmpOp {
@@ -311,6 +317,10 @@ impl JmpOp {
             JmpOp::Lt => JLT,
             JmpOp::Le => JLE,
             JmpOp::Set => JSET,
+            JmpOp::Sgt => JSGT,
+            JmpOp::Sge => JSGE,
+            JmpOp::Slt => JSLT,
+            JmpOp::Sle => JSLE,
         }
     }
 }
@@ -525,7 +535,8 @@ fn alu_name(op: u8) -> &'static str {
 fn jmp_name(op: u8) -> &'static str {
     match op {
         JEQ => "==", JNE => "!=", JGT => ">", JGE => ">=", JLT => "<",
-        JLE => "<=", JSET => "&", _ => "jmp?",
+        JLE => "<=", JSET => "&", JSGT => "s>", JSGE => "s>=", JSLT => "s<",
+        JSLE => "s<=", _ => "jmp?",
     }
 }
 

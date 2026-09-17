@@ -57,8 +57,21 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 ```
 
 A program is a list of *items*: `const`, `map`, `event`, and `probe`
-declarations. Each `probe` becomes one BPF program; the userspace loader
-(stage 3) attaches it and prints the events.
+declarations. Each `probe` becomes one BPF program with its own 512-byte
+stack; probes share the maps and the event ring buffer. The loader attaches
+every probe and prints the events, dispatching on an id in each record.
+
+Probe kinds:
+
+| Probe                              | Hook                                    | Available |
+|------------------------------------|-----------------------------------------|-----------|
+| `tracepoint("syscalls", "sys_enter_openat")` | a static kernel tracepoint    | `arg(n)`  |
+| `kprobe("do_sys_openat2")`         | entry of a kernel function              | `arg(n)`  |
+| `kretprobe("do_sys_openat2")`      | return of a kernel function             | `retval()`|
+
+A tracepoint sees the *request*; to know the *result* hook the function with
+a `kprobe` and a `kretprobe` and correlate them through a map keyed by
+`tid()` (see `examples/shadow_open_ok.hny`).
 
 ---
 
@@ -224,6 +237,7 @@ Precedence, lowest to highest: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`,
 | Type                    | Notes                                                    |
 |-------------------------|----------------------------------------------------------|
 | `u8 u16 u32 u64`        | Unsigned. No implicit conversions between widths; an unsuffixed literal adapts to the width it meets and is range-checked. |
+| `i64`                   | Signed; the type of `retval()`. Compared with signed jumps. Never mixes with unsigned widths implicitly. |
 | `bool`                  | Conditions must be `bool`; `&& \|\| !` take `bool`.       |
 | `str<N>`                | Fixed-capacity byte string on the BPF stack, 1 ≤ N ≤ 256. Only `read_user_str` (and `comm()` in an `emit`) can produce one. |
 | `hash<K, V>`, `array<V>`| Map kinds, only in `map` declarations. K and V are integers or bool. |
@@ -254,7 +268,9 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `uid()`                    | `u32`                             | `bpf_get_current_uid_gid`     |
 | `comm()`                   | `str<16>`                         | `bpf_get_current_comm`        |
 | `ktime()`                  | `u64`                             | `bpf_ktime_get_ns`            |
-| `arg(n)`                   | `u64`                             | tracepoint context field `n`  |
+| `arg(n)`                   | `u64`                             | tracepoint: record field `n`; kprobe: `pt_regs` argument `n` (per arch); not in kretprobe |
+| `retval()`                 | `i64`                             | kretprobe only: the return register (`x0` / `rax`) |
+| `tid()`                    | `u32`                             | `bpf_get_current_pid_tgid` low half; key for kprobe↔kretprobe correlation |
 | `read_user_str(p)`         | `str<N>` (N from the let type)    | `bpf_probe_read_user_str`     |
 | `m.get(k)` / `m.insert(k,v)` | `Option<&V>` / `()`             | `bpf_map_lookup/update_elem`  |
 | `emit E { … }`             | statement                         | `bpf_ringbuf_output`          |
@@ -276,5 +292,5 @@ anything that needs a heap.
 
 - Should `str<N>` comparisons (`==`) be allowed, or only `starts_with`?
 - Does `emit` need a rate limit / sampling primitive built in?
-- kprobe argument access: `arg(n)` is enough for tracepoints; kprobes need
-  the pt_regs layout per architecture.
+- kprobe argument offsets are per architecture (`--arch aarch64|x86_64`);
+  the manifest records the arch and the loader warns on mismatch.

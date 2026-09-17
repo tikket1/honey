@@ -5,16 +5,16 @@
 //! is the loader's job and lives in `linux/`. The kernel verifier is the
 //! ultimate check, but these catch regressions without needing Linux.
 
-use honeyc::codegen::compile;
+use honeyc::codegen::{compile, Arch};
 use honeyc::layout::{layout_event, FieldKind};
 use honeyc::parser::parse;
 use honeyc::ast::Item;
 
 fn asm(src: &str) -> String {
     let prog = parse(src).unwrap();
-    let c = compile(&prog).unwrap_or_else(|e| panic!("codegen failed: {e}"));
-    // Re-decode and disassemble, mirroring `honeyc --asm`.
-    disasm_bytes(&c.bytecode)
+    let c = compile(&prog, Arch::Aarch64).unwrap_or_else(|e| panic!("codegen failed: {e}"));
+    // Re-decode and disassemble the first program, mirroring `honeyc --asm`.
+    disasm_bytes(&c.programs[0].bytecode)
 }
 
 fn disasm_bytes(bytes: &[u8]) -> String {
@@ -44,26 +44,28 @@ const EXEC: &str = include_str!("../../../examples/exec.hny");
 fn exec_compiles_to_the_expected_program() {
     let expected = "\n   0: stx64 [r10 -8], r1
    1: ld64 r1, map_fd(0)
-   3: mov r2, 24
+   3: mov r2, 32
    4: mov r3, 0
    5: call 131
-   6: if r0 == 0 goto +14
+   6: if r0 == 0 goto +16
    7: mov r6, r0
-   8: call 14
-   9: rsh r0, 32
-  10: stx32 [r6 +0], r0
-  11: call 15
-  12: mov32 r0, r0
-  13: stx32 [r6 +4], r0
-  14: mov r1, r6
-  15: add r1, 8
-  16: mov r2, 16
-  17: call 16
-  18: mov r1, r6
-  19: mov r2, 0
-  20: call 132
-  21: mov r0, 0
-  22: exit
+   8: st32 [r6 +0], 0
+   9: st32 [r6 +4], 0
+  10: call 14
+  11: rsh r0, 32
+  12: stx32 [r6 +8], r0
+  13: call 15
+  14: mov32 r0, r0
+  15: stx32 [r6 +12], r0
+  16: mov r1, r6
+  17: add r1, 16
+  18: mov r2, 16
+  19: call 16
+  20: mov r1, r6
+  21: mov r2, 0
+  22: call 132
+  23: mov r0, 0
+  24: exit
 ";
     assert_eq!(asm(EXEC), expected.trim_start_matches('\n'));
 }
@@ -71,10 +73,11 @@ fn exec_compiles_to_the_expected_program() {
 #[test]
 fn bytecode_is_a_whole_number_of_instructions() {
     let prog = parse(EXEC).unwrap();
-    let c = compile(&prog).unwrap();
-    assert_eq!(c.bytecode.len() % 8, 0);
-    // 23 instruction slots (the ld_map_fd counts as two 8-byte slots).
-    assert_eq!(c.bytecode.len(), 23 * 8);
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    let code = &c.programs[0].bytecode;
+    assert_eq!(code.len() % 8, 0);
+    // 25 instruction slots (the ld_map_fd counts as two 8-byte slots).
+    assert_eq!(code.len(), 25 * 8);
 }
 
 #[test]
@@ -83,9 +86,9 @@ fn drop_branch_lands_on_the_final_exit() {
     // final `mov r0, 0` right before `exit`. If slot/label arithmetic were
     // off by one this would silently run a helper with a null pointer.
     let text = asm(EXEC);
-    assert!(text.contains("6: if r0 == 0 goto +14"), "{text}");
-    assert!(text.contains("21: mov r0, 0"), "{text}");
-    assert!(text.contains("22: exit"), "{text}");
+    assert!(text.contains("6: if r0 == 0 goto +16"), "{text}");
+    assert!(text.contains("23: mov r0, 0"), "{text}");
+    assert!(text.contains("24: exit"), "{text}");
 }
 
 #[test]
@@ -126,16 +129,9 @@ fn unsupported_constructs_report_clearly() {
     ];
     for (src, needle) in cases {
         let prog = parse(&src).unwrap();
-        let err = compile(&prog).unwrap_err();
+        let err = compile(&prog, Arch::Aarch64).unwrap_err();
         assert!(err.contains(needle), "error {err:?} should mention {needle:?}");
     }
-}
-
-#[test]
-fn wrong_field_count_is_rejected() {
-    let src = "event E { a: u32, b: u32 } probe tracepoint(\"s\",\"n\") { emit E { a: pid() }; }";
-    let prog = parse(src).unwrap();
-    assert!(compile(&prog).unwrap_err().contains("fields"));
 }
 
 // ------------------------------------------------------- stage 3b: maps
@@ -145,13 +141,13 @@ const EXEC_BURST: &str = include_str!("../../../examples/exec_burst.hny");
 #[test]
 fn exec_burst_compiles() {
     let prog = parse(EXEC_BURST).unwrap();
-    let c = compile(&prog).unwrap_or_else(|e| panic!("{e}"));
+    let c = compile(&prog, Arch::Aarch64).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(c.maps.len(), 1);
     assert_eq!(c.maps[0].name, "execs");
     assert_eq!(c.maps[0].kind, honeyc::codegen::MapKind::Hash);
     assert_eq!((c.maps[0].key_size, c.maps[0].value_size, c.maps[0].max_entries), (4, 8, 1024));
-    assert_eq!(c.event.name, "Burst");
-    assert_eq!(c.event.size, 16);
+    assert_eq!(c.events[0].name, "Burst");
+    assert_eq!(c.events[0].size, 16);
     assert!(c.stack_bytes <= 512);
 }
 
@@ -193,18 +189,20 @@ fn threshold_compare_guards_the_emit() {
 }
 
 #[test]
-fn deref_before_null_check_is_rejected() {
+fn codegen_still_refuses_an_unchecked_deref() {
+    // The type checker is the gate (see tests/typeck.rs); codegen keeps a
+    // backstop so it can never emit a deref of a map_value_or_null pointer.
     let src = "map m: hash<u32,u64>[4]; event E { a: u64 } probe tracepoint(\"s\",\"n\") { let p = m.get(1); emit E { a: *p }; }";
     let prog = parse(src).unwrap();
-    let err = compile(&prog).unwrap_err();
-    assert!(err.contains("if let Some"), "{err}");
+    let err = compile(&prog, Arch::Aarch64).unwrap_err();
+    assert!(err.contains("unchecked"), "{err}");
 }
 
 #[test]
 fn stack_usage_is_tracked() {
     // exec_burst: uid, n, prev/temps. Small, but nonzero and 8-aligned.
     let prog = parse(EXEC_BURST).unwrap();
-    let c = compile(&prog).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
     assert!(c.stack_bytes >= 24 && c.stack_bytes.is_multiple_of(8), "{}", c.stack_bytes);
 }
 
@@ -215,10 +213,10 @@ const SENSITIVE: &str = include_str!("../../../examples/sensitive_open.hny");
 #[test]
 fn sensitive_open_compiles() {
     let prog = parse(SENSITIVE).unwrap();
-    let c = compile(&prog).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(c.event.name, "SensitiveOpen");
+    let c = compile(&prog, Arch::Aarch64).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(c.events[0].name, "SensitiveOpen");
     // path is a str<64> field.
-    let path = c.event.fields.iter().find(|f| f.name == "path").unwrap();
+    let path = c.events[0].fields.iter().find(|f| f.name == "path").unwrap();
     assert_eq!(path.size, 64);
     assert!(c.stack_bytes <= 512, "stack {}", c.stack_bytes);
 }
@@ -264,16 +262,77 @@ fn for_loop_is_fully_unrolled() {
 fn for_bounds_must_be_constant() {
     let src = "event E { a: u32 } probe tracepoint(\"s\",\"n\") { let n = pid(); for i in 0..n { } emit E { a: pid() }; }";
     let prog = parse(src).unwrap();
-    let err = compile(&prog).unwrap_err();
+    let err = compile(&prog, Arch::Aarch64).unwrap_err();
     assert!(err.contains("constant"), "{err}");
 }
 
 #[test]
 fn every_example_compiles_and_verifies_shape() {
-    for (name, src) in [("exec", EXEC), ("exec_burst", EXEC_BURST), ("sensitive_open", SENSITIVE)] {
+    for (name, src) in [("exec", EXEC), ("exec_burst", EXEC_BURST), ("sensitive_open", SENSITIVE), ("shadow_open_ok", SHADOW)] {
         let prog = parse(src).unwrap();
-        let c = compile(&prog).unwrap_or_else(|e| panic!("{name} failed: {e}"));
-        assert_eq!(c.bytecode.len() % 8, 0, "{name}");
-        assert!(c.stack_bytes <= 512, "{name} stack {}", c.stack_bytes);
+        let c = compile(&prog, Arch::Aarch64).unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        for p in &c.programs {
+            assert_eq!(p.bytecode.len() % 8, 0, "{name}/{}", p.name);
+            assert!(p.stack_bytes <= 512, "{name}/{} stack {}", p.name, p.stack_bytes);
+        }
     }
+}
+
+// ------------------------------------------- kprobes, kretprobes, multi-probe
+
+const SHADOW: &str = include_str!("../../../examples/shadow_open_ok.hny");
+
+fn asm_of(src: &str, arch: Arch, idx: usize) -> String {
+    let prog = parse(src).unwrap();
+    let c = compile(&prog, arch).unwrap_or_else(|e| panic!("codegen failed: {e}"));
+    disasm_bytes(&c.programs[idx].bytecode)
+}
+
+#[test]
+fn two_probes_become_two_programs_sharing_maps() {
+    let prog = parse(SHADOW).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert_eq!(c.programs.len(), 2);
+    assert_eq!(c.programs[0].name, "kprobe:do_sys_openat2");
+    assert_eq!(c.programs[1].name, "kretprobe:do_sys_openat2");
+    assert_eq!(c.maps.len(), 1);
+    // Both programs reference the same map index.
+    assert!(disasm_bytes(&c.programs[0].bytecode).contains("map_fd(1)"));
+    assert!(disasm_bytes(&c.programs[1].bytecode).contains("map_fd(1)"));
+}
+
+#[test]
+fn kprobe_arg_reads_pt_regs_per_arch() {
+    // arg(1): aarch64 x1 at +8, x86_64 rsi at +104.
+    assert!(asm_of(SHADOW, Arch::Aarch64, 0).contains("ldx64 r0, [r0 +8]"));
+    assert!(asm_of(SHADOW, Arch::X86_64, 0).contains("ldx64 r0, [r0 +104]"));
+}
+
+#[test]
+fn retval_reads_return_register_and_compares_signed() {
+    let a = asm_of(SHADOW, Arch::Aarch64, 1);
+    assert!(a.contains("ldx64 r0, [r0 +0]"), "aarch64 x0\n{a}");
+    // `fd >= 0` on an i64 must be a signed jump, or -EACCES would look huge.
+    assert!(a.contains("s>="), "expected signed compare\n{a}");
+    let x = asm_of(SHADOW, Arch::X86_64, 1);
+    assert!(x.contains("ldx64 r0, [r0 +80]"), "x86_64 rax\n{x}");
+}
+
+#[test]
+fn records_carry_an_event_id_header() {
+    // Every emit writes the event id at offset 0 and reserves header + size.
+    let text = asm(EXEC);
+    assert!(text.contains("st32 [r6 +0], 0"), "{text}");
+    assert!(text.contains("mov r2, 32"), "24-byte Exec + 8-byte header\n{text}");
+    let prog = parse(SHADOW).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert_eq!(c.events[0].name, "ShadowOpen");
+    let ret = disasm_bytes(&c.programs[1].bytecode);
+    assert!(ret.contains("st32 [r6 +0], 0"), "{ret}");
+}
+
+#[test]
+fn unsigned_compares_stay_unsigned() {
+    // exec_burst compares u64s: no signed jump anywhere.
+    assert!(!asm(EXEC_BURST).contains(" s>"), "{}", asm(EXEC_BURST));
 }

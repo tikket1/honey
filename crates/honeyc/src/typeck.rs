@@ -39,6 +39,8 @@ pub enum Ty {
     U16,
     U32,
     U64,
+    /// Signed 64-bit: the type of `retval()`. Compared with signed jumps.
+    I64,
     Bool,
     /// Fixed-capacity byte string.
     Str(u32),
@@ -59,6 +61,7 @@ impl Ty {
             ("u16", []) => Ok(Ty::U16),
             ("u32", []) => Ok(Ty::U32),
             ("u64", []) => Ok(Ty::U64),
+            ("i64", []) => Ok(Ty::I64),
             ("bool", []) => Ok(Ty::Bool),
             ("str", [TypeArg::Int(n)]) => {
                 if *n == 0 || *n > 256 {
@@ -73,7 +76,7 @@ impl Ty {
     }
 
     pub fn is_int(&self) -> bool {
-        matches!(self, Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Int)
+        matches!(self, Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::I64 | Ty::Int)
     }
 
     /// Bytes this value occupies on the BPF stack as a local.
@@ -92,6 +95,7 @@ impl Ty {
             Ty::U16 => u16::MAX as u64,
             Ty::U32 => u32::MAX as u64,
             Ty::U64 | Ty::Int => u64::MAX,
+            Ty::I64 => i64::MAX as u64,
             _ => return None,
         })
     }
@@ -104,6 +108,7 @@ impl std::fmt::Display for Ty {
             Ty::U16 => write!(f, "u16"),
             Ty::U32 => write!(f, "u32"),
             Ty::U64 => write!(f, "u64"),
+            Ty::I64 => write!(f, "i64"),
             Ty::Bool => write!(f, "bool"),
             Ty::Str(n) => write!(f, "str<{n}>"),
             Ty::Option(inner) => write!(f, "Option<&{inner}>"),
@@ -126,7 +131,7 @@ pub struct Diag {
 /// What a successful check tells the next stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checked {
-    /// Peak bytes of BPF stack the probe's locals need.
+    /// Peak bytes of BPF stack any probe's locals need.
     pub stack_bytes: u32,
 }
 
@@ -135,8 +140,15 @@ pub struct Checked {
 pub const STACK_LIMIT: u32 = 512;
 pub const STACK_RESERVED: u32 = 40;
 pub const MAX_UNROLL: i64 = 64;
-/// Tracepoint syscall hooks expose at most six arguments.
+/// Syscall tracepoints and kprobes expose at most six arguments.
 pub const MAX_ARG: i64 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+    Tracepoint,
+    Kprobe,
+    Kretprobe,
+}
 
 // ----------------------------------------------------------------- checker
 
@@ -171,6 +183,8 @@ struct Checker {
     stack_now: u32,
     stack_peak: u32,
     diags: Vec<Diag>,
+    /// The kind of the probe whose body is being checked.
+    probe_kind: Option<ProbeKind>,
 }
 
 pub fn check(program: &Program) -> Result<Checked, Vec<Diag>> {
@@ -182,10 +196,11 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diag>> {
         stack_now: 0,
         stack_peak: 0,
         diags: Vec::new(),
+        probe_kind: None,
     };
-    c.program(program);
+    let peak = c.program(program);
     if c.diags.is_empty() {
-        Ok(Checked { stack_bytes: c.stack_peak })
+        Ok(Checked { stack_bytes: peak })
     } else {
         Err(c.diags)
     }
@@ -228,7 +243,7 @@ impl Checker {
 
     // ---- items -----------------------------------------------------------
 
-    fn program(&mut self, p: &Program) {
+    fn program(&mut self, p: &Program) -> u32 {
         // Declarations first, so order in the file doesn't matter.
         for item in &p.items {
             match item {
@@ -243,13 +258,18 @@ impl Checker {
             .iter()
             .filter_map(|i| if let Item::Probe(p) = i { Some(p) } else { None })
             .collect();
-        match probes.as_slice() {
-            [] => self.error(Span::new(0, 0), "program has no `probe`"),
-            [one] => self.probe(one),
-            [_, second, ..] => {
-                self.error(second.span, "only one `probe` per program is supported in v1");
-            }
+        if probes.is_empty() {
+            self.error(Span::new(0, 0), "program has no `probe`");
         }
+        // Each probe is its own BPF program with its own 512-byte stack.
+        let mut peak = 0;
+        for pr in probes {
+            self.stack_now = 0;
+            self.stack_peak = 0;
+            self.probe(pr);
+            peak = peak.max(self.stack_peak);
+        }
+        peak
     }
 
     fn const_decl(&mut self, c: &ConstDecl) {
@@ -330,19 +350,35 @@ impl Checker {
     }
 
     fn probe(&mut self, p: &ProbeDecl) {
-        if p.kind.name != "tracepoint" {
-            self.error_help(
-                p.kind.span,
-                format!("unsupported probe kind `{}`", p.kind.name),
-                "v1 supports `probe tracepoint(\"category\", \"name\")`",
-            );
+        let kind = match (p.kind.name.as_str(), p.args.len()) {
+            ("tracepoint", 2) => Some(ProbeKind::Tracepoint),
+            ("tracepoint", _) => {
+                self.error(p.span, "`tracepoint` takes two string arguments: category and name");
+                None
+            }
+            ("kprobe", 1) => Some(ProbeKind::Kprobe),
+            ("kretprobe", 1) => Some(ProbeKind::Kretprobe),
+            ("kprobe" | "kretprobe", _) => {
+                self.error(p.span, format!("`{}` takes one string argument: the kernel function name", p.kind.name));
+                None
+            }
+            (other, _) => {
+                self.error_help(
+                    p.kind.span,
+                    format!("unsupported probe kind `{other}`"),
+                    "use `tracepoint(\"category\", \"name\")`, `kprobe(\"function\")`, or `kretprobe(\"function\")`",
+                );
+                None
+            }
+        };
+        if p.args.iter().any(|a| a.is_empty()) {
+            self.error(p.span, "probe target must not be empty");
         }
-        if p.args.len() != 2 {
-            self.error(p.span, "`tracepoint` takes two string arguments: category and name");
-        }
+        self.probe_kind = kind;
         self.push_scope();
         self.block(&p.body);
         self.pop_scope();
+        self.probe_kind = None;
 
         let budget = STACK_LIMIT - STACK_RESERVED;
         if self.stack_peak > budget {
@@ -753,18 +789,35 @@ impl Checker {
                 Ty::Str(16)
             }
             ("arg", [idx]) => {
+                if self.probe_kind == Some(ProbeKind::Kretprobe) {
+                    self.error_help(
+                        span,
+                        "`arg()` is not available in a `kretprobe`: the arguments are gone by the time the function returns",
+                        "record what you need in a `kprobe` on the same function and share it through a map keyed by `tid()`",
+                    );
+                }
                 match self.const_eval(idx) {
                     Some(n) if (0..=MAX_ARG).contains(&n) => {}
-                    Some(n) => self.error(idx.span, format!("`arg({n})`: syscall tracepoints have arguments 0 to {MAX_ARG}")),
+                    Some(n) => self.error(idx.span, format!("`arg({n})`: probes expose arguments 0 to {MAX_ARG}")),
                     None => {}
                 }
                 Ty::U64
+            }
+            ("retval", []) => {
+                if self.probe_kind != Some(ProbeKind::Kretprobe) {
+                    self.error_help(
+                        span,
+                        "`retval()` is only available in a `kretprobe`",
+                        "a return value only exists when the function returns; use `probe kretprobe(\"fn\")`",
+                    );
+                }
+                Ty::I64
             }
             ("read_user_str", _) => {
                 self.error_help(span, "`read_user_str` must initialise a bounded string", "write `let s: str<N> = read_user_str(ptr);`");
                 Ty::Unit
             }
-            ("pid" | "tgid" | "tid" | "uid" | "gid" | "ktime" | "arg", _) => {
+            ("pid" | "tgid" | "tid" | "uid" | "gid" | "ktime" | "arg" | "retval", _) => {
                 self.error(span, format!("wrong number of arguments to `{name}()`"));
                 for a in args {
                     self.expr(a);

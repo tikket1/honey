@@ -29,6 +29,8 @@ pub struct FieldLayout {
 pub enum FieldKind {
     /// An unsigned integer of the given byte width (1, 2, 4, 8).
     Uint(u32),
+    /// A signed integer of the given byte width (8).
+    Sint(u32),
     /// A fixed-capacity string of `N` bytes.
     Str(u32),
     Bool,
@@ -37,7 +39,7 @@ pub enum FieldKind {
 impl FieldKind {
     fn align(&self) -> u32 {
         match self {
-            FieldKind::Uint(w) => *w,
+            FieldKind::Uint(w) | FieldKind::Sint(w) => *w,
             FieldKind::Str(_) => 1,
             FieldKind::Bool => 1,
         }
@@ -45,7 +47,7 @@ impl FieldKind {
 
     fn size(&self) -> u32 {
         match self {
-            FieldKind::Uint(w) => *w,
+            FieldKind::Uint(w) | FieldKind::Sint(w) => *w,
             FieldKind::Str(n) => *n,
             FieldKind::Bool => 1,
         }
@@ -80,6 +82,7 @@ fn field_kind(name: &str, args: &[TypeArg]) -> Option<FieldKind> {
         "u16" => Some(FieldKind::Uint(2)),
         "u32" => Some(FieldKind::Uint(4)),
         "u64" => Some(FieldKind::Uint(8)),
+        "i64" => Some(FieldKind::Sint(8)),
         "bool" => Some(FieldKind::Bool),
         "str" => match args {
             [TypeArg::Int(n)] => Some(FieldKind::Str(*n as u32)),

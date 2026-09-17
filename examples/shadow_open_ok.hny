@@ -1,0 +1,34 @@
+// shadow_open_ok.hny — report opens of /etc/shadow that actually SUCCEEDED.
+//
+// A syscall tracepoint only sees the request. To know the result you hook
+// the kernel function itself twice: once on entry (kprobe), once on return
+// (kretprobe). The two probes share a map keyed by thread id: the entry
+// probe records "this thread is opening /etc/shadow", the return probe
+// checks the result and reports the file descriptor it got.
+
+map pending: hash<u32, u8>[1024];
+
+event ShadowOpen {
+    pid: u32,
+    uid: u32,
+    fd: i64,
+}
+
+probe kprobe("do_sys_openat2") {
+    // do_sys_openat2(int dfd, const char *filename, struct open_how *how)
+    let path: str<32> = read_user_str(arg(1));
+    if path.starts_with("/etc/shadow") {
+        pending.insert(tid(), 1);
+    }
+}
+
+probe kretprobe("do_sys_openat2") {
+    let t = tid();
+    if let Some(flag) = pending.get(t) {
+        pending.delete(t);
+        let fd = retval();
+        if fd >= 0 {
+            emit ShadowOpen { pid: pid(), uid: uid(), fd: fd };
+        }
+    }
+}

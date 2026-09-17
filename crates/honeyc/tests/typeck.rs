@@ -66,7 +66,7 @@ fn every_bad_example_fails_where_it_should() {
             ds.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
-    assert!(n >= 10, "expected the bad examples to exist, found {n}");
+    assert!(n >= 12, "expected the bad examples to exist, found {n}");
 }
 
 #[test]
@@ -75,6 +75,7 @@ fn every_good_example_passes() {
         ("exec", include_str!("../../../examples/exec.hny")),
         ("exec_burst", include_str!("../../../examples/exec_burst.hny")),
         ("sensitive_open", include_str!("../../../examples/sensitive_open.hny")),
+        ("shadow_open_ok", include_str!("../../../examples/shadow_open_ok.hny")),
     ] {
         let prog = parse(src).unwrap();
         if let Err(d) = check(&prog) {
@@ -294,7 +295,7 @@ fn builtins_and_args_are_validated() {
     let msg = first_message(&probe("    let x = pid(1);\n    emit E { a: 1, b: true };"));
     assert!(msg.contains("wrong number of arguments to `pid()`"), "{msg}");
     let msg = first_message(&probe("    let x = arg(6);\n    emit E { a: 1, b: true };"));
-    assert!(msg.contains("`arg(6)`: syscall tracepoints have arguments 0 to 5"), "{msg}");
+    assert!(msg.contains("`arg(6)`: probes expose arguments 0 to 5"), "{msg}");
     ok(&probe("    let x = arg(5);\n    emit E { a: x, b: true };"));
 }
 
@@ -315,10 +316,70 @@ fn declarations_are_validated() {
     assert!(msg.contains("duplicate field `a`"), "{msg}");
     let msg = first_message("const N: u8 = 300;\nevent E { a: u64 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }");
     assert!(msg.contains("300 does not fit in `u8`"), "{msg}");
-    let msg = first_message("event E { a: u64 }\nprobe kprobe(\"do_sys_open\") { emit E { a: 1 }; }");
-    assert!(msg.contains("unsupported probe kind `kprobe`"), "{msg}");
+    let msg = first_message("event E { a: u64 }\nprobe uprobe(\"/bin/sh\") { emit E { a: 1 }; }");
+    assert!(msg.contains("unsupported probe kind `uprobe`"), "{msg}");
+    let msg = first_message("event E { a: u64 }\nprobe kprobe(\"a\", \"b\") { emit E { a: 1 }; }");
+    assert!(msg.contains("`kprobe` takes one string argument"), "{msg}");
     let msg = first_message("event E { a: u64 }");
     assert!(msg.contains("program has no `probe`"), "{msg}");
-    let msg = first_message("event E { a: u64 }\nprobe tracepoint(\"s\", \"n\") { emit E { a: 1 }; }\nprobe tracepoint(\"s\", \"m\") { emit E { a: 1 }; }");
-    assert!(msg.contains("only one `probe`"), "{msg}");
+}
+
+// ------------------------------------------------ probe kinds & multi-probe
+
+fn kprobe(body: &str) -> String {
+    format!("map m: hash<u32, u8>[8];\nevent E {{ a: u64, r: i64 }}\nprobe kprobe(\"do_sys_openat2\") {{\n{body}\n}}")
+}
+
+fn kret(body: &str) -> String {
+    format!("map m: hash<u32, u8>[8];\nevent E {{ a: u64, r: i64 }}\nprobe kretprobe(\"do_sys_openat2\") {{\n{body}\n}}")
+}
+
+#[test]
+fn kprobe_gets_args_but_not_retval() {
+    ok(&kprobe("    emit E { a: arg(1), r: 0 };"));
+    let ds = diags(&kprobe("    emit E { a: 1, r: retval() };"));
+    assert!(ds[0].message.contains("`retval()` is only available in a `kretprobe`"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("kretprobe"));
+}
+
+#[test]
+fn kretprobe_gets_retval_but_not_args() {
+    ok(&kret("    emit E { a: 1, r: retval() };"));
+    let ds = diags(&kret("    emit E { a: arg(0), r: retval() };"));
+    assert!(ds[0].message.contains("`arg()` is not available in a `kretprobe`"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("tid()"), "{ds:#?}");
+}
+
+#[test]
+fn retval_is_signed_and_does_not_mix_with_unsigned() {
+    // Comparing with a literal is fine; the literal adapts.
+    ok(&kret("    let fd = retval();\n    if fd >= 0 { emit E { a: 1, r: fd }; }"));
+    // Mixing i64 with u32 is a width/sign error, not a silent conversion.
+    let ds = diags(&kret("    let x = retval() + uid();\n    emit E { a: 1, r: 0 };"));
+    assert!(ds[0].message.contains("mismatched integer widths: `i64` + `u32`"), "{ds:#?}");
+    // And an i64 cannot be stored in a u64 field.
+    let ds = diags(&kret("    emit E { a: retval(), r: 0 };"));
+    assert!(ds[0].message.contains("expected `u64`, found `i64`"), "{ds:#?}");
+}
+
+#[test]
+fn tracepoint_has_no_retval() {
+    let msg = first_message(&probe("    let r = retval();\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("only available in a `kretprobe`"), "{msg}");
+}
+
+#[test]
+fn multiple_probes_each_get_their_own_stack_budget() {
+    // Two probes with 400-byte strings each: fine, because each BPF program
+    // has its own 512-byte stack. One probe with both: over budget.
+    let two = "event E { b: u8 }\nprobe kprobe(\"f\") { let a: str<256> = read_user_str(arg(0)); emit E { b: a.byte_at(0) }; }\nprobe kretprobe(\"f\") { let r = retval(); if r >= 0 { emit E { b: 1 }; } }";
+    assert_eq!(ok(two), 256);
+    let one = "event E { b: u8 }\nprobe kprobe(\"f\") { let a: str<256> = read_user_str(arg(0)); let c: str<256> = read_user_str(arg(1)); emit E { b: a.byte_at(0) }; }";
+    let ds = diags(one);
+    assert!(ds[0].message.contains("512 bytes of stack"), "{ds:#?}");
+}
+
+#[test]
+fn probes_can_emit_different_events() {
+    ok("event A { x: u64 }\nevent B { y: u32 }\nprobe kprobe(\"f\") { emit A { x: arg(0) }; }\nprobe kretprobe(\"f\") { emit B { y: uid() }; }");
 }

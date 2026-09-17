@@ -1,0 +1,11 @@
+// error: `retval()` is only available in a `kretprobe`
+//
+// At function entry there is no return value yet. The kernel would let you
+// read the register, and you would get garbage. honey knows which probe
+// kind you are in.
+
+event E { fd: i64 }
+
+probe kprobe("do_sys_openat2") {
+    emit E { fd: retval() };
+}

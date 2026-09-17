@@ -1,32 +1,44 @@
-//! Stage 3 codegen: compile a detection probe to BPF bytecode.
+//! Stage 3 codegen: compile honey probes to BPF bytecode.
 //!
-//! Supported today: `const` (integer literals), `map` (`hash<K, V>` and
-//! `array<V>`), `event`, one `tracepoint` probe; `let`, assignment, `if`,
-//! `if let Some(x) = map.get(k)`, `return`, `emit`; integer literals, names,
-//! nullary builtins, `*ptr`, arithmetic / bitwise / comparison / `&&` / `||`
-//! / `!`, `map.get(k)`, `map.insert(k, v)`. That covers `exec.hny` and
-//! `exec_burst.hny`.
+//! A program may contain several probes. Each becomes its own BPF program
+//! (its own instruction stream and 512-byte stack); they share the maps and
+//! the event ring buffer. Probe kinds:
 //!
-//! Not yet: `for`, strings beyond `comm()`, `read_user_str`, `as`, signed
-//! comparisons. Each reports a clear "not yet" error rather than emitting
-//! something the verifier would reject.
+//! | kind                        | BPF program type | context (R1 at entry)    |
+//! |-----------------------------|------------------|--------------------------|
+//! | `tracepoint("cat", "name")` | TRACEPOINT       | tracepoint record; `arg(n)` at `+16 + 8n` |
+//! | `kprobe("fn")`              | KPROBE           | `struct pt_regs`; `arg(n)` per arch |
+//! | `kretprobe("fn")`           | KPROBE (retprobe)| `struct pt_regs`; `retval()` per arch |
+//!
+//! `pt_regs` layout differs per architecture, so codegen takes an [`Arch`].
+//!
+//! # Records
+//!
+//! Every emitted record starts with an 8-byte header holding the event id
+//! (`u32`) so a single ring buffer can carry several event types; the loader
+//! dispatches on it. Field offsets from `layout.rs` are relative to the
+//! payload that follows the header.
 //!
 //! # How values move
 //!
-//! Every expression evaluates into `R0`. Locals live on the BPF stack, one
-//! 8-byte slot each, addressed as `[R10 - off]`. Binary operators spill the
-//! left operand to a scratch slot while the right is computed, then reload it
-//! into `R1`. It is not clever, but it is easy to read and the verifier
-//! accepts it; register allocation can come later.
+//! Every expression evaluates into `R0`. Locals are 8-byte stack slots
+//! (`str<N>` buffers are N rounded to 8) at `[R10 - off]`, allocated per
+//! scope and released LIFO. Binary operators spill the left operand to a
+//! scratch slot while the right is computed, then reload it into `R1`.
+//! `R6` holds the ring-buffer record during an `emit`; helper calls preserve
+//! it. The context pointer is spilled in the prologue so `arg`/`retval` can
+//! read it after `R1` has been reused.
 //!
-//! `R6` is reserved during an `emit` for the ring-buffer record pointer; it
-//! is callee-saved so helper calls inside field expressions don't clobber it.
+//! `map.get` spills its result and *then* null-checks it: the verifier
+//! propagates the check to the spilled copy, so reloading it inside the
+//! `if let` body yields a pointer it will let you dereference. The type
+//! checker (stage 4) guarantees the program only ever does that.
 //!
 //! # Map references
 //!
-//! `ld64 rN, map_fd(i)` carries a map *index*, not a real fd. Index 0 is the
-//! event ring buffer; user maps follow in declaration order. The loader
-//! creates the maps and rewrites each index to the fd it got.
+//! `ld64 rN, map_fd(i)` carries a map *index*: 0 is the event ring buffer,
+//! user maps follow in declaration order. The loader creates the maps and
+//! rewrites each index to the fd it got.
 
 use std::collections::HashMap;
 
@@ -36,21 +48,78 @@ use crate::layout::{layout_event, EventLayout, FieldKind};
 
 // ------------------------------------------------------------------ output
 
-/// A compiled probe plus everything the loader needs to install it.
+/// Target architecture: decides `pt_regs` offsets for kprobes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    Aarch64,
+    X86_64,
+}
+
+impl Arch {
+    pub fn parse(s: &str) -> Option<Arch> {
+        match s {
+            "aarch64" | "arm64" => Some(Arch::Aarch64),
+            "x86_64" | "amd64" => Some(Arch::X86_64),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::Aarch64 => "aarch64",
+            Arch::X86_64 => "x86_64",
+        }
+    }
+
+    /// Byte offset in `struct pt_regs` of the n-th integer argument.
+    fn kprobe_arg_offset(self, n: i64) -> Option<i16> {
+        match self {
+            // regs[0..8] = x0..x7, contiguous.
+            Arch::Aarch64 => (0..8).contains(&n).then(|| (8 * n) as i16),
+            // rdi, rsi, rdx, rcx, r8, r9.
+            Arch::X86_64 => [112, 104, 96, 88, 72, 64].get(n as usize).copied(),
+        }
+    }
+
+    /// Byte offset in `struct pt_regs` of the return value register.
+    fn retval_offset(self) -> i16 {
+        match self {
+            Arch::Aarch64 => 0,  // x0
+            Arch::X86_64 => 80, // rax
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeKind {
+    Tracepoint { category: String, name: String },
+    Kprobe { function: String },
+    Kretprobe { function: String },
+}
+
+/// One BPF program.
+#[derive(Debug, Clone)]
+pub struct CompiledProbe {
+    /// `tracepoint:syscalls:sys_enter_execve`, `kprobe:do_sys_openat2`, ...
+    pub name: String,
+    pub kind: ProbeKind,
+    pub bytecode: Vec<u8>,
+    pub stack_bytes: u32,
+}
+
+/// Everything the loader needs to install a honey program.
 #[derive(Debug, Clone)]
 pub struct Compiled {
-    pub bytecode: Vec<u8>,
-    pub tracepoint: (String, String),
+    pub programs: Vec<CompiledProbe>,
     /// Ring buffer size in bytes (map index 0).
     pub ringbuf_bytes: u32,
     /// User maps, in index order starting at 1.
     pub maps: Vec<MapSpec>,
-    /// Layouts of every declared event (the loader decodes by name).
+    /// Every declared event; its position is its id in the record header.
     pub events: Vec<EventLayout>,
-    /// The event this probe emits (the loader prints this one).
-    pub event: EventLayout,
     pub license: String,
-    /// Bytes of BPF stack the probe uses (must stay ≤ 512).
+    pub arch: Arch,
+    /// Largest per-probe stack use.
     pub stack_bytes: u32,
 }
 
@@ -71,21 +140,21 @@ pub enum MapKind {
 
 const RINGBUF_INDEX: i32 = 0;
 const BPF_STACK_LIMIT: i32 = 512;
+/// Bytes before the payload in every ring-buffer record: `u32` event id + pad.
+pub const RECORD_HEADER: u32 = 8;
 
 // -------------------------------------------------------------------- types
 //
-// Just enough type information to pick load/store widths. Stage 4 replaces
-// this with a real checker; codegen then consumes its output.
+// Just enough type information to pick load/store widths and signedness.
+// The type checker (stage 4) has already validated the program.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ty {
-    Uint(u32), // byte width
+    Uint(u32),
+    I64,
     Bool,
-    /// Fixed-capacity byte buffer on the stack (a `str<N>` local).
     Str(u32),
-    /// Pointer into a map value of this type (from `map.get`).
     ValuePtr(Box<Ty>),
-    /// `Option<&V>` straight out of `map.get`, before the null check.
     OptionPtr(Box<Ty>),
 }
 
@@ -96,8 +165,9 @@ impl Ty {
             ("u16", []) => Ok(Ty::Uint(2)),
             ("u32", []) => Ok(Ty::Uint(4)),
             ("u64", []) => Ok(Ty::Uint(8)),
+            ("i64", []) => Ok(Ty::I64),
             ("bool", []) => Ok(Ty::Bool),
-            (other, _) => Err(format!("type `{other}` is not supported in codegen yet")),
+            (other, _) => Err(format!("type `{other}` is not supported in codegen")),
         }
     }
 
@@ -106,7 +176,7 @@ impl Ty {
             Ty::Uint(w) => *w,
             Ty::Bool => 1,
             Ty::Str(n) => *n,
-            Ty::ValuePtr(_) | Ty::OptionPtr(_) => 8,
+            Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) => 8,
         }
     }
 
@@ -128,88 +198,118 @@ struct Local {
     ty: Ty,
 }
 
-struct Cg {
-    prog: Prog,
-    events: HashMap<String, EventLayout>,
+/// Declarations shared by every probe in the program.
+struct Shared {
+    events: Vec<EventLayout>,
+    event_ids: HashMap<String, u32>,
     maps: Vec<MapSpec>,
     map_index: HashMap<String, i32>,
-    map_types: HashMap<String, (Ty, Ty)>, // key, value
+    map_types: HashMap<String, (Ty, Ty)>,
     consts: HashMap<String, i64>,
+    arch: Arch,
+}
+
+struct Cg<'a> {
+    sh: &'a Shared,
+    kind: &'a ProbeKind,
+    prog: Prog,
     scopes: Vec<HashMap<String, Local>>,
-    /// Next free stack offset (positive magnitude; slot is at R10 - off).
+    /// Loop variables and other per-probe constants (shadow `sh.consts`).
+    local_consts: HashMap<String, i64>,
     stack_top: i32,
     max_stack: i32,
     exit_label: Label,
-    /// Stack slot holding the tracepoint context pointer (R1 at entry).
     ctx_slot: i16,
 }
 
 // -------------------------------------------------------------------- entry
 
-pub fn compile(program: &Program) -> Result<Compiled, String> {
-    let mut events = HashMap::new();
-    let mut maps = Vec::new();
-    let mut map_index = HashMap::new();
-    let mut map_types = HashMap::new();
-    let mut consts = HashMap::new();
-    let mut probe = None;
+pub fn compile(program: &Program, arch: Arch) -> Result<Compiled, String> {
+    let mut sh = Shared {
+        events: Vec::new(),
+        event_ids: HashMap::new(),
+        maps: Vec::new(),
+        map_index: HashMap::new(),
+        map_types: HashMap::new(),
+        consts: HashMap::new(),
+        arch,
+    };
+    let mut probes = Vec::new();
 
     for item in &program.items {
         match item {
             Item::Event(e) => {
-                events.insert(e.name.name.clone(), layout_event(e)?);
+                let layout = layout_event(e)?;
+                sh.event_ids.insert(e.name.name.clone(), sh.events.len() as u32);
+                sh.events.push(layout);
             }
             Item::Const(c) => {
-                let v = const_value(&c.value)?;
-                consts.insert(c.name.name.clone(), v);
+                sh.consts.insert(c.name.name.clone(), const_value(&c.value)?);
             }
             Item::Map(m) => {
                 let (spec, kty, vty) = map_spec(m)?;
-                map_index.insert(m.name.name.clone(), (maps.len() as i32) + 1);
-                map_types.insert(m.name.name.clone(), (kty, vty));
-                maps.push(spec);
+                sh.map_index.insert(m.name.name.clone(), (sh.maps.len() as i32) + 1);
+                sh.map_types.insert(m.name.name.clone(), (kty, vty));
+                sh.maps.push(spec);
             }
-            Item::Probe(p) => {
-                if probe.is_some() {
-                    return Err("only one probe per program is supported yet".into());
-                }
-                probe = Some(p);
-            }
+            Item::Probe(p) => probes.push(p),
         }
     }
-    let probe = probe.ok_or("no probe to compile")?;
-
-    if probe.kind.name != "tracepoint" {
-        return Err(format!("only `tracepoint` probes are supported yet, got `{}`", probe.kind.name));
+    if probes.is_empty() {
+        return Err("no probe to compile".into());
     }
-    let [category, name] = probe.args.as_slice() else {
-        return Err("tracepoint probe needs exactly two string arguments".into());
-    };
 
+    let mut programs = Vec::new();
+    for p in probes {
+        let kind = match (p.kind.name.as_str(), p.args.as_slice()) {
+            ("tracepoint", [c, n]) => ProbeKind::Tracepoint { category: c.clone(), name: n.clone() },
+            ("kprobe", [f]) => ProbeKind::Kprobe { function: f.clone() },
+            ("kretprobe", [f]) => ProbeKind::Kretprobe { function: f.clone() },
+            (k, a) => return Err(format!("probe `{k}` with {} argument(s) is not supported", a.len())),
+        };
+        let name = match &kind {
+            ProbeKind::Tracepoint { category, name } => format!("tracepoint:{category}:{name}"),
+            ProbeKind::Kprobe { function } => format!("kprobe:{function}"),
+            ProbeKind::Kretprobe { function } => format!("kretprobe:{function}"),
+        };
+        let (bytecode, stack_bytes) = compile_probe(&sh, &kind, p)?;
+        programs.push(CompiledProbe { name, kind, bytecode, stack_bytes });
+    }
+
+    let stack_bytes = programs.iter().map(|p| p.stack_bytes).max().unwrap_or(0);
+    Ok(Compiled {
+        programs,
+        ringbuf_bytes: 1 << 16,
+        maps: sh.maps,
+        events: sh.events,
+        license: "GPL".into(),
+        arch,
+        stack_bytes,
+    })
+}
+
+fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl) -> Result<(Vec<u8>, u32), String> {
     let mut prog = Prog::new();
     let exit_label = prog.new_label();
     let mut cg = Cg {
+        sh,
+        kind,
         prog,
-        events,
-        maps,
-        map_index,
-        map_types,
-        consts,
         scopes: vec![HashMap::new()],
+        local_consts: HashMap::new(),
         stack_top: 0,
         max_stack: 0,
         exit_label,
         ctx_slot: 0,
     };
 
-    // Save the context pointer (R1 at entry) so `arg(n)` can read it after
-    // other code has reused R1.
+    // Prologue: save the context pointer (R1) for `arg` / `retval`.
     cg.ctx_slot = cg.alloc_slot();
     cg.prog.push(stx_mem(Size::DW, Reg::R10, cg.ctx_slot, Reg::R1));
 
-    let emitted = cg.block(&probe.body, true)?;
+    cg.block(&p.body, true)?;
 
-    // exit: return 0
+    // Epilogue: return 0.
     cg.prog.bind(cg.exit_label);
     cg.prog.push(mov64_imm(Reg::R0, 0));
     cg.prog.push(bpf::exit());
@@ -220,28 +320,15 @@ pub fn compile(program: &Program) -> Result<Compiled, String> {
             cg.max_stack
         ));
     }
-
-    let event = emitted.ok_or("probe never emits an event; nothing for the loader to print")?;
-    let events: Vec<EventLayout> = cg.events.values().cloned().collect();
-    let bytecode = cg.prog.to_bytes()?;
-
-    Ok(Compiled {
-        bytecode,
-        tracepoint: (category.clone(), name.clone()),
-        ringbuf_bytes: 1 << 16,
-        maps: cg.maps,
-        events,
-        event,
-        license: "GPL".into(),
-        stack_bytes: cg.max_stack as u32,
-    })
+    let max_stack = cg.max_stack as u32;
+    Ok((cg.prog.to_bytes()?, max_stack))
 }
 
 fn const_value(e: &Expr) -> Result<i64, String> {
     match &e.kind {
         ExprKind::Int(n) => Ok(*n as i64),
         ExprKind::Bool(b) => Ok(*b as i64),
-        _ => Err("const initialisers must be integer literals for now".into()),
+        _ => Err("const initialisers must be integer literals".into()),
     }
 }
 
@@ -279,12 +366,39 @@ fn map_spec(m: &MapDecl) -> Result<(MapSpec, Ty, Ty), String> {
     }
 }
 
+fn str_capacity(t: &Type) -> Result<u32, String> {
+    match t.args.as_slice() {
+        [TypeArg::Int(n)] => u32::try_from(*n).map_err(|_| "str capacity too large".into()),
+        _ => Err("`str` needs a capacity, e.g. `str<64>`".into()),
+    }
+}
+
+/// Which jump implements a comparison, given whether operands are signed.
+fn compare_op(op: BinaryOp, signed: bool) -> Option<JmpOp> {
+    Some(match (op, signed) {
+        (BinaryOp::Eq, _) => JmpOp::Eq,
+        (BinaryOp::Ne, _) => JmpOp::Ne,
+        (BinaryOp::Lt, false) => JmpOp::Lt,
+        (BinaryOp::Le, false) => JmpOp::Le,
+        (BinaryOp::Gt, false) => JmpOp::Gt,
+        (BinaryOp::Ge, false) => JmpOp::Ge,
+        (BinaryOp::Lt, true) => JmpOp::Slt,
+        (BinaryOp::Le, true) => JmpOp::Sle,
+        (BinaryOp::Gt, true) => JmpOp::Sgt,
+        (BinaryOp::Ge, true) => JmpOp::Sge,
+        _ => return None,
+    })
+}
+
+fn is_comparison(op: BinaryOp) -> bool {
+    matches!(op, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge)
+}
+
 // --------------------------------------------------------------- statements
 
-impl Cg {
+impl Cg<'_> {
     // ---- stack -----------------------------------------------------------
 
-    /// Reserve an 8-byte stack slot; returns the offset below R10.
     fn alloc_slot(&mut self) -> i16 {
         self.stack_top += 8;
         self.max_stack = self.max_stack.max(self.stack_top);
@@ -295,8 +409,6 @@ impl Cg {
         self.stack_top -= 8;
     }
 
-    /// Reserve `n` bytes (rounded up to 8) and return the offset of the
-    /// buffer's first byte below R10.
     fn alloc_bytes(&mut self, n: u32) -> i16 {
         let rounded = n.div_ceil(8) * 8;
         self.stack_top += rounded as i32;
@@ -319,24 +431,29 @@ impl Cg {
         self.scopes.push(HashMap::new());
     }
 
-    /// Pop a scope and release its slots (LIFO, so this is exact).
+    /// Pop a scope and release its stack. Strings occupy more than one slot,
+    /// so release by size, not by count.
     fn pop_scope(&mut self) {
         let scope = self.scopes.pop().unwrap();
-        for _ in 0..scope.len() {
-            self.free_slot();
+        for local in scope.values() {
+            let bytes = match &local.ty {
+                Ty::Str(n) => n.div_ceil(8) * 8,
+                _ => 8,
+            };
+            self.stack_top -= bytes as i32;
         }
     }
 
-    /// Evaluate a compile-time-constant integer expression (literals, consts,
-    /// and simple arithmetic over them). Used for loop bounds and arg indices.
+    fn const_lookup(&self, name: &str) -> Option<i64> {
+        self.local_consts.get(name).or_else(|| self.sh.consts.get(name)).copied()
+    }
+
     fn const_eval(&self, e: &Expr) -> Result<i64, String> {
         match &e.kind {
             ExprKind::Int(n) => Ok(*n as i64),
             ExprKind::Bool(b) => Ok(*b as i64),
             ExprKind::Ident(name) => self
-                .consts
-                .get(name)
-                .copied()
+                .const_lookup(name)
                 .ok_or_else(|| format!("`{name}` is not a compile-time constant")),
             ExprKind::Binary { op, lhs, rhs } => {
                 let a = self.const_eval(lhs)?;
@@ -347,6 +464,7 @@ impl Cg {
                     BinaryOp::Mul => a * b,
                     BinaryOp::BitOr => a | b,
                     BinaryOp::BitAnd => a & b,
+                    BinaryOp::Shl => a << b,
                     _ => return Err("unsupported operator in a constant expression".into()),
                 })
             }
@@ -356,58 +474,38 @@ impl Cg {
 
     // ---- blocks ----------------------------------------------------------
 
-    /// Compile a block. Returns the layout of the event it emits, if any
-    /// (`top` blocks must emit exactly one kind so the loader knows what to
-    /// print).
-    fn block(&mut self, b: &Block, top: bool) -> Result<Option<EventLayout>, String> {
+    fn block(&mut self, b: &Block, top: bool) -> Result<(), String> {
         if !top {
             self.push_scope();
         }
-        let mut emitted: Option<EventLayout> = None;
         for s in &b.stmts {
-            if let Some(ev) = self.stmt(s)? {
-                match &emitted {
-                    Some(prev) if prev.name != ev.name => {
-                        return Err(format!(
-                            "a probe may emit only one event type for now (got `{}` and `{}`)",
-                            prev.name, ev.name
-                        ));
-                    }
-                    _ => emitted = Some(ev),
-                }
-            }
+            self.stmt(s)?;
         }
         if !top {
             self.pop_scope();
         }
-        Ok(emitted)
+        Ok(())
     }
 
-    fn stmt(&mut self, s: &Stmt) -> Result<Option<EventLayout>, String> {
+    fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
             StmtKind::Let { name, ty, value, .. } => {
-                // `let path: str<N> = read_user_str(p);` allocates the buffer
-                // and reads straight into it — a string is not a scalar in R0.
                 if let Some(t) = ty
                     && t.name.name == "str"
                 {
                     let n = str_capacity(t)?;
                     let off = self.alloc_bytes(n);
-                    self.scopes.last_mut().unwrap().insert(
-                        name.name.clone(),
-                        Local { off, ty: Ty::Str(n) },
-                    );
-                    self.read_user_str_into(off, n, value)?;
-                    return Ok(None);
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off, ty: Ty::Str(n) });
+                    return self.read_user_str_into(off, n, value);
                 }
-                let vty = self.expr(value)?; // value in R0
+                let vty = self.expr(value)?;
                 let ty = match ty {
                     Some(t) => Ty::from_ast(t)?,
                     None => vty,
                 };
                 let local = self.declare(&name.name, ty);
                 self.prog.push(stx_mem(Size::DW, Reg::R10, local.off, Reg::R0));
-                Ok(None)
+                Ok(())
             }
             StmtKind::Assign { target, value } => {
                 self.expr(value)?;
@@ -418,17 +516,15 @@ impl Cg {
                             .cloned()
                             .ok_or_else(|| format!("assignment to unknown variable `{n}`"))?;
                         self.prog.push(stx_mem(Size::DW, Reg::R10, local.off, Reg::R0));
-                        Ok(None)
+                        Ok(())
                     }
-                    ExprKind::Unary { op: UnaryOp::Deref, .. } => {
-                        Err("writing through a map pointer (`*p = ...`) is not supported yet; use `map.insert`".into())
-                    }
-                    _ => Err("invalid assignment target".into()),
+                    _ => Err("unsupported assignment target".into()),
                 }
             }
             StmtKind::If { cond, then, otherwise } => {
                 let else_label = self.prog.new_label();
                 let end_label = self.prog.new_label();
+                let mut binding_scope = false;
                 match cond {
                     Cond::Expr(e) => {
                         let then_label = self.prog.new_label();
@@ -436,39 +532,24 @@ impl Cg {
                         self.prog.bind(then_label);
                     }
                     Cond::Let { pattern, value } => {
-                        self.if_let_prelude(pattern, value, else_label)?;
+                        binding_scope = self.if_let_prelude(pattern, value, else_label)?;
                     }
                 }
-                let mut emitted = self.block(then, false)?;
-                if let Cond::Let { pattern, .. } = cond
-                    && pattern.binding.is_some() {
-                        self.pop_scope(); // the binding's scope
-                    }
+                self.block(then, false)?;
+                if binding_scope {
+                    self.pop_scope();
+                }
                 if otherwise.is_some() {
                     self.prog.ja_to(end_label);
                 }
                 self.prog.bind(else_label);
-                if let Some(b) = otherwise
-                    && let Some(ev) = self.block(b, false)? {
-                        emitted = Some(ev);
-                    }
+                if let Some(b) = otherwise {
+                    self.block(b, false)?;
+                }
                 self.prog.bind(end_label);
-                Ok(emitted)
-            }
-            StmtKind::Return(None) => {
-                self.prog.ja_to(self.exit_label);
-                Ok(None)
-            }
-            StmtKind::Return(Some(_)) => Err("`return <value>` is not supported; probes return 0".into()),
-            StmtKind::Emit { event, fields } => self.emit(event, fields).map(Some),
-            StmtKind::Expr(e) => {
-                self.expr(e)?;
-                Ok(None)
+                Ok(())
             }
             StmtKind::For { var, start, end, body } => {
-                // Bounded loops only: both ends must be compile-time constants,
-                // and we unroll. That is the whole point — the verifier gets a
-                // straight-line program it can prove terminates.
                 let lo = self.const_eval(start)?;
                 let hi = self.const_eval(end)?;
                 if hi < lo {
@@ -477,46 +558,51 @@ impl Cg {
                 if hi - lo > 64 {
                     return Err(format!("`for` unrolls {} iterations; the limit is 64", hi - lo));
                 }
-                let mut emitted = None;
                 for i in lo..hi {
-                    // Bind the loop variable as a constant for this iteration,
-                    // saving any outer const it shadows.
-                    let prev = self.consts.insert(var.name.clone(), i);
-                    let ev = self.block(body, false)?;
-                    if let Some(ev) = ev {
-                        emitted = Some(ev);
-                    }
+                    let prev = self.local_consts.insert(var.name.clone(), i);
+                    self.block(body, false)?;
                     match prev {
-                        Some(v) => { self.consts.insert(var.name.clone(), v); }
-                        None => { self.consts.remove(&var.name); }
+                        Some(v) => {
+                            self.local_consts.insert(var.name.clone(), v);
+                        }
+                        None => {
+                            self.local_consts.remove(&var.name);
+                        }
                     }
                 }
-                Ok(emitted)
+                Ok(())
+            }
+            StmtKind::Return(None) => {
+                self.prog.ja_to(self.exit_label);
+                Ok(())
+            }
+            StmtKind::Return(Some(_)) => Err("`return <value>` is not supported".into()),
+            StmtKind::Emit { event, fields } => self.emit(event, fields),
+            StmtKind::Expr(e) => {
+                self.expr(e)?;
+                Ok(())
             }
         }
     }
 
-    /// `if let Some(x) = map.get(k)`: evaluate the lookup, spill the pointer
-    /// into a fresh local `x`, and jump to `else_label` when it is null.
-    fn if_let_prelude(&mut self, pattern: &Pattern, value: &Expr, else_label: Label) -> Result<(), String> {
+    /// `if let Some(x) = map.get(k)`: evaluate, spill, null-check. Returns
+    /// whether a binding scope was pushed (the caller pops it).
+    fn if_let_prelude(&mut self, pattern: &Pattern, value: &Expr, else_label: Label) -> Result<bool, String> {
         let ty = self.expr(value)?; // R0 = ptr or 0
         let Ty::OptionPtr(inner) = ty else {
             return Err("`if let` only works on the result of `map.get(...)`".into());
         };
         match (pattern.name.name.as_str(), &pattern.binding) {
             ("Some", Some(bind)) => {
-                // The binding lives in its own scope so it disappears after
-                // the then-block. We spill R0 first, then null-check it; the
-                // verifier propagates the check to the spilled copy.
                 self.push_scope();
                 let local = self.declare(&bind.name, Ty::ValuePtr(inner));
                 self.prog.push(stx_mem(Size::DW, Reg::R10, local.off, Reg::R0));
                 self.prog.jmp_imm_to(JmpOp::Eq, Reg::R0, 0, else_label);
-                Ok(())
+                Ok(true)
             }
             ("None", None) => {
                 self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, 0, else_label);
-                Ok(())
+                Ok(false)
             }
             _ => Err("pattern must be `Some(name)` or `None`".into()),
         }
@@ -524,8 +610,6 @@ impl Cg {
 
     // ---- conditions ------------------------------------------------------
 
-    /// Compile a boolean expression as control flow: jump to `then_label` if
-    /// true, `else_label` if false. Short-circuits `&&` / `||`.
     fn cond(&mut self, e: &Expr, then_label: Label, else_label: Label) -> Result<(), String> {
         match &e.kind {
             ExprKind::Binary { op: BinaryOp::And, lhs, rhs } => {
@@ -541,16 +625,15 @@ impl Cg {
                 self.cond(rhs, then_label, else_label)
             }
             ExprKind::Unary { op: UnaryOp::Not, expr } => self.cond(expr, else_label, then_label),
-            ExprKind::Binary { op, lhs, rhs } if compare_op(*op).is_some() => {
-                // R1 = lhs, R0 = rhs, then `if R1 op R0 goto then; goto else`.
-                self.binary_operands(lhs, rhs)?;
-                let jop = compare_op(*op).unwrap();
+            ExprKind::Binary { op, lhs, rhs } if is_comparison(*op) => {
+                let (lty, rty) = self.binary_operands(lhs, rhs)?; // R1 = lhs, R0 = rhs
+                let signed = lty == Ty::I64 || rty == Ty::I64;
+                let jop = compare_op(*op, signed).unwrap();
                 self.prog.jmp_reg_to(jop, Reg::R1, Reg::R0, then_label);
                 self.prog.ja_to(else_label);
                 Ok(())
             }
             _ => {
-                // Any other expression: nonzero is true.
                 self.expr(e)?;
                 self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, 0, then_label);
                 self.prog.ja_to(else_label);
@@ -561,30 +644,27 @@ impl Cg {
 
     // ---- emit ------------------------------------------------------------
 
-    fn emit(&mut self, event: &Ident, fields: &[(Ident, Expr)]) -> Result<EventLayout, String> {
-        let layout = self
-            .events
+    fn emit(&mut self, event: &Ident, fields: &[(Ident, Expr)]) -> Result<(), String> {
+        let id = *self
+            .sh
+            .event_ids
             .get(&event.name)
-            .cloned()
             .ok_or_else(|| format!("unknown event `{}`", event.name))?;
-        if fields.len() != layout.fields.len() {
-            return Err(format!(
-                "event `{}` has {} fields but `emit` provides {}",
-                layout.name,
-                layout.fields.len(),
-                fields.len()
-            ));
-        }
-
+        let layout = self.sh.events[id as usize].clone();
+        let total = RECORD_HEADER + layout.size;
         let skip = self.prog.new_label();
 
-        // r0 = bpf_ringbuf_reserve(&ringbuf, size, 0); if !r0 skip
+        // r0 = bpf_ringbuf_reserve(&ringbuf, total, 0); if !r0 skip
         self.prog.push(ld_map_fd(Reg::R1, RINGBUF_INDEX));
-        self.prog.push(mov64_imm(Reg::R2, layout.size as i32));
+        self.prog.push(mov64_imm(Reg::R2, total as i32));
         self.prog.push(mov64_imm(Reg::R3, 0));
         self.prog.push(call(Helper::RingbufReserve));
         self.prog.jmp_imm_to(JmpOp::Eq, Reg::R0, 0, skip);
         self.prog.push(mov64_reg(Reg::R6, Reg::R0));
+
+        // Header: event id.
+        self.prog.push(st_mem(Size::W, Reg::R6, 0, id as i32));
+        self.prog.push(st_mem(Size::W, Reg::R6, 4, 0));
 
         for (fname, value) in fields {
             let fl = layout
@@ -592,35 +672,35 @@ impl Cg {
                 .iter()
                 .find(|f| f.name == fname.name)
                 .ok_or_else(|| format!("event `{}` has no field `{}`", layout.name, fname.name))?;
-            let off = i16::try_from(fl.offset).map_err(|_| "field offset too large")?;
+            let off = i16::try_from(RECORD_HEADER + fl.offset).map_err(|_| "field offset too large")?;
 
-            // comm() fills the field in place; everything else is a value.
+            // comm() fills the field in place.
             if let ExprKind::Call { callee, args } = &value.kind
-                && args.is_empty() && matches!(&callee.kind, ExprKind::Ident(n) if n == "comm") {
-                    let FieldKind::Str(n) = fl.kind else {
-                        return Err("`comm()` must fill a `str<N>` field".into());
-                    };
-                    self.prog.push(mov64_reg(Reg::R1, Reg::R6));
-                    self.prog.push(alu64_imm(AluOp::Add, Reg::R1, off as i32));
-                    self.prog.push(mov64_imm(Reg::R2, n as i32));
-                    self.prog.push(call(Helper::GetCurrentComm));
-                    continue;
-                }
+                && args.is_empty()
+                && matches!(&callee.kind, ExprKind::Ident(n) if n == "comm")
+            {
+                let FieldKind::Str(n) = fl.kind else {
+                    return Err("`comm()` must fill a `str<N>` field".into());
+                };
+                self.prog.push(mov64_reg(Reg::R1, Reg::R6));
+                self.prog.push(alu64_imm(AluOp::Add, Reg::R1, off as i32));
+                self.prog.push(mov64_imm(Reg::R2, n as i32));
+                self.prog.push(call(Helper::GetCurrentComm));
+                continue;
+            }
             if let FieldKind::Str(cap) = fl.kind {
-                // The value must be a `str<N>` local; copy its bytes in.
                 let ExprKind::Ident(n) = &value.kind else {
                     return Err(format!("string field `{}` must be a `str` variable", fname.name));
                 };
                 let local = self.lookup(n).cloned().ok_or_else(|| format!("unknown variable `{n}`"))?;
                 let Ty::Str(src_cap) = local.ty else {
-                    return Err(format!("field `{}` expects a string, `{n}` is not one", fname.name));
+                    return Err(format!("field `{}` expects a string", fname.name));
                 };
-                let bytes = src_cap.min(cap);
-                self.copy_str_to_record(local.off, off, bytes);
+                self.copy_str_to_record(local.off, off, src_cap.min(cap));
                 continue;
             }
             let size = match fl.kind {
-                FieldKind::Uint(w) => Ty::Uint(w).mem_size(),
+                FieldKind::Uint(w) | FieldKind::Sint(w) => Ty::Uint(w).mem_size(),
                 FieldKind::Bool => Size::B,
                 FieldKind::Str(_) => unreachable!(),
             };
@@ -633,12 +713,11 @@ impl Cg {
         self.prog.push(mov64_imm(Reg::R2, 0));
         self.prog.push(call(Helper::RingbufSubmit));
         self.prog.bind(skip);
-        Ok(layout)
+        Ok(())
     }
 
     // ---- expressions -----------------------------------------------------
 
-    /// Evaluate `e` into R0. Returns its (approximate) type.
     fn expr(&mut self, e: &Expr) -> Result<Ty, String> {
         match &e.kind {
             ExprKind::Int(n) => {
@@ -649,30 +728,26 @@ impl Cg {
                 self.prog.push(mov64_imm(Reg::R0, *b as i32));
                 Ok(Ty::Bool)
             }
-            ExprKind::Str(_) => Err("string values are not supported in expressions yet".into()),
+            ExprKind::Str(_) => Err("string values are not supported in expressions".into()),
             ExprKind::Ident(name) => {
                 if let Some(local) = self.lookup(name).cloned() {
                     self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, local.off));
                     return Ok(local.ty);
                 }
-                if let Some(v) = self.consts.get(name).copied() {
+                if let Some(v) = self.const_lookup(name) {
                     self.load_imm(Reg::R0, v);
                     return Ok(Ty::Uint(8));
                 }
                 Err(format!("unknown name `{name}`"))
             }
             ExprKind::Unary { op, expr } => match op {
-                UnaryOp::Deref => {
-                    let ty = self.expr(expr)?;
-                    match ty {
-                        Ty::ValuePtr(inner) => {
-                            self.prog.push(ldx_mem(inner.mem_size(), Reg::R0, Reg::R0, 0));
-                            Ok(*inner)
-                        }
-                        Ty::OptionPtr(_) => Err("map value must be checked with `if let Some(..)` before `*`".into()),
-                        _ => Err("`*` applied to a non-pointer".into()),
+                UnaryOp::Deref => match self.expr(expr)? {
+                    Ty::ValuePtr(inner) => {
+                        self.prog.push(ldx_mem(inner.mem_size(), Reg::R0, Reg::R0, 0));
+                        Ok(*inner)
                     }
-                }
+                    _ => Err("`*` applied to an unchecked or non-pointer value".into()),
+                },
                 UnaryOp::Neg => {
                     let ty = self.expr(expr)?;
                     self.prog.push(alu64_imm(AluOp::Neg, Reg::R0, 0));
@@ -684,7 +759,6 @@ impl Cg {
                     Ok(ty)
                 }
                 UnaryOp::Not => {
-                    // !x  ==  (x == 0)
                     self.expr(expr)?;
                     let t = self.prog.new_label();
                     let end = self.prog.new_label();
@@ -698,34 +772,32 @@ impl Cg {
                 }
             },
             ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs),
-            ExprKind::Cast { .. } => Err("`as` casts are not supported in codegen yet".into()),
+            ExprKind::Cast { .. } => Err("`as` casts are not supported".into()),
             ExprKind::Call { callee, args } => {
-                let name = match &callee.kind {
-                    ExprKind::Ident(n) => n.clone(),
-                    _ => return Err("only plain builtin calls are supported".into()),
+                let ExprKind::Ident(name) = &callee.kind else {
+                    return Err("only builtins can be called".into());
                 };
                 if args.is_empty() {
-                    self.builtin(&name)
+                    self.builtin(name)
                 } else {
-                    self.builtin_with_args(&name, args)
+                    self.builtin_with_args(name, args)
                 }
             }
             ExprKind::MethodCall { receiver, method, args } => {
                 if let ExprKind::Ident(n) = &receiver.kind {
-                    // String methods on a `str<N>` local.
                     if let Some(local) = self.lookup(n).cloned()
                         && let Ty::Str(cap) = local.ty
                     {
                         return self.str_method(local.off, cap, &method.name, args);
                     }
-                    if self.map_index.contains_key(n) {
+                    if self.sh.map_index.contains_key(n) {
                         return self.map_method(n, &method.name, args);
                     }
                 }
                 Err(format!("`.{}()` is only supported on maps and strings", method.name))
             }
-            ExprKind::Field { .. } => Err("field access is not supported in codegen yet".into()),
-            ExprKind::Index { .. } => Err("indexing is not supported in codegen yet".into()),
+            ExprKind::Field { .. } => Err("field access is not supported".into()),
+            ExprKind::Index { .. } => Err("indexing is not supported".into()),
         }
     }
 
@@ -737,24 +809,26 @@ impl Cg {
         }
     }
 
-    /// Leaves lhs in R1 and rhs in R0.
-    fn binary_operands(&mut self, lhs: &Expr, rhs: &Expr) -> Result<Ty, String> {
+    /// Leaves lhs in R1 and rhs in R0. Returns both operand types.
+    fn binary_operands(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(Ty, Ty), String> {
         let lty = self.expr(lhs)?;
         let tmp = self.alloc_slot();
         self.prog.push(stx_mem(Size::DW, Reg::R10, tmp, Reg::R0));
-        self.expr(rhs)?;
+        let rty = self.expr(rhs)?;
         self.prog.push(ldx_mem(Size::DW, Reg::R1, Reg::R10, tmp));
         self.free_slot();
-        Ok(lty)
+        Ok((lty, rty))
     }
 
     fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Result<Ty, String> {
-        if matches!(op, BinaryOp::And | BinaryOp::Or) || compare_op(op).is_some() {
-            // Materialise a boolean: 1 if the condition holds, else 0.
+        if matches!(op, BinaryOp::And | BinaryOp::Or) || is_comparison(op) {
             let t = self.prog.new_label();
             let f = self.prog.new_label();
             let end = self.prog.new_label();
-            let e = Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs.clone()), rhs: Box::new(rhs.clone()) }, span: lhs.span };
+            let e = Expr {
+                kind: ExprKind::Binary { op, lhs: Box::new(lhs.clone()), rhs: Box::new(rhs.clone()) },
+                span: lhs.span,
+            };
             self.cond(&e, t, f)?;
             self.prog.bind(t);
             self.prog.push(mov64_imm(Reg::R0, 1));
@@ -765,7 +839,7 @@ impl Cg {
             return Ok(Ty::Bool);
         }
 
-        let lty = self.binary_operands(lhs, rhs)?; // R1 = lhs, R0 = rhs
+        let (lty, rty) = self.binary_operands(lhs, rhs)?; // R1 = lhs, R0 = rhs
         let alu = match op {
             BinaryOp::Add => AluOp::Add,
             BinaryOp::Sub => AluOp::Sub,
@@ -779,21 +853,10 @@ impl Cg {
             BinaryOp::Shr => AluOp::Rsh,
             _ => unreachable!(),
         };
-        // R1 = R1 op R0; R0 = R1
         self.prog.push(alu64_reg(alu, Reg::R1, Reg::R0));
         self.prog.push(mov64_reg(Reg::R0, Reg::R1));
-        Ok(lty)
-    }
-
-    fn builtin_with_args(&mut self, name: &str, args: &[Expr]) -> Result<Ty, String> {
-        match (name, args) {
-            ("arg", [idx]) => {
-                let n = self.const_eval(idx)?;
-                self.load_ctx_arg(n)
-            }
-            ("read_user_str", _) => Err("`read_user_str` may only initialise a `str<N>` local".into()),
-            (other, _) => Err(format!("builtin `{other}` does not take arguments here")),
-        }
+        // A literal operand (typed Uint(8) here) adopts the other side's type.
+        Ok(if lty == Ty::I64 || rty == Ty::I64 { Ty::I64 } else { lty })
     }
 
     fn builtin(&mut self, name: &str) -> Result<Ty, String> {
@@ -805,7 +868,7 @@ impl Cg {
             }
             "tid" => {
                 self.prog.push(call(Helper::GetCurrentPidTgid));
-                self.prog.push(alu32_reg(AluOp::Mov, Reg::R0, Reg::R0)); // zero-extend low 32
+                self.prog.push(alu32_reg(AluOp::Mov, Reg::R0, Reg::R0));
                 Ok(Ty::Uint(4))
             }
             "uid" => {
@@ -822,9 +885,66 @@ impl Cg {
                 self.prog.push(call(Helper::KtimeGetNs));
                 Ok(Ty::Uint(8))
             }
-            "comm" => Err("`comm()` can only be used directly as an `emit` field value for now".into()),
+            "retval" => {
+                let ProbeKind::Kretprobe { .. } = self.kind else {
+                    return Err("`retval()` is only available in a kretprobe".into());
+                };
+                let off = self.sh.arch.retval_offset();
+                self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot));
+                self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R0, off));
+                Ok(Ty::I64)
+            }
+            "comm" => Err("`comm()` can only be used directly as an `emit` field value".into()),
             other => Err(format!("unknown builtin `{other}()`")),
         }
+    }
+
+    fn builtin_with_args(&mut self, name: &str, args: &[Expr]) -> Result<Ty, String> {
+        match (name, args) {
+            ("arg", [idx]) => {
+                let n = self.const_eval(idx)?;
+                let off = match self.kind {
+                    ProbeKind::Tracepoint { .. } => {
+                        if !(0..=5).contains(&n) {
+                            return Err(format!("arg index {n} out of range"));
+                        }
+                        (16 + 8 * n) as i16
+                    }
+                    ProbeKind::Kprobe { .. } => self
+                        .sh
+                        .arch
+                        .kprobe_arg_offset(n)
+                        .ok_or_else(|| format!("arg index {n} out of range for {}", self.sh.arch.name()))?,
+                    ProbeKind::Kretprobe { .. } => {
+                        return Err("`arg()` is not available in a kretprobe".into());
+                    }
+                };
+                self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot));
+                self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R0, off));
+                Ok(Ty::Uint(8))
+            }
+            ("read_user_str", _) => Err("`read_user_str` may only initialise a `str<N>` local".into()),
+            (other, _) => Err(format!("builtin `{other}` does not take arguments here")),
+        }
+    }
+
+    fn read_user_str_into(&mut self, off: i16, n: u32, value: &Expr) -> Result<(), String> {
+        let ExprKind::Call { callee, args } = &value.kind else {
+            return Err("a `str<N>` local must be initialised with `read_user_str(ptr)`".into());
+        };
+        if !matches!(&callee.kind, ExprKind::Ident(name) if name == "read_user_str") {
+            return Err("a `str<N>` local must be initialised with `read_user_str(ptr)`".into());
+        }
+        let [src] = args.as_slice() else {
+            return Err("`read_user_str` takes exactly one pointer argument".into());
+        };
+        self.expr(src)?;
+        self.prog.push(mov64_reg(Reg::R3, Reg::R0));
+        self.prog.push(mov64_reg(Reg::R1, Reg::R10));
+        self.prog.push(alu64_imm(AluOp::Add, Reg::R1, off as i32));
+        self.prog.push(mov64_imm(Reg::R2, n as i32));
+        self.prog.push(call(Helper::ProbeReadUserStr));
+        Ok(())
     }
 
     fn str_method(&mut self, off: i16, cap: u32, method: &str, args: &[Expr]) -> Result<Ty, String> {
@@ -833,22 +953,48 @@ impl Cg {
                 let ExprKind::Str(lit) = &arg.kind else {
                     return Err("`starts_with` takes a string literal".into());
                 };
-                self.str_starts_with(off, cap, lit)
+                let bytes = lit.as_bytes();
+                if bytes.len() as u32 > cap {
+                    return Err(format!("prefix {lit:?} is longer than the str<{cap}> it tests"));
+                }
+                let fail = self.prog.new_label();
+                let end = self.prog.new_label();
+                for (i, &b) in bytes.iter().enumerate() {
+                    self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, off + i as i16));
+                    self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, b as i32, fail);
+                }
+                self.prog.push(mov64_imm(Reg::R0, 1));
+                self.prog.ja_to(end);
+                self.prog.bind(fail);
+                self.prog.push(mov64_imm(Reg::R0, 0));
+                self.prog.bind(end);
+                Ok(Ty::Bool)
             }
             ("byte_at", [arg]) => {
                 let i = self.const_eval(arg)?;
-                self.str_byte_at(off, cap, i)
+                if i < 0 || i as u32 >= cap {
+                    return Err(format!("byte_at({i}) is outside str<{cap}>"));
+                }
+                self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, off + i as i16));
+                Ok(Ty::Uint(1))
             }
             (m, a) => Err(format!("string has no method `{m}` taking {} argument(s)", a.len())),
         }
     }
 
+    fn copy_str_to_record(&mut self, src: i16, dst: i16, n: u32) {
+        let words = n.div_ceil(8);
+        for w in 0..words as i16 {
+            self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, src + w * 8));
+            self.prog.push(stx_mem(Size::DW, Reg::R6, dst + w * 8, Reg::R0));
+        }
+    }
+
     fn map_method(&mut self, map: &str, method: &str, args: &[Expr]) -> Result<Ty, String> {
-        let idx = self.map_index[map];
-        let (kty, vty) = self.map_types[map].clone();
+        let idx = self.sh.map_index[map];
+        let (kty, vty) = self.sh.map_types[map].clone();
         match (method, args) {
             ("get", [key]) => {
-                // key -> stack slot; r1 = map; r2 = &key; call lookup
                 self.expr(key)?;
                 let kslot = self.alloc_slot();
                 self.prog.push(stx_mem(kty.mem_size(), Reg::R10, kslot, Reg::R0));
@@ -875,7 +1021,7 @@ impl Cg {
                 self.prog.push(call(Helper::MapUpdateElem));
                 self.free_slot();
                 self.free_slot();
-                Ok(Ty::Uint(8)) // helper's return code, usually ignored
+                Ok(Ty::Uint(8))
             }
             ("delete", [key]) => {
                 self.expr(key)?;
@@ -891,100 +1037,4 @@ impl Cg {
             (m, a) => Err(format!("map `{map}` has no method `{m}` taking {} argument(s)", a.len())),
         }
     }
-}
-
-impl Cg {
-    /// `read_user_str(p)` into the `n`-byte buffer at `[R10 + off]`:
-    /// bpf_probe_read_user_str(dst = buffer, size = n, src = p).
-    fn read_user_str_into(&mut self, off: i16, n: u32, value: &Expr) -> Result<(), String> {
-        let ExprKind::Call { callee, args } = &value.kind else {
-            return Err("a `str<N>` local must be initialised with `read_user_str(ptr)`".into());
-        };
-        if !matches!(&callee.kind, ExprKind::Ident(name) if name == "read_user_str") {
-            return Err("a `str<N>` local must be initialised with `read_user_str(ptr)`".into());
-        }
-        let [src] = args.as_slice() else {
-            return Err("`read_user_str` takes exactly one pointer argument".into());
-        };
-        self.expr(src)?; // pointer in R0
-        self.prog.push(mov64_reg(Reg::R3, Reg::R0));      // src
-        self.prog.push(mov64_reg(Reg::R1, Reg::R10));     // dst = &buffer
-        self.prog.push(alu64_imm(AluOp::Add, Reg::R1, off as i32));
-        self.prog.push(mov64_imm(Reg::R2, n as i32));     // size
-        self.prog.push(call(Helper::ProbeReadUserStr));
-        Ok(())
-    }
-
-    /// `arg(n)`: the n-th tracepoint argument, at ctx + 16 + 8*n.
-    fn load_ctx_arg(&mut self, n: i64) -> Result<Ty, String> {
-        if !(0..=32).contains(&n) {
-            return Err(format!("arg index {n} out of range"));
-        }
-        let off = i16::try_from(16 + 8 * n).unwrap();
-        self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, self.ctx_slot)); // R0 = ctx
-        self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R0, off));            // R0 = *(ctx+off)
-        Ok(Ty::Uint(8))
-    }
-
-    /// `s.starts_with("literal")` on a `str<N>` local: compare byte by byte,
-    /// result 1 in R0 if every prefix byte matches, else 0. Fully unrolled and
-    /// bounded by the literal length, so the verifier sees straight-line code.
-    fn str_starts_with(&mut self, off: i16, cap: u32, lit: &str) -> Result<Ty, String> {
-        let bytes = lit.as_bytes();
-        if bytes.len() as u32 > cap {
-            return Err(format!("prefix {lit:?} is longer than the str<{cap}> it tests"));
-        }
-        let fail = self.prog.new_label();
-        let end = self.prog.new_label();
-        for (i, &b) in bytes.iter().enumerate() {
-            // R0 = buffer[i]; if R0 != b goto fail
-            self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, off + i as i16));
-            self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, b as i32, fail);
-        }
-        self.prog.push(mov64_imm(Reg::R0, 1));
-        self.prog.ja_to(end);
-        self.prog.bind(fail);
-        self.prog.push(mov64_imm(Reg::R0, 0));
-        self.prog.bind(end);
-        Ok(Ty::Bool)
-    }
-
-    /// `s.byte_at(i)` with constant `i`: load buffer[i] into R0.
-    fn str_byte_at(&mut self, off: i16, cap: u32, index: i64) -> Result<Ty, String> {
-        if index < 0 || index as u32 >= cap {
-            return Err(format!("byte_at({index}) is outside str<{cap}>"));
-        }
-        self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, off + index as i16));
-        Ok(Ty::Uint(1))
-    }
-
-    /// Copy an `n`-byte `str` buffer from `[R10 + src]` into the record at
-    /// `[R6 + dst]`, 8 bytes at a time (n is always a multiple of 8 on the
-    /// stack, and the record field is padded to match).
-    fn copy_str_to_record(&mut self, src: i16, dst: i16, n: u32) {
-        let words = n.div_ceil(8);
-        for w in 0..words as i16 {
-            self.prog.push(ldx_mem(Size::DW, Reg::R0, Reg::R10, src + w * 8));
-            self.prog.push(stx_mem(Size::DW, Reg::R6, dst + w * 8, Reg::R0));
-        }
-    }
-}
-
-fn str_capacity(t: &Type) -> Result<u32, String> {
-    match t.args.as_slice() {
-        [TypeArg::Int(n)] => u32::try_from(*n).map_err(|_| "str capacity too large".into()),
-        _ => Err("`str` needs a capacity, e.g. `str<64>`".into()),
-    }
-}
-
-fn compare_op(op: BinaryOp) -> Option<JmpOp> {
-    Some(match op {
-        BinaryOp::Eq => JmpOp::Eq,
-        BinaryOp::Ne => JmpOp::Ne,
-        BinaryOp::Lt => JmpOp::Lt,
-        BinaryOp::Le => JmpOp::Le,
-        BinaryOp::Gt => JmpOp::Gt,
-        BinaryOp::Ge => JmpOp::Ge,
-        _ => return None,
-    })
 }

@@ -25,7 +25,8 @@ first and refuse to generate code for anything that fails.
 | out-of-range stack access                      | `byte_at(i)` needs a constant `i < N`; `starts_with` literal must fit in `N` |
 | more than 512 bytes of stack                   | locals are summed along each scope path; the peak plus the compiler's reserve must fit, or it is an error naming the numbers |
 | writes through map value pointers (v1 choice)  | `*p = v` is rejected; `map.insert` is the supported update |
-| unsafe integer truncation                      | four unsigned widths, no implicit conversion; mixing widths is a type error and literals are range-checked |
+| unsafe integer truncation                      | four unsigned widths plus `i64`, no implicit conversion; mixing widths is a type error and literals are range-checked |
+| reading arguments after they are gone          | `arg(n)` is rejected in a `kretprobe`; `retval()` is rejected everywhere but a `kretprobe` |
 
 Everything else is ordinary static typing: `bool` conditions, event fields
 set exactly once with the right types, map key/value types on every access,
@@ -72,10 +73,9 @@ All errors in a file are reported together, not just the first.
 
 ## What is deliberately not here yet
 
-- `kprobe` / `kretprobe` / LSM / XDP probe kinds, and per-architecture
-  `pt_regs` argument access.
-- Multiple probes per program, and functions.
-- `as` casts, signed integers, in-place map updates, string equality.
+- LSM and XDP probe kinds; uprobes.
+- Functions.
+- `as` casts, signed widths other than `i64`, in-place map updates, string equality.
 - Rate limiting or sampling for `emit`.
 
 Each of these is an addition to the same checker, not a redesign.

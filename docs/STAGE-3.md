@@ -60,13 +60,14 @@ cargo run -- --asm examples/exec.hny   # disassemble what codegen produced
 
 ## What codegen supports today (and what's next)
 
-Two of the three example programs compile and run in-kernel:
+All example programs compile and run in-kernel:
 
 | Program                      | Status                                                  |
 |------------------------------|---------------------------------------------------------|
 | `examples/exec.hny`          | runs: emit an event with builtin fields                 |
 | `examples/exec_burst.hny`    | runs: `const`, `hash` map get/insert, `if let`, arithmetic, threshold compare |
 | `examples/sensitive_open.hny`| runs: `arg(n)`, `read_user_str` into `str<N>`, `starts_with`, `byte_at`, bounded (unrolled) `for`, bit tests |
+| `examples/shadow_open_ok.hny`| runs: `kprobe` + `kretprobe` on the same function, shared map keyed by `tid()`, `retval()` with a signed compare, `i64` field |
 
 Supported: `const` integer literals; `map` (`hash<K, V>`, `array<V>`) with
 `.get`, `.insert`, `.delete`; `let`, assignment, `if`/`else`,
@@ -83,6 +84,17 @@ one, and an `emit` copies one into the record.
 Not yet (clear "not yet" errors, never unverifiable bytecode): `as` casts,
 signed comparisons, `return <value>`, writing through a map pointer, dynamic
 loop bounds, `field.access` beyond builtins, indexing.
+
+### Probe kinds and multiple probes
+
+Each `probe` compiles to its own BPF program; a `.bin` holds them
+concatenated and the manifest records each one's offset, type, and attach
+target. Tracepoints attach through their tracefs id; kprobes and kretprobes
+through the kprobe perf PMU (function name in `config1`, the retprobe flag
+in `config`). `arg(n)` in a kprobe reads `struct pt_regs`, whose layout is
+per architecture: pass `--arch x86_64` when compiling for an x86 box (the
+default is aarch64, the dev environment). Every record starts with an
+8-byte header carrying the event id so one ring buffer serves every probe.
 
 ### How values move (read `codegen.rs` with this in mind)
 

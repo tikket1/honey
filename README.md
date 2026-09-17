@@ -12,10 +12,16 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 }
 ```
 
-Status: **v1 pipeline complete.** All three example probes compile to eBPF bytecode the
-kernel verifier accepts, the loader prints live events, and the stage 4 type checker
-turns every verifier rule into an error at your source line. `examples/bad/` holds one
-program per rule, each rejected with a fix hint.
+Status: **v1 pipeline complete, with kprobes and multi-probe programs.** All four
+example programs compile to eBPF bytecode the kernel verifier accepts and the loader
+prints live events. The stage 4 type checker turns every verifier rule into an error
+at your source line; `examples/bad/` holds one program per rule, each rejected with a
+fix hint.
+
+The example that shows why kprobes matter, `examples/shadow_open_ok.hny`: a syscall
+tracepoint sees every *attempt* to open `/etc/shadow`. Hooking the kernel function
+on entry and return, sharing a map keyed by thread id, reports only the opens that
+*succeeded*, with the file descriptor they got.
 
 ## The idea in one screen
 
@@ -52,31 +58,32 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (20)
-  tests/typeck.rs    stage 4 acceptance tests (28)
+  tests/codegen.rs   stage 3 acceptance tests (25)
+  tests/typeck.rs    stage 4 acceptance tests (34)
 linux/               the Linux side (build + run against a real kernel)
   loader.c           loads bytecode, attaches to a tracepoint, reads events
   honey-linux        run a command in the Docker Linux environment
   run.sh             build the loader, then load + run a compiled program
 docs/LANGUAGE.md     language reference (§3 is normative for stage 1)
 docs/STAGE-1.md      what to build, in what order, and the Rust you need
-examples/*.hny       programs that compile and run
+examples/*.hny       programs that compile and run (tracepoint, kprobe + kretprobe)
 examples/bad/*.hny   programs the checker must reject (first line = expected error)
 ```
 
 ## Build & test
 
 ```bash
-cargo test                                  # 158 tests
+cargo test                                  # 169 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
 cargo run -- build examples/exec.hny -o build/exec   # write bytecode + manifest
 
 # run one against a real kernel (needs Docker Desktop):
-cargo run -- build examples/sensitive_open.hny -o build/sensitive
-linux/honey-linux ./linux/run.sh build/sensitive.bin build/sensitive.json
-#   -> flags every open of /etc/shadow or /etc/sudoers, with the caller
+cargo run -- build examples/shadow_open_ok.hny -o build/shadow
+linux/honey-linux ./linux/run.sh build/shadow.bin build/shadow.json
+#   -> ShadowOpen  pid=6500  uid=0  fd=3      (only successful opens)
+# compiling for an x86_64 box: add --arch x86_64 (kprobe register layout)
 ```
 
 Stages 1–2 run entirely on macOS. Stage 3 (loading bytecode into a kernel)
@@ -92,8 +99,9 @@ buffers.
 4. **Verifier-aware types** — bounded loops, checked map lookups, stack
    budget, bounded reads: illegal-to-verify becomes illegal-to-typecheck.
 
-All four stages are in place. What comes next is breadth (kprobes, LSM hooks,
-more builtins, string equality, sampling) on the same skeleton.
+All four stages are in place, plus kprobes/kretprobes and multi-probe programs.
+What comes next is breadth (LSM hooks, more builtins, string equality, sampling,
+JSON event output) on the same skeleton.
 
 ## Prior art
 
