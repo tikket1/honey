@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <net/if.h>
+#include <arpa/inet.h>
 #include <linux/if_link.h>
 #include <fcntl.h>
 #include <gelf.h>
@@ -91,7 +92,7 @@ static long json_int_in(const char *from, const char *limit, const char *key, lo
 
 // ------------------------------------------------------------- data model
 
-enum kind { K_UINT, K_INT, K_STR, K_BOOL, K_IPV4 };
+enum kind { K_UINT, K_INT, K_STR, K_BOOL, K_IPV4, K_IPV6, K_MAC };
 
 struct field {
     char name[32];
@@ -643,6 +644,14 @@ static int on_event(void *vctx, void *data, size_t len) {
                 printf("\"%u.%u.%u.%u\"", (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255);
                 break;
             }
+            case K_IPV6: {
+                char buf[INET6_ADDRSTRLEN];
+                printf("\"%s\"", inet_ntop(AF_INET6, p, buf, sizeof buf) ? buf : "?");
+                break;
+            }
+            case K_MAC:
+                printf("\"%02x:%02x:%02x:%02x:%02x:%02x\"", p[0], p[1], p[2], p[3], p[4], p[5]);
+                break;
             case K_STR:
                 putchar('"');
                 for (uint32_t j = 0; j < f->size && p[j]; j++) {
@@ -673,6 +682,8 @@ static int on_event(void *vctx, void *data, size_t len) {
         case K_BOOL: printf("%s", *p ? "true" : "false"); break;
         case K_IPV4: { uint32_t v = 0; memcpy(&v, p, 4);
                        printf("%u.%u.%u.%u", (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255); break; }
+        case K_IPV6: { char buf[INET6_ADDRSTRLEN]; printf("%s", inet_ntop(AF_INET6, p, buf, sizeof buf) ? buf : "?"); break; }
+        case K_MAC:  printf("%02x:%02x:%02x:%02x:%02x:%02x", p[0], p[1], p[2], p[3], p[4], p[5]); break;
         case K_STR:  printf("%.*s", (int)f->size, (const char *)p); break;
         }
     }
@@ -810,7 +821,9 @@ int main(int argc, char **argv) {
             f->kind = strcmp(kind, "str") == 0 ? K_STR
                     : strcmp(kind, "bool") == 0 ? K_BOOL
                     : strcmp(kind, "int") == 0 ? K_INT
-                    : strcmp(kind, "ipv4") == 0 ? K_IPV4 : K_UINT;
+                    : strcmp(kind, "ipv4") == 0 ? K_IPV4
+                    : strcmp(kind, "ipv6") == 0 ? K_IPV6
+                    : strcmp(kind, "mac") == 0 ? K_MAC : K_UINT;
             ev->n_fields++;
             fp = strstr(after, "\"name\":");
         }

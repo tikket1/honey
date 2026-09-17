@@ -586,3 +586,42 @@ fn usdt_arg_is_a_spec_driven_read() {
     assert!(text.contains("call 112"), "probe_read_user for memory operands\n{text}");
     assert!(text.contains("lsh r0, r4") && text.contains("arsh r0, r4") && text.contains("rsh r0, r4"), "{text}");
 }
+
+// ------------------------------------------------------------ ipv6 & mac
+
+const IPV6: &str = include_str!("../../../examples/ipv6_ping.hny");
+
+#[test]
+fn blob_reads_extend_the_entry_bounds_check() {
+    // dst is pkt.ipv6(38): 38 + 16 = 54 is the furthest byte.
+    let text = asm(IPV6);
+    assert!(text.contains("add r2, 54"), "{text}");
+    assert_eq!(text.matches("if r2 > r8 goto").count(), 1, "{text}");
+}
+
+#[test]
+fn blobs_copy_in_chunks_from_packet_to_stack_and_record() {
+    let text = asm(IPV6);
+    // `let src = pkt.ipv6(22)`: two 8-byte chunks packet -> stack
+    assert!(text.contains("ldx64 r0, [r7 +22]"), "{text}");
+    assert!(text.contains("ldx64 r0, [r7 +30]"), "{text}");
+    // `smac: pkt.mac(6)`: 4 + 2 bytes packet -> record
+    assert!(text.contains("ldx32 r0, [r7 +6]"), "{text}");
+    assert!(text.contains("ldx16 r0, [r7 +10]"), "{text}");
+    // the local is copied stack -> record for `src: src`
+    assert!(text.contains("ldx64 r0, [r10 -"), "{text}");
+    let prog = parse(IPV6).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    let ev = &c.events[0];
+    let kinds: Vec<_> = ev.fields.iter().map(|f| (f.name.as_str(), f.size)).collect();
+    assert_eq!(kinds, vec![("smac", 6), ("dmac", 6), ("src", 16), ("dst", 16), ("next", 1)]);
+    assert_eq!(ev.size, 45);
+}
+
+#[test]
+fn blob_local_uses_its_full_stack_size() {
+    let prog = parse(IPV6).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    // ctx slot (8) + one ipv6 local (16) = 24; no temporaries needed.
+    assert_eq!(c.programs[0].stack_bytes, 24);
+}

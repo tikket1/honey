@@ -15,7 +15,8 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 Status: **v1 complete: tracepoints, kprobes (with kernel struct-field reads),
 uprobes and USDT markers with their arguments, LSM enforcement, XDP packet
 filtering, sampling, string equality, multi-probe programs, JSON output with
-typed fields (`ipv4` prints as a dotted quad), and a `./honey run` one-shot.** Every example
+typed fields (`ipv4`, `ipv6`, `mac` print as addresses), and a `./honey run`
+one-shot.** Every example
 compiles to eBPF bytecode the kernel verifier accepts and the loader prints live
 events (text, or `--json` for a log pipeline). The stage 4 type checker turns every verifier rule into an error
 at your source line; `examples/bad/` holds one program per rule, each rejected with a
@@ -76,8 +77,8 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (44)
-  tests/typeck.rs    stage 4 acceptance tests (53)
+  tests/codegen.rs   stage 3 acceptance tests (47)
+  tests/typeck.rs    stage 4 acceptance tests (56)
   tests/kernel_fields.rs  struct-field read tests (10, synthetic BTF)
 linux/               the Linux side (build + run against a real kernel)
   loader.c           loads bytecode, attaches (tracepoint/kprobe/uprobe/usdt/lsm/xdp), reads events
@@ -93,7 +94,7 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 220 tests
+cargo test                                  # 226 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
@@ -135,9 +136,9 @@ buffers.
    budget, bounded reads: illegal-to-verify becomes illegal-to-typecheck.
 
 All four stages are in place, plus kprobes/kretprobes and multi-probe programs.
-The v1 feature list is done, including USDT arguments and the `./honey run`
-one-shot. Natural next steps: IPv6 and MAC field types, and struct-field
-reads in XDP.
+The v1 feature list is done, including USDT arguments, the `./honey run`
+one-shot, and `ipv4`/`ipv6`/`mac` fields. What's left is genuinely optional:
+comparing addresses, struct-field reads in XDP, and a register allocator.
 
 ## Prior art
 

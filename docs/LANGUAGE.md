@@ -244,6 +244,7 @@ Precedence, lowest to highest: `||`, `&&`, `== !=`, `< <= > >=`, `|`, `^`,
 | `Option<&V>`            | The result of `map.get`. Not user-writable. Must be matched with `if let Some(v)` / `if let None`. |
 | `&V`                    | A checked pointer, only bound by `if let Some(v)` and only inside that block. `*v` reads it. |
 | `ipv4`                  | A `u32` to the type system, printed by the loader as a dotted quad (`127.0.0.1`). Assign from `pkt.u32(...)`. |
+| `ipv6`, `mac`           | 16- and 6-byte values copied straight from the packet with `pkt.ipv6(off)` / `pkt.mac(off)`. Bind with `let` or emit directly; printed as `::1` / `aa:bb:cc:dd:ee:ff`. Cannot be compared or reassigned (yet), and cannot live in maps. |
 | `ptr<S>`                | A kernel pointer to `struct S` (a real kernel type, checked against BTF). From `let p: ptr<S> = arg(n);`. Read fields with `.` (pointers auto-deref). |
 
 Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):

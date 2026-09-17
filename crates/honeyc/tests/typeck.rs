@@ -558,3 +558,35 @@ fn ipv4_is_a_u32_to_the_type_system() {
     // usable as a map value and a local type too
     ok("map seen: hash<u32, ipv4>[8]\nevent E { a: u32 } probe xdp(\"lo\") { let ip: ipv4 = pkt.u32(26); seen.insert(1, ip); emit E { a: 1 }; }".replace("[8]\n", "[8];\n").as_str());
 }
+
+// ------------------------------------------------------------ ipv6 & mac
+
+#[test]
+fn ipv6_and_mac_are_packet_blobs() {
+    ok("event E { s: ipv6, m: mac } probe xdp(\"lo\") { emit E { s: pkt.ipv6(22), m: pkt.mac(6) }; }");
+    ok("event E { s: ipv6 } probe xdp(\"lo\") { let a = pkt.ipv6(22); emit E { s: a }; }");
+    ok("event E { s: ipv6 } probe xdp(\"lo\") { let a: ipv6 = pkt.ipv6(22); emit E { s: a }; }");
+    // wrong blob kind for the field
+    let msg = first_message("event E { s: ipv6 } probe xdp(\"lo\") { emit E { s: pkt.mac(6) }; }");
+    assert!(msg.contains("expected `ipv6`, found `mac`"), "{msg}");
+}
+
+#[test]
+fn blobs_only_come_from_the_packet_and_cannot_be_compared_or_reassigned() {
+    let msg = first_message("event E { s: ipv6 } probe xdp(\"lo\") { let x: ipv6 = 5; emit E { s: x }; }");
+    assert!(msg.contains("an `ipv6` value can only come straight from the packet") || msg.contains("expected `ipv6`"), "{msg}");
+    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.ipv6(22); let b = pkt.ipv6(38); if a == b { emit E { a: 1 }; } }");
+    assert!(msg.contains("cannot be compared yet"), "{msg}");
+    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let mut a = pkt.mac(0); a = pkt.mac(6); emit E { a: 1 }; }");
+    assert!(msg.contains("is a `mac` buffer and cannot be reassigned"), "{msg}");
+    // not in a map, not in a kprobe
+    let msg = first_message("map m: hash<u32, ipv6>[4];\nevent E { a: u8 } probe xdp(\"lo\") { emit E { a: 1 }; }");
+    assert!(msg.contains("map keys and values must be integers or bool"), "{msg}");
+}
+
+#[test]
+fn blob_reads_count_toward_the_packet_bound() {
+    let msg = first_message("event E { s: ipv6 } probe xdp(\"lo\") { emit E { s: pkt.ipv6(250) }; }");
+    assert!(msg.contains("ends past 256 bytes"), "{msg}");
+    ok("event E { s: ipv6 } probe xdp(\"lo\") { emit E { s: pkt.ipv6(240) }; }");
+}

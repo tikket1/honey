@@ -45,6 +45,10 @@ pub enum Ty {
     Bool,
     /// Fixed-capacity byte string.
     Str(u32),
+    /// A 16-byte IPv6 address (a stack buffer; only from `pkt.ipv6`).
+    Ipv6,
+    /// A 6-byte MAC address (a stack buffer; only from `pkt.mac`).
+    Mac,
     /// The result of `map.get`: maybe a pointer, must be checked.
     Option(Box<Ty>),
     /// A checked pointer into a map value.
@@ -70,6 +74,8 @@ impl Ty {
             // An IPv4 address is a u32 to the type system; the loader prints it
             // as a dotted quad.
             ("ipv4", []) => Ok(Ty::U32),
+            ("ipv6", []) => Ok(Ty::Ipv6),
+            ("mac", []) => Ok(Ty::Mac),
             ("bool", []) => Ok(Ty::Bool),
             ("str", [TypeArg::Int(n)]) => {
                 if *n == 0 || *n > 256 {
@@ -91,6 +97,8 @@ impl Ty {
     pub fn stack_bytes(&self) -> u32 {
         match self {
             Ty::Str(n) => n.div_ceil(8) * 8,
+            Ty::Ipv6 => 16,
+            Ty::Mac => 8,
             Ty::Unit => 0,
             _ => 8,
         }
@@ -119,6 +127,8 @@ impl std::fmt::Display for Ty {
             Ty::I64 => write!(f, "i64"),
             Ty::Bool => write!(f, "bool"),
             Ty::Str(n) => write!(f, "str<{n}>"),
+            Ty::Ipv6 => write!(f, "ipv6"),
+            Ty::Mac => write!(f, "mac"),
             Ty::Option(inner) => write!(f, "Option<&{inner}>"),
             Ty::Ref(inner) => write!(f, "&{inner}"),
             Ty::KPtr(name) => write!(f, "ptr<{name}>"),
@@ -364,13 +374,13 @@ impl Checker<'_> {
         let mut fields = Vec::new();
         for f in &e.fields {
             match Ty::from_ast(&f.ty) {
-                Ok(ty) if ty.is_int() || ty == Ty::Bool || matches!(ty, Ty::Str(_)) => {
+                Ok(ty) if ty.is_int() || ty == Ty::Bool || matches!(ty, Ty::Str(_) | Ty::Ipv6 | Ty::Mac) => {
                     if fields.iter().any(|(n, _)| n == &f.name.name) {
                         self.error(f.name.span, format!("duplicate field `{}`", f.name.name));
                     }
                     fields.push((f.name.name.clone(), ty));
                 }
-                Ok(ty) => self.error(f.ty.span, format!("event fields must be integers, bool or str<N>, not `{ty}`")),
+                Ok(ty) => self.error(f.ty.span, format!("event fields must be integers, bool, str<N>, ipv4, ipv6 or mac, not `{ty}`")),
                 Err(m) => self.error(f.ty.span, m),
             }
         }
@@ -624,6 +634,9 @@ impl Checker<'_> {
         if let Ty::Str(_) = ty {
             self.error_help(value.span, "strings can only come from `read_user_str`", "declare `let s: str<N> = read_user_str(ptr);`");
         }
+        if matches!(ty, Ty::Ipv6 | Ty::Mac) && !is_pkt_call(value) {
+            self.error_help(value.span, format!("an `{ty}` value can only come straight from the packet"), format!("write `let x: {ty} = pkt.{ty}(offset);`"));
+        }
         self.declare(&name.name, ty, mutable, None);
     }
 
@@ -633,6 +646,11 @@ impl Checker<'_> {
                 let Some(var) = self.lookup(n).cloned() else {
                     return self.error(target.span, format!("unknown variable `{n}`"));
                 };
+                if matches!(var.ty, Ty::Ipv6 | Ty::Mac | Ty::Str(_)) {
+                    self.error(target.span, format!("`{n}` is a `{}` buffer and cannot be reassigned", var.ty));
+                    self.expr(value);
+                    return;
+                }
                 if !var.mutable {
                     self.error_help(
                         target.span,
@@ -950,6 +968,10 @@ impl Checker<'_> {
 
         let l = self.expr(lhs);
         let r = self.expr(rhs);
+        if matches!(l, Ty::Ipv6 | Ty::Mac) || matches!(r, Ty::Ipv6 | Ty::Mac) {
+            self.error(span, "`ipv6` and `mac` values cannot be compared yet; emit them");
+            return Ty::Bool;
+        }
         // Errors in operands already reported; don't cascade.
         if l == Ty::Unit || r == Ty::Unit {
             return if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge) { Ty::Bool } else { Ty::Unit };
@@ -1121,11 +1143,13 @@ impl Checker<'_> {
             }
             return match (method.name.as_str(), args) {
                 ("len", []) => Ty::U32,
-                ("u8" | "u16" | "u32", [off]) => {
+                ("u8" | "u16" | "u32" | "ipv6" | "mac", [off]) => {
                     let width: u32 = match method.name.as_str() {
                         "u8" => 1,
                         "u16" => 2,
-                        _ => 4,
+                        "u32" => 4,
+                        "mac" => 6,
+                        _ => 16,
                     };
                     match self.const_eval_global(off) {
                         Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
@@ -1139,15 +1163,17 @@ impl Checker<'_> {
                     match width {
                         1 => Ty::U8,
                         2 => Ty::U16,
-                        _ => Ty::U32,
+                        4 => Ty::U32,
+                        6 => Ty::Mac,
+                        _ => Ty::Ipv6,
                     }
                 }
-                ("u8" | "u16" | "u32", _) => {
+                ("u8" | "u16" | "u32" | "ipv6" | "mac", _) => {
                     self.error(span, format!("`pkt.{}` takes one constant offset", method.name));
                     Ty::Unit
                 }
                 (m, _) => {
-                    self.error(method.span, format!("`pkt` has no method `{m}`; use `u8(off)`, `u16(off)`, `u32(off)`, or `len()`"));
+                    self.error(method.span, format!("`pkt` has no method `{m}`; use `u8/u16/u32(off)`, `ipv6(off)`, `mac(off)`, or `len()`"));
                     Ty::Unit
                 }
             };
@@ -1307,6 +1333,12 @@ fn compatible(expected: &Ty, actual: &Ty) -> bool {
         (_, Ty::Unit) | (Ty::Unit, _) => true,
         _ => false,
     }
+}
+
+/// `pkt.ipv6(...)` / `pkt.mac(...)`: the only producers of blob values.
+fn is_pkt_call(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::MethodCall { receiver, method, .. }
+        if matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") && (method.name == "ipv6" || method.name == "mac"))
 }
 
 fn is_call_to(e: &Expr, name: &str) -> bool {

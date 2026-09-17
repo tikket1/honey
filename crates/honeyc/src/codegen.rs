@@ -192,6 +192,9 @@ enum Ty {
     I64,
     Bool,
     Str(u32),
+    /// Byte blobs copied from the packet: a 16-byte IPv6 or 6-byte MAC.
+    Ipv6,
+    Mac,
     ValuePtr(Box<Ty>),
     OptionPtr(Box<Ty>),
     /// Kernel pointer to a named struct (an address).
@@ -209,6 +212,8 @@ impl Ty {
             ("u64", []) => Ok(Ty::Uint(8)),
             ("i64", []) => Ok(Ty::I64),
             ("ipv4", []) => Ok(Ty::Uint(4)),
+            ("ipv6", []) => Ok(Ty::Ipv6),
+            ("mac", []) => Ok(Ty::Mac),
             ("bool", []) => Ok(Ty::Bool),
             ("ptr", [TypeArg::Type(inner)]) => Ok(Ty::KPtr(inner.name.name.clone())),
             (other, _) => Err(format!("type `{other}` is not supported in codegen")),
@@ -220,6 +225,8 @@ impl Ty {
             Ty::Uint(w) => *w,
             Ty::Bool => 1,
             Ty::Str(n) => *n,
+            Ty::Ipv6 => 16,
+            Ty::Mac => 6,
             Ty::I64 | Ty::ValuePtr(_) | Ty::OptionPtr(_) | Ty::KPtr(_) | Ty::KCharPtr => 8,
         }
     }
@@ -536,6 +543,8 @@ fn pkt_max_bound(body: &Block, consts: &HashMap<String, i64>) -> Result<u32, Str
                         "u8" => 1,
                         "u16" => 2,
                         "u32" => 4,
+                        "mac" => 6,
+                        "ipv6" => 16,
                         _ => 0,
                     };
                     if width > 0
@@ -751,6 +760,8 @@ impl Cg<'_> {
         for local in scope.values() {
             let bytes = match &local.ty {
                 Ty::Str(n) => n.div_ceil(8) * 8,
+                Ty::Ipv6 => 16,
+                Ty::Mac => 8,
                 _ => 8,
             };
             self.stack_top -= bytes as i32;
@@ -810,6 +821,14 @@ impl Cg<'_> {
                     let off = self.alloc_bytes(n);
                     self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off, ty: Ty::Str(n) });
                     return self.read_str_into(off, n, value);
+                }
+                // Byte blobs: `let a = pkt.ipv6(22);` copies straight from the packet.
+                if let Some((width, off)) = self.pkt_blob(value)? {
+                    let ty = if width == 16 { Ty::Ipv6 } else { Ty::Mac };
+                    let dst = self.alloc_bytes(width);
+                    self.scopes.last_mut().unwrap().insert(name.name.clone(), Local { off: dst, ty });
+                    self.copy_bytes(Reg::R7, off, Reg::R10, dst, width);
+                    return Ok(());
                 }
                 let vty = self.expr(value)?;
                 let ty = match ty {
@@ -1012,11 +1031,30 @@ impl Cg<'_> {
                 self.copy_str_to_record(local.off, off, src_cap.min(cap));
                 continue;
             }
+            if matches!(fl.kind, FieldKind::Ipv6 | FieldKind::Mac) {
+                let width = fl.size;
+                if let Some((w, poff)) = self.pkt_blob(value)? {
+                    if w != width {
+                        return Err(format!("field `{}` is {width} bytes but the packet read is {w}", fname.name));
+                    }
+                    self.copy_bytes(Reg::R7, poff, Reg::R6, off, width);
+                    continue;
+                }
+                let ExprKind::Ident(n) = &value.kind else {
+                    return Err(format!("field `{}` must be a `pkt.ipv6/mac(...)` read or a variable holding one", fname.name));
+                };
+                let local = self.lookup(n).cloned().ok_or_else(|| format!("unknown variable `{n}`"))?;
+                if local.ty.size() != width {
+                    return Err(format!("field `{}` is {width} bytes but `{n}` is {}", fname.name, local.ty.size()));
+                }
+                self.copy_bytes(Reg::R10, local.off, Reg::R6, off, width);
+                continue;
+            }
             let size = match fl.kind {
                 FieldKind::Uint(w) | FieldKind::Sint(w) => Ty::Uint(w).mem_size(),
                 FieldKind::Ipv4 => Size::W,
                 FieldKind::Bool => Size::B,
-                FieldKind::Str(_) => unreachable!(),
+                FieldKind::Str(_) | FieldKind::Ipv6 | FieldKind::Mac => unreachable!(),
             };
             self.expr(value)?;
             self.prog.push(stx_mem(size, Reg::R6, off, Reg::R0));
@@ -1484,6 +1522,7 @@ impl Cg<'_> {
                 self.prog.push(bswap(Reg::R0, 32));
                 Ok(Ty::Uint(4))
             }
+            ("ipv6" | "mac", _) => Err(format!("`pkt.{method}` is a byte blob: bind it with `let` or emit it directly")),
             (m, a) => Err(format!("`pkt` has no method `{m}` taking {} argument(s)", a.len())),
         }
     }
@@ -1598,6 +1637,49 @@ impl Cg<'_> {
         self.prog.push(mov64_imm(Reg::R0, 0));
         self.prog.bind(end);
         Ok(Ty::Bool)
+    }
+
+    /// If `e` is `pkt.ipv6(off)` / `pkt.mac(off)`, return (width, packet offset).
+    fn pkt_blob(&self, e: &Expr) -> Result<Option<(u32, i16)>, String> {
+        let ExprKind::MethodCall { receiver, method, args } = &e.kind else { return Ok(None) };
+        if !matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt" && self.lookup("pkt").is_none()) {
+            return Ok(None);
+        }
+        let width = match method.name.as_str() {
+            "ipv6" => 16,
+            "mac" => 6,
+            _ => return Ok(None),
+        };
+        if !matches!(self.kind, ProbeKind::Xdp { .. }) {
+            return Err("`pkt` is only available in an xdp probe".into());
+        }
+        let [off] = args.as_slice() else {
+            return Err(format!("`pkt.{}` takes one constant offset", method.name));
+        };
+        let o = i16::try_from(self.const_eval(off)?).map_err(|_| "packet offset too large")?;
+        Ok(Some((width, o)))
+    }
+
+    /// Copy `n` bytes from `[src + soff]` to `[dst + doff]` in 8/4/2/1-byte
+    /// chunks through R0. Sources may be the packet (R7) or the stack (R10);
+    /// destinations the stack or the ring-buffer record (R6).
+    fn copy_bytes(&mut self, src: Reg, soff: i16, dst: Reg, doff: i16, n: u32) {
+        let mut done: u32 = 0;
+        while done < n {
+            let left = n - done;
+            let (size, w) = if left >= 8 {
+                (Size::DW, 8)
+            } else if left >= 4 {
+                (Size::W, 4)
+            } else if left >= 2 {
+                (Size::H, 2)
+            } else {
+                (Size::B, 1)
+            };
+            self.prog.push(ldx_mem(size, Reg::R0, src, soff + done as i16));
+            self.prog.push(stx_mem(size, dst, doff + done as i16, Reg::R0));
+            done += w;
+        }
     }
 
     fn str_method(&mut self, off: i16, cap: u32, method: &str, args: &[Expr]) -> Result<Ty, String> {

@@ -1,0 +1,8 @@
+// error: an `ipv6` value can only come straight from the packet
+
+event E { a: ipv6 }
+
+probe xdp("lo") {
+    let x: ipv6 = 5;
+    emit E { a: x };
+}

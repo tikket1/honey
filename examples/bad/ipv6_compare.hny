@@ -1,0 +1,11 @@
+// error: `ipv6` and `mac` values cannot be compared yet; emit them
+
+event E { a: u8 }
+
+probe xdp("lo") {
+    let src = pkt.ipv6(22);
+    let dst = pkt.ipv6(38);
+    if src == dst {
+        emit E { a: 1 };
+    }
+}

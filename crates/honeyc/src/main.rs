@@ -257,6 +257,8 @@ fn manifest(c: &Compiled) -> String {
                 FieldKind::Uint(w) => ("uint", format!("\"width\": {w}")),
                 FieldKind::Sint(w) => ("int", format!("\"width\": {w}")),
                 FieldKind::Ipv4 => ("ipv4", "\"width\": 4".to_string()),
+                FieldKind::Ipv6 => ("ipv6", "\"width\": 16".to_string()),
+                FieldKind::Mac => ("mac", "\"width\": 6".to_string()),
                 FieldKind::Str(n) => ("str", format!("\"cap\": {n}")),
                 FieldKind::Bool => ("bool", "\"width\": 1".to_string()),
             };

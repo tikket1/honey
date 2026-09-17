@@ -1,0 +1,31 @@
+// ipv6_ping.hny — log ICMPv6 packets with their addresses, as addresses.
+//
+// `ipv6` and `mac` are byte values, not numbers: `pkt.ipv6(off)` copies 16
+// bytes straight out of the packet and `pkt.mac(off)` copies 6. They can be
+// bound with `let` or emitted directly, and the loader prints them the way
+// you'd read them (`::1`, `aa:bb:cc:dd:ee:ff`). Both count toward the single
+// entry bounds check like every other packet read.
+//
+//   ./honey run examples/ipv6_ping.hny --json
+//   ... then `ping -6 -c 1 ::1` inside the environment.
+
+event Icmp6 {
+    smac: mac,
+    dmac: mac,
+    src: ipv6,
+    dst: ipv6,
+    next: u8,
+}
+
+probe xdp("lo") {
+    if pkt.u16(12) == 0x86DD && pkt.u8(20) == 58 {
+        let src = pkt.ipv6(22);
+        emit Icmp6 {
+            smac: pkt.mac(6),
+            dmac: pkt.mac(0),
+            src: src,
+            dst: pkt.ipv6(38),
+            next: pkt.u8(20),
+        };
+    }
+}

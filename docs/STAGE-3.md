@@ -154,6 +154,13 @@ them) and emits one bounds check for the largest offset the body reads; each
 `pkt.uN(off)` is then a plain load the verifier has already proven safe, with
 a `bswap` for 16/32-bit values. The default return is `XDP_PASS`.
 
+`ipv6` and `mac` values are byte blobs, not registers: `pkt.ipv6(off)` in a
+`let` allocates a 16-byte stack buffer and copies the packet bytes into it;
+in an `emit` it copies packet → record directly. Copies go in 8/4/2/1-byte
+chunks (unaligned packet loads are fine on the targets that run eBPF). Their
+widths count toward the entry bounds check. The loader prints them with
+`inet_ntop` and `%02x:` formatting.
+
 ### Reading kernel struct fields (CO-RE-lite)
 
 A kprobe/LSM argument typed `ptr<S>` can be walked with `.field`. honey reads
