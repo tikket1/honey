@@ -1,0 +1,40 @@
+/* sensitive_open.hny — flag opens of credential files, and note whether
+ * the caller asked for write access.
+ *
+ * Shows: reading a user-space string with a fixed bound, bit tests on
+ * syscall flags, a bounded loop, hex literals. /* Block comments nest. */
+ */
+
+const O_WRONLY: u64 = 0x1;
+const O_RDWR:   u64 = 0x2;
+const O_CREAT:  u64 = 0o100;
+
+event SensitiveOpen {
+    pid: u32,
+    uid: u32,
+    write: bool,
+    path: str<64>,
+}
+
+probe tracepoint("syscalls", "sys_enter_openat") {
+    // arg(1) is the `const char *filename` pointer; copy at most 64 bytes.
+    let path: str<64> = read_user_str(arg(1));
+    let flags = arg(2);
+
+    let mut hit = false;
+    if path.starts_with("/etc/shadow") || path.starts_with("/etc/sudoers") {
+        hit = true;
+    }
+
+    // Loops must have constant bounds so the verifier can unroll/prove them.
+    for i in 0..4 {
+        if path.byte_at(i) == 0 {
+            return;
+        }
+    }
+
+    if hit {
+        let write = (flags & (O_WRONLY | O_RDWR)) != 0;
+        emit SensitiveOpen { pid: pid(), uid: uid(), write: write, path: path };
+    }
+}

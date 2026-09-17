@@ -1,0 +1,29 @@
+// exec_burst.hny — count execs per uid in a map, fire on a burst.
+//
+// Shows: maps, map lookup with a *checked* result (the kernel verifier
+// rejects unchecked map pointers, so the language makes you check),
+// mutation, and constants.
+
+const THRESHOLD: u64 = 100;
+
+map execs: hash<u32, u64>[1024];
+
+event Burst {
+    uid: u32,
+    count: u64,
+}
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let uid = uid();
+    let mut n: u64 = 0;
+
+    if let Some(prev) = execs.get(uid) {
+        n = *prev;
+    }
+    n = n + 1;
+    execs.insert(uid, n);
+
+    if n > THRESHOLD {
+        emit Burst { uid: uid, count: n };
+    }
+}

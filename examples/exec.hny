@@ -1,0 +1,14 @@
+// exec.hny — the "hello world" of detection: report every execve.
+//
+// `event` declares the record shape that userspace will read from the
+// ring buffer. `probe` attaches a body to a kernel hook.
+
+event Exec {
+    pid: u32,
+    uid: u32,
+    comm: str<16>,
+}
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    emit Exec { pid: pid(), uid: uid(), comm: comm() };
+}

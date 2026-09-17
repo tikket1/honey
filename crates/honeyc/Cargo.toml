@@ -1,0 +1,16 @@
+[package]
+name = "honeyc"
+description = "Compiler for honey, a typed language for eBPF security probes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "honeyc"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately empty. Everything is hand-written.
