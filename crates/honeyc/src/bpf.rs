@@ -204,6 +204,12 @@ pub fn alu32_imm(op: AluOp, dst: Reg, imm: i32) -> Insn {
     Insn::new(ALU | op.bits() | K, dst, Reg::R0, 0, imm)
 }
 
+/// `dst op= src`, 32-bit. `mov32 r, r` is the idiom for zero-extending a
+/// register to its low 32 bits.
+pub fn alu32_reg(op: AluOp, dst: Reg, src: Reg) -> Insn {
+    Insn::new(ALU | op.bits() | X, dst, src, 0, 0)
+}
+
 /// `dst = imm` as a full 64-bit load (the only way to get a value wider than
 /// 32 bits, or a map fd, into a register).
 pub fn ld_imm64(dst: Reg, imm: i64) -> Insn {
@@ -266,7 +272,7 @@ pub fn exit() -> Insn {
 /// Arithmetic and bitwise operations for `alu*` builders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluOp {
-    Add, Sub, Mul, Div, Or, And, Lsh, Rsh, Mod, Xor, Arsh, Neg,
+    Add, Sub, Mul, Div, Or, And, Lsh, Rsh, Mod, Xor, Arsh, Neg, Mov,
 }
 
 impl AluOp {
@@ -284,6 +290,7 @@ impl AluOp {
             AluOp::Xor => XOR,
             AluOp::Arsh => ARSH,
             AluOp::Neg => NEG,
+            AluOp::Mov => MOV,
         }
     }
 }

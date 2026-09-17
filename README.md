@@ -12,9 +12,11 @@ probe tracepoint("syscalls", "sys_enter_execve") {
 }
 ```
 
-Status: **stages 1-3 working end to end.** honey compiles `examples/exec.hny` to eBPF
-bytecode that the kernel verifier accepts, and the loader prints live execve events.
-Next: stage 3b (maps, control flow, arithmetic) and stage 4 (verifier-aware types).
+Status: **stages 1-3b working end to end.** `exec.hny` and `exec_burst.hny` compile
+to eBPF bytecode the kernel verifier accepts; the loader prints live events. That
+covers events, hash maps, constants, `if let`, arithmetic, and thresholds.
+Next: stage 3c (bounded `for`, strings) for `sensitive_open.hny`, then stage 4
+(verifier-aware types).
 
 ## Layout
 
@@ -27,11 +29,11 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/pretty.rs      AST → source, for debugging and round-trip tests
   src/bpf.rs         eBPF instruction encoder + disassembler
   src/layout.rs      event record byte layout
-  src/codegen.rs     stage 3, AST → BPF bytecode (first slice)
+  src/codegen.rs     stage 3, AST → BPF bytecode
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (7)
+  tests/codegen.rs   stage 3 acceptance tests (13)
 linux/               the Linux side (build + run against a real kernel)
   loader.c           loads bytecode, attaches to a tracepoint, reads events
   honey-linux        run a command in the Docker Linux environment
@@ -44,7 +46,7 @@ examples/*.hny      programs the compiler must eventually accept
 ## Build & test
 
 ```bash
-cargo test                                  # 117 tests
+cargo test                                  # 123 tests
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
 cargo run -- build examples/exec.hny -o build/exec   # write bytecode + manifest

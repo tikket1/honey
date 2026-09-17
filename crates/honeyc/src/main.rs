@@ -8,7 +8,7 @@
 use std::{env, fs, process};
 
 use honeyc::bpf;
-use honeyc::codegen::{self, Compiled};
+use honeyc::codegen::{self, Compiled, MapKind};
 use honeyc::layout::FieldKind;
 
 fn main() {
@@ -155,6 +155,18 @@ fn manifest(c: &Compiled) -> String {
         jstr(&c.tracepoint.1)
     ));
     s.push_str(&format!("  \"ringbuf_bytes\": {},\n", c.ringbuf_bytes));
+    s.push_str(&format!("  \"stack_bytes\": {},\n", c.stack_bytes));
+    // User maps, index order (index 0 is the ring buffer).
+    s.push_str("  \"maps\": [\n");
+    for (i, m) in c.maps.iter().enumerate() {
+        let kind = match m.kind { MapKind::Hash => "hash", MapKind::Array => "array" };
+        let comma = if i + 1 < c.maps.len() { "," } else { "" };
+        s.push_str(&format!(
+            "    {{ \"index\": {}, \"name\": {}, \"kind\": \"{}\", \"key_size\": {}, \"value_size\": {}, \"max_entries\": {} }}{}\n",
+            i + 1, jstr(&m.name), kind, m.key_size, m.value_size, m.max_entries, comma
+        ));
+    }
+    s.push_str("  ],\n");
     s.push_str(&format!("  \"event\": {{ \"name\": {}, \"size\": {}, \"fields\": [\n", jstr(&c.event.name), c.event.size));
     for (i, f) in c.event.fields.iter().enumerate() {
         let (kind, extra) = match &f.kind {

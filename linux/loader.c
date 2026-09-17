@@ -155,22 +155,26 @@ static int on_event(void *vctx, void *data, size_t len) {
 
 // ----------------------------------------------------- map fd relocation
 
-// honeyc emits `ld64 r1, map_fd(0)` for the ring buffer: an 8-byte opcode
-// 0x18 slot with src-reg nibble = 1 and imm = map index 0. Rewrite that
-// imm to the real map fd before loading.
-static void relocate_map_fd(uint8_t *insns, size_t bytes, int map_fd) {
-    for (size_t i = 0; i + 16 <= bytes; ) {
+// honeyc emits `ld64 rN, map_fd(i)` with i = a map *index*: 0 is the ring
+// buffer, 1.. are user maps in declaration order. Each is a 16-byte LD_IMM64
+// (opcode 0x18) with src-reg nibble = 1 (BPF_PSEUDO_MAP_FD). Rewrite every
+// index to the fd we got when we created that map.
+#define MAX_MAPS 16
+static void relocate_map_fds(uint8_t *insns, size_t bytes, const int *fds, int nfds) {
+    for (size_t i = 0; i + 8 <= bytes; ) {
         uint8_t opcode = insns[i];
         uint8_t src = insns[i + 1] >> 4;
         if (opcode == 0x18) {
-            if (src == 1) { // PSEUDO_MAP_FD
+            if (src == 1 && i + 16 <= bytes) { // PSEUDO_MAP_FD
                 int32_t idx;
                 memcpy(&idx, insns + i + 4, 4);
-                if (idx == 0) {
-                    memcpy(insns + i + 4, &map_fd, 4);
+                if (idx >= 0 && idx < nfds) {
+                    memcpy(insns + i + 4, &fds[idx], 4);
+                } else {
+                    fprintf(stderr, "bytecode references map index %d but only %d maps exist\n", idx, nfds);
                 }
             }
-            i += 16; // wide instruction
+            i += 16;
         } else {
             i += 8;
         }
@@ -200,8 +204,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     long ringbuf_bytes = json_int(man, "ringbuf_bytes", 1 << 16);
-    long ev_size = json_int(man, "size", 0);
-    json_str(man, "name", ev_name, sizeof ev_name); // event name (first "name")
+
+    const char *evp = strstr(man, "\"event\"");
+    json_str(evp ? evp : man, "name", ev_name, sizeof ev_name);
+    long ev_size = json_int(evp ? evp : man, "size", 0);
 
     // Parse the fields array.
     struct field fields[MAX_FIELDS];
@@ -220,15 +226,40 @@ int main(int argc, char **argv) {
         fp = strstr(after, "\"name\""); // next field object
     }
 
-    // 1. Create the ring-buffer map.
+    // 1. Create the maps: index 0 is the ring buffer, then user maps from
+    //    the manifest's "maps" array in index order.
+    int fds[MAX_MAPS];
+    int nfds = 0;
     int map_fd = bpf_map_create(BPF_MAP_TYPE_RINGBUF, "events", 0, 0, ringbuf_bytes, NULL);
     if (map_fd < 0) {
-        fprintf(stderr, "bpf_map_create: %s\n", strerror(-map_fd));
+        fprintf(stderr, "bpf_map_create(ringbuf): %s\n", strerror(-map_fd));
         return 1;
     }
+    fds[nfds++] = map_fd;
 
-    // 2. Relocate the program's map reference to the real fd.
-    relocate_map_fd(code, code_len, map_fd);
+    const char *mp = strstr(man, "\"maps\"");
+    while (mp && nfds < MAX_MAPS) {
+        char mname[32], mkind[16];
+        const char *after = json_str(mp, "name", mname, sizeof mname);
+        if (!after) break;
+        // Stop when we've left the maps array (the event object also has "name").
+        const char *end_arr = strchr(mp, ']');
+        if (end_arr && after > end_arr) break;
+        json_str(mp, "kind", mkind, sizeof mkind);
+        long ks = json_int(mp, "key_size", 4), vs = json_int(mp, "value_size", 8), me = json_int(mp, "max_entries", 1);
+        enum bpf_map_type t = strcmp(mkind, "array") == 0 ? BPF_MAP_TYPE_ARRAY : BPF_MAP_TYPE_HASH;
+        int fd = bpf_map_create(t, mname, ks, vs, me, NULL);
+        if (fd < 0) {
+            fprintf(stderr, "bpf_map_create(%s): %s\n", mname, strerror(-fd));
+            return 1;
+        }
+        fprintf(stderr, "map %d: %s (%s, key %ld, value %ld, max %ld) fd %d\n", nfds, mname, mkind, ks, vs, me, fd);
+        fds[nfds++] = fd;
+        mp = strstr(after, "\"index\"");
+    }
+
+    // 2. Relocate the program's map references to real fds.
+    relocate_map_fds(code, code_len, fds, nfds);
 
     // 3. Load the program. The verifier accepts or rejects here.
     char log[64 * 1024];

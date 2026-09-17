@@ -47,22 +47,23 @@ fn exec_compiles_to_the_expected_program() {
    2: mov r2, 24
    3: mov r3, 0
    4: call 131
-   5: if r0 == 0 goto +13
+   5: if r0 == 0 goto +14
    6: mov r6, r0
    7: call 14
    8: rsh r0, 32
    9: stx32 [r6 +0], r0
   10: call 15
-  11: stx32 [r6 +4], r0
-  12: mov r1, r6
-  13: add r1, 8
-  14: mov r2, 16
-  15: call 16
-  16: mov r1, r6
-  17: mov r2, 0
-  18: call 132
-  19: mov r0, 0
-  20: exit
+  11: mov32 r0, r0
+  12: stx32 [r6 +4], r0
+  13: mov r1, r6
+  14: add r1, 8
+  15: mov r2, 16
+  16: call 16
+  17: mov r1, r6
+  18: mov r2, 0
+  19: call 132
+  20: mov r0, 0
+  21: exit
 ";
     assert_eq!(asm(EXEC), expected.trim_start_matches('\n'));
 }
@@ -72,20 +73,19 @@ fn bytecode_is_a_whole_number_of_instructions() {
     let prog = parse(EXEC).unwrap();
     let c = compile(&prog).unwrap();
     assert_eq!(c.bytecode.len() % 8, 0);
-    // 21 instruction slots (the ld_map_fd counts as two 8-byte slots).
-    assert_eq!(c.bytecode.len(), 21 * 8);
+    // 22 instruction slots (the ld_map_fd counts as two 8-byte slots).
+    assert_eq!(c.bytecode.len(), 22 * 8);
 }
 
 #[test]
 fn drop_branch_lands_on_the_final_exit() {
-    // The `if r0 == 0 goto +13` at slot 5 must land on `mov r0, 0` (slot 19),
-    // just before `exit` (slot 20). +13 from slot 6 = slot 19. This is the
-    // one hand-computed offset that would silently corrupt the program if the
-    // slot/label arithmetic were wrong.
+    // The reserve-failed jump must skip the whole emit and land on the
+    // final `mov r0, 0` right before `exit`. If slot/label arithmetic were
+    // off by one this would silently run a helper with a null pointer.
     let text = asm(EXEC);
-    assert!(text.contains("  5: if r0 == 0 goto +13"), "{text}");
-    assert!(text.contains("  19: mov r0, 0"), "{text}");
-    assert!(text.contains("  20: exit"), "{text}");
+    assert!(text.contains("5: if r0 == 0 goto +14"), "{text}");
+    assert!(text.contains("20: mov r0, 0"), "{text}");
+    assert!(text.contains("21: exit"), "{text}");
 }
 
 #[test]
@@ -106,21 +106,26 @@ fn uid_field_high_half_is_not_shifted() {
     // uid() stores the low 32 bits directly (no rsh), unlike pid().
     let src = "event U { uid: u32 } probe tracepoint(\"syscalls\",\"sys_enter_execve\") { emit U { uid: uid() }; }";
     let text = asm(src);
-    // call 15 (uid_gid) then a straight stx32, no rsh in between.
+    // call 15 (uid_gid), zero-extend the low 32 bits, then store. No rsh.
     assert!(text.contains("call 15"), "{text}");
     let after_uid = text.split("call 15").nth(1).unwrap();
-    let next_line = after_uid.lines().nth(1).unwrap();
-    assert!(next_line.contains("stx32"), "expected stx right after uid call, got: {next_line}");
+    let l1 = after_uid.lines().nth(1).unwrap();
+    let l2 = after_uid.lines().nth(2).unwrap();
+    assert!(l1.contains("mov32 r0, r0"), "expected zero-extend after uid call, got: {l1}");
+    assert!(l2.contains("stx32"), "expected store after zero-extend, got: {l2}");
+    assert!(!after_uid.contains("rsh r0, 32"), "uid must not be shifted");
 }
 
 #[test]
 fn unsupported_constructs_report_clearly() {
+    let probe = |body: &str| format!("event E {{ a: u32 }} probe tracepoint(\"s\",\"n\") {{ {body} emit E {{ a: pid() }}; }}");
     let cases = [
-        ("const X: u64 = 1;", "const"),
-        ("map m: hash<u32,u64>[4];", "map"),
+        (probe("for i in 0..4 { }"), "for"),
+        (probe("let x = 1 as u8;"), "as"),
+        ("event E { a: u32 }".to_string(), "no probe"),
     ];
     for (src, needle) in cases {
-        let prog = parse(src).unwrap();
+        let prog = parse(&src).unwrap();
         let err = compile(&prog).unwrap_err();
         assert!(err.contains(needle), "error {err:?} should mention {needle:?}");
     }
@@ -131,4 +136,74 @@ fn wrong_field_count_is_rejected() {
     let src = "event E { a: u32, b: u32 } probe tracepoint(\"s\",\"n\") { emit E { a: pid() }; }";
     let prog = parse(src).unwrap();
     assert!(compile(&prog).unwrap_err().contains("fields"));
+}
+
+// ------------------------------------------------------- stage 3b: maps
+
+const EXEC_BURST: &str = include_str!("../../../examples/exec_burst.hny");
+
+#[test]
+fn exec_burst_compiles() {
+    let prog = parse(EXEC_BURST).unwrap();
+    let c = compile(&prog).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(c.maps.len(), 1);
+    assert_eq!(c.maps[0].name, "execs");
+    assert_eq!(c.maps[0].kind, honeyc::codegen::MapKind::Hash);
+    assert_eq!((c.maps[0].key_size, c.maps[0].value_size, c.maps[0].max_entries), (4, 8, 1024));
+    assert_eq!(c.event.name, "Burst");
+    assert_eq!(c.event.size, 16);
+    assert!(c.stack_bytes <= 512);
+}
+
+#[test]
+fn map_lookup_spills_then_null_checks() {
+    // The verifier needs: lookup result checked for null before any deref.
+    // Our shape: call 1, spill r0, `if r0 == 0`, and only then reload+deref.
+    let text = asm(EXEC_BURST);
+    let after = text.split("call 1\n").nth(1).unwrap();
+    let l: Vec<&str> = after.lines().take(4).collect();
+    assert!(l[0].contains("stx64 [r10"), "{l:?}");
+    assert!(l[1].contains("if r0 == 0 goto"), "{l:?}");
+    assert!(l[2].contains("ldx64 r0, [r10"), "{l:?}");
+    assert!(l[3].contains("ldx64 r0, [r0 +0]"), "{l:?}");
+}
+
+#[test]
+fn map_insert_passes_key_and_value_pointers() {
+    let text = asm(EXEC_BURST);
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| l.ends_with(" call 2")).expect("map_update_elem call");
+    // The six instructions before the call set up: r1 = map, r2 = &key,
+    // r3 = &value, r4 = 0 (BPF_ANY).
+    let setup = &lines[at - 6..at];
+    assert!(setup[0].contains("ld64 r1, map_fd(1)"), "{setup:?}");
+    assert!(setup[1].contains("mov r2, r10"), "{setup:?}");
+    assert!(setup[2].contains("add r2, -"), "{setup:?}");
+    assert!(setup[3].contains("mov r3, r10"), "{setup:?}");
+    assert!(setup[4].contains("add r3, -"), "{setup:?}");
+    assert!(setup[5].contains("mov r4, 0"), "{setup:?}");
+}
+
+#[test]
+fn threshold_compare_guards_the_emit() {
+    let text = asm(EXEC_BURST);
+    // `if n > THRESHOLD` becomes: r0 = 100, r1 = n, `if r1 > r0 goto then; goto else`
+    assert!(text.contains("mov r0, 100"), "{text}");
+    assert!(text.contains("if r1 > r0 goto +1"), "{text}");
+}
+
+#[test]
+fn deref_before_null_check_is_rejected() {
+    let src = "map m: hash<u32,u64>[4]; event E { a: u64 } probe tracepoint(\"s\",\"n\") { let p = m.get(1); emit E { a: *p }; }";
+    let prog = parse(src).unwrap();
+    let err = compile(&prog).unwrap_err();
+    assert!(err.contains("if let Some"), "{err}");
+}
+
+#[test]
+fn stack_usage_is_tracked() {
+    // exec_burst: uid, n, prev/temps. Small, but nonzero and 8-aligned.
+    let prog = parse(EXEC_BURST).unwrap();
+    let c = compile(&prog).unwrap();
+    assert!(c.stack_bytes >= 24 && c.stack_bytes.is_multiple_of(8), "{}", c.stack_bytes);
 }
