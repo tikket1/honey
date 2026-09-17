@@ -75,6 +75,11 @@ Supported: `const` integer literals; `map` (`hash<K, V>`, `array<V>`) with
 nullary builtins (`pid tgid tid uid gid ktime`), `comm()` as an emit field,
 `*ptr`, unsigned arithmetic/bitwise/comparison, `&&`/`||`/`!`.
 
+String equality (`s == "lit"`, `s == t`) is unrolled into one byte compare
+per position with an early exit on mismatch and, for `s == t`, on a shared
+NUL; a literal test ends with a terminator check unless the literal fills the
+capacity. `!=` is `==` followed by `xor r0, 1`.
+
 Bounded `for` loops are **fully unrolled**: both ends must be compile-time
 constants, so the verifier sees straight-line code with no back-edge. The loop
 variable is a constant inside the body. Strings are fixed `str<N>` stack

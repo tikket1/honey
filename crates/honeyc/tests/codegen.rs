@@ -471,3 +471,60 @@ fn no_sample_map_when_unused() {
     let c = compile(&prog, Arch::Aarch64).unwrap();
     assert!(!c.maps.iter().any(|m| m.name == "__honey_sample"));
 }
+
+// ---------------------------------------------------------- string equality
+
+const SHELL: &str = include_str!("../../../examples/exec_shell.hny");
+
+/// Count terminator checks: a byte load immediately followed by `!= 0`.
+/// (A plain `if r0 != 0 goto` also appears for boolean conditions.)
+fn nul_checks(text: &str) -> usize {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .windows(2)
+        .filter(|w| w[0].contains("ldx8 r0, [r10") && w[1].contains("if r0 != 0 goto"))
+        .count()
+}
+
+#[test]
+fn string_equality_checks_every_byte_then_the_terminator() {
+    // "/bin/sh" is 7 bytes into a str<32>: 7 byte compares + 1 NUL check.
+    let src = "event E { a: u8 } probe tracepoint(\"s\",\"n\") { let p: str<32> = read_user_str(arg(0)); if p == \"/bin/sh\" { emit E { a: 1 }; } }";
+    let text = asm_helper(src);
+    // first byte '/' = 47, last byte 'h' = 104, then the terminator at +7.
+    assert!(text.contains("if r0 != 47 goto"), "{text}");
+    assert!(text.contains("if r0 != 104 goto"), "{text}");
+    assert_eq!(nul_checks(&text), 1, "one NUL check\n{text}");
+}
+
+#[test]
+fn string_inequality_flips_the_result() {
+    let src = "event E { b: bool } probe tracepoint(\"s\",\"n\") { let p: str<8> = read_user_str(arg(0)); emit E { b: p != \"x\" }; }";
+    let text = asm_helper(src);
+    assert!(text.contains("xor r0, 1"), "{text}");
+}
+
+#[test]
+fn literal_filling_the_capacity_has_no_terminator_check() {
+    let src = "event E { a: u8 } probe tracepoint(\"s\",\"n\") { let p: str<2> = read_user_str(arg(0)); if p == \"ab\" { emit E { a: 1 }; } }";
+    let text = asm_helper(src);
+    assert_eq!(nul_checks(&text), 0, "{text}");
+}
+
+#[test]
+fn two_locals_compare_bytewise_and_stop_at_a_shared_nul() {
+    let src = "event E { a: u8 } probe tracepoint(\"s\",\"n\") { let p: str<4> = read_user_str(arg(0)); let q: str<8> = read_user_str(arg(1)); if p == q { emit E { a: 1 }; } }";
+    let text = asm_helper(src);
+    // 4 bytes compared pairwise (min capacity), each with a NUL early-exit,
+    // then q must end at index 4.
+    assert_eq!(text.matches("if r1 != r0 goto").count(), 4, "{text}");
+    assert_eq!(text.matches("if r1 == 0 goto").count(), 4, "{text}");
+    assert!(text.contains("ldx8 r0, [r10 -"), "{text}");
+}
+
+#[test]
+fn exec_shell_example_compiles() {
+    let prog = parse(SHELL).unwrap();
+    let c = compile(&prog, Arch::Aarch64).unwrap();
+    assert_eq!(c.events[0].name, "Shell");
+}

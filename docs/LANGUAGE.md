@@ -255,6 +255,10 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 - **Bounded reads.** `read_user_str(p)` must initialise `let s: str<N>`;
   `s.byte_at(i)` needs constant `i < N`; `s.starts_with("...")` needs a literal
   no longer than `N`.
+- **String equality.** `s == "lit"`, `s != "lit"`, and `s == t` between two
+  `str<N>` values compare as C strings: equal through the terminating NUL,
+  bounded by the capacities, fully unrolled. A literal longer than `N` is a
+  compile-time error (it could never match); `<`/`>` on strings are errors.
 - **Stack budget.** Locals are 8 bytes (scalars, pointers) or `N` rounded to 8
   (`str<N>`), summed along each scope path. Peak + 40 bytes reserve ≤ 512.
 - **No pointer writes** in v1: `*p = v` is rejected, use `map.insert`.
@@ -276,6 +280,7 @@ Verifier-safety rules the checker enforces (see `docs/STAGE-4.md`):
 | `m.get(k)` / `m.insert(k,v)` | `Option<&V>` / `()`             | `bpf_map_lookup/update_elem`  |
 | `emit E { … }`             | statement                         | `bpf_ringbuf_output`          |
 | `s.starts_with("…")`, `s.byte_at(i)` | `bool` / `u8`           | inline, bounded by `N`        |
+| `s == "…"`, `s != t`       | `bool`                            | exact C-string equality, unrolled, bounded by `N` |
 
 ## 7. Roadmap
 

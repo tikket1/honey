@@ -65,8 +65,8 @@ crates/honeyc/        the compiler (Rust, no dependencies)
   src/main.rs        honeyc <file> | --tokens | --asm | build -o <out>
   tests/lexer.rs     stage 1 acceptance tests (50)
   tests/parser.rs    stage 2 acceptance tests (44)
-  tests/codegen.rs   stage 3 acceptance tests (35)
-  tests/typeck.rs    stage 4 acceptance tests (47)
+  tests/codegen.rs   stage 3 acceptance tests (40)
+  tests/typeck.rs    stage 4 acceptance tests (51)
   tests/kernel_fields.rs  struct-field read tests (10, synthetic BTF)
 linux/               the Linux side (build + run against a real kernel)
   loader.c           loads bytecode, attaches to a tracepoint, reads events
@@ -81,7 +81,7 @@ examples/bad/*.hny   programs the checker must reject (first line = expected err
 ## Build & test
 
 ```bash
-cargo test                                  # 205 tests
+cargo test                                  # 214 tests
 cargo run -- check examples/exec.hny       # type-check: verifier rules at your source line
 cargo run -- examples/exec.hny             # parse and pretty-print
 cargo run -- --asm examples/exec.hny       # show the emitted BPF assembly
@@ -123,8 +123,8 @@ buffers.
    budget, bounded reads: illegal-to-verify becomes illegal-to-typecheck.
 
 All four stages are in place, plus kprobes/kretprobes and multi-probe programs.
-What comes next is breadth (USDT probes, string equality, IP address
-formatting in the loader) on the same skeleton.
+What comes next is polish (USDT probes, IP address formatting in the loader)
+on the same skeleton.
 
 ## Prior art
 

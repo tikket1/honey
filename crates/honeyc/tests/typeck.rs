@@ -495,3 +495,41 @@ fn sample_returns_bool_with_a_positive_rate() {
 fn sample_works_in_any_probe_kind() {
     ok("event E { t: u16 } probe xdp(\"lo\") { if sample(10) { emit E { t: pkt.u16(12) }; } }");
 }
+
+// ---------------------------------------------------------- string equality
+
+fn with_path(body: &str) -> String {
+    format!("event E {{ a: u32, b: bool }}\nprobe tracepoint(\"syscalls\", \"sys_enter_execve\") {{\n    let path: str<32> = read_user_str(arg(0));\n    let other: str<16> = read_user_str(arg(0));\n{body}\n}}")
+}
+
+#[test]
+fn string_equality_with_a_literal_and_between_locals() {
+    ok(&with_path("    if path == \"/bin/sh\" { emit E { a: 1, b: true }; }"));
+    ok(&with_path("    let same = path != \"/bin/sh\";\n    emit E { a: 1, b: same };"));
+    ok(&with_path("    if path == other { emit E { a: 1, b: path != other }; }"));
+}
+
+#[test]
+fn string_literal_longer_than_capacity_can_never_match() {
+    let ds = diags(&with_path("    if other == \"/usr/local/bin/something\" { }\n    emit E { a: 1, b: true };"));
+    assert!(ds[0].message.contains("can never be equal"), "{ds:#?}");
+    assert!(ds[0].help.as_deref().unwrap().contains("enlarge"));
+    // exactly the capacity is fine (no room for a NUL is allowed)
+    ok(&with_path("    if other == \"0123456789abcdef\" { }\n    emit E { a: 1, b: true };"));
+}
+
+#[test]
+fn strings_only_support_equality() {
+    let msg = first_message(&with_path("    if path < \"/bin\" { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("strings do not support `<`"), "{msg}");
+}
+
+#[test]
+fn string_vs_non_string_is_an_error() {
+    let msg = first_message(&with_path("    if path == 5 { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("cannot compare `str<32>` with `{integer}`"), "{msg}");
+    let msg = first_message(&with_path("    if pid() == \"x\" { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("cannot compare a string literal with `u32`"), "{msg}");
+    let msg = first_message(&with_path("    if \"a\" == \"a\" { }\n    emit E { a: 1, b: true };"));
+    assert!(msg.contains("two string literals"), "{msg}");
+}

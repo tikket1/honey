@@ -1,0 +1,10 @@
+// error: this literal is 39 bytes but the string is only `str<16>`; they can never be equal
+
+event E { p: u32 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let path: str<16> = read_user_str(arg(0));
+    if path == "/usr/local/share/very/long/path/here.sh" {
+        emit E { p: pid() };
+    }
+}

@@ -900,7 +900,7 @@ impl Cg<'_> {
                 self.cond(rhs, then_label, else_label)
             }
             ExprKind::Unary { op: UnaryOp::Not, expr } => self.cond(expr, else_label, then_label),
-            ExprKind::Binary { op, lhs, rhs } if is_comparison(*op) => {
+            ExprKind::Binary { op, lhs, rhs } if is_comparison(*op) && !self.is_str_compare(lhs, rhs) => {
                 let (lty, rty) = self.binary_operands(lhs, rhs)?; // R1 = lhs, R0 = rhs
                 let signed = lty == Ty::I64 || rty == Ty::I64;
                 let jop = compare_op(*op, signed).unwrap();
@@ -1137,7 +1137,92 @@ impl Cg<'_> {
         Ok((lty, rty))
     }
 
+    /// Is this `a == b` / `a != b` a string comparison (a `str<N>` local on a
+    /// side, or a literal)? The checker has already validated the shapes.
+    fn is_str_compare(&self, lhs: &Expr, rhs: &Expr) -> bool {
+        let is_str = |e: &Expr| match &e.kind {
+            ExprKind::Str(_) => true,
+            ExprKind::Ident(n) => matches!(self.lookup(n).map(|l| &l.ty), Some(Ty::Str(_))),
+            _ => false,
+        };
+        is_str(lhs) || is_str(rhs)
+    }
+
+    /// Emit a string equality test into R0 (1 = equal). C-string semantics:
+    /// equal through the terminating NUL, bounded by the capacities. Fully
+    /// unrolled, so the verifier sees straight-line code.
+    fn str_equal(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        enum Side {
+            Local(i16, u32),
+            Lit(Vec<u8>),
+        }
+        let side = |cg: &Self, e: &Expr| -> Result<Side, String> {
+            match &e.kind {
+                ExprKind::Str(lit) => Ok(Side::Lit(lit.as_bytes().to_vec())),
+                ExprKind::Ident(n) => match cg.lookup(n) {
+                    Some(Local { off, ty: Ty::Str(cap) }) => Ok(Side::Local(*off, *cap)),
+                    _ => Err(format!("`{n}` is not a string")),
+                },
+                _ => Err("string comparison needs a `str<N>` variable or a literal".into()),
+            }
+        };
+        let (a, b) = (side(self, lhs)?, side(self, rhs)?);
+        let fail = self.prog.new_label();
+        let equal = self.prog.new_label();
+        let end = self.prog.new_label();
+        match (a, b) {
+            (Side::Local(off, cap), Side::Lit(lit)) | (Side::Lit(lit), Side::Local(off, cap)) => {
+                if lit.len() as u32 > cap {
+                    return Err("literal longer than the string's capacity".into());
+                }
+                for (i, &byte) in lit.iter().enumerate() {
+                    self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, off + i as i16));
+                    self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, byte as i32, fail);
+                }
+                // The variable must end where the literal ends.
+                if (lit.len() as u32) < cap {
+                    self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, off + lit.len() as i16));
+                    self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, 0, fail);
+                }
+            }
+            (Side::Local(ao, ac), Side::Local(bo, bc)) => {
+                let n = ac.min(bc);
+                for i in 0..n as i16 {
+                    self.prog.push(ldx_mem(Size::B, Reg::R1, Reg::R10, ao + i));
+                    self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, bo + i));
+                    self.prog.jmp_reg_to(JmpOp::Ne, Reg::R1, Reg::R0, fail);
+                    // Same byte on both sides; if it's the NUL, both ended.
+                    self.prog.jmp_imm_to(JmpOp::Eq, Reg::R1, 0, equal);
+                }
+                // Ran through the shorter capacity: the longer must end here.
+                if ac > n {
+                    self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, ao + n as i16));
+                    self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, 0, fail);
+                }
+                if bc > n {
+                    self.prog.push(ldx_mem(Size::B, Reg::R0, Reg::R10, bo + n as i16));
+                    self.prog.jmp_imm_to(JmpOp::Ne, Reg::R0, 0, fail);
+                }
+            }
+            (Side::Lit(_), Side::Lit(_)) => return Err("cannot compare two literals".into()),
+        }
+        self.prog.bind(equal);
+        self.prog.push(mov64_imm(Reg::R0, 1));
+        self.prog.ja_to(end);
+        self.prog.bind(fail);
+        self.prog.push(mov64_imm(Reg::R0, 0));
+        self.prog.bind(end);
+        Ok(())
+    }
+
     fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Result<Ty, String> {
+        if matches!(op, BinaryOp::Eq | BinaryOp::Ne) && self.is_str_compare(lhs, rhs) {
+            self.str_equal(lhs, rhs)?;
+            if op == BinaryOp::Ne {
+                self.prog.push(alu64_imm(AluOp::Xor, Reg::R0, 1));
+            }
+            return Ok(Ty::Bool);
+        }
         if matches!(op, BinaryOp::And | BinaryOp::Or) || is_comparison(op) {
             let t = self.prog.new_label();
             let f = self.prog.new_label();

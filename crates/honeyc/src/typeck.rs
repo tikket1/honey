@@ -876,7 +876,58 @@ impl Checker<'_> {
         }
     }
 
+    /// How an operand takes part in a string comparison, decided without
+    /// evaluating it (a bare literal is an error everywhere else).
+    fn str_side(&self, e: &Expr) -> StrSide {
+        match &e.kind {
+            ExprKind::Str(lit) => StrSide::Lit(lit.len() as u32),
+            ExprKind::Ident(n) => match self.lookup(n).map(|v| v.ty.clone()) {
+                Some(Ty::Str(cap)) => StrSide::Local(cap),
+                _ => StrSide::No,
+            },
+            _ => StrSide::No,
+        }
+    }
+
     fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> Ty {
+        // String comparisons: `s == "lit"`, `s != t`. Only `==` / `!=`.
+        let (ls, rs) = (self.str_side(lhs), self.str_side(rhs));
+        if ls != StrSide::No || rs != StrSide::No {
+            if !matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+                self.error_help(span, format!("strings do not support `{}`", op.symbol()), "strings can only be compared with `==` and `!=`, or tested with `starts_with`");
+                return Ty::Bool;
+            }
+            match (ls, rs) {
+                (StrSide::Lit(_), StrSide::Lit(_)) => {
+                    self.error(span, "comparing two string literals; compare a `str<N>` variable with a literal");
+                }
+                (StrSide::Local(cap), StrSide::Lit(len)) | (StrSide::Lit(len), StrSide::Local(cap)) => {
+                    if len > cap {
+                        self.error_help(
+                            span,
+                            format!("this literal is {len} bytes but the string is only `str<{cap}>`; they can never be equal"),
+                            "enlarge the `str<N>` or shorten the literal",
+                        );
+                    }
+                }
+                (StrSide::Local(_), StrSide::Local(_)) => {}
+                (StrSide::Local(cap), StrSide::No) | (StrSide::No, StrSide::Local(cap)) => {
+                    let other = if ls == StrSide::No { self.expr(lhs) } else { self.expr(rhs) };
+                    if other != Ty::Unit {
+                        self.error(span, format!("cannot compare `str<{cap}>` with `{other}`"));
+                    }
+                }
+                (StrSide::Lit(_), StrSide::No) | (StrSide::No, StrSide::Lit(_)) => {
+                    let other = if ls == StrSide::No { self.expr(lhs) } else { self.expr(rhs) };
+                    if other != Ty::Unit {
+                        self.error_help(span, format!("cannot compare a string literal with `{other}`"), "only a `str<N>` variable can be compared with a literal");
+                    }
+                }
+                (StrSide::No, StrSide::No) => unreachable!(),
+            }
+            return Ty::Bool;
+        }
+
         let l = self.expr(lhs);
         let r = self.expr(rhs);
         // Errors in operands already reported; don't cascade.
@@ -1215,6 +1266,15 @@ impl Checker<'_> {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrSide {
+    /// A `str<N>` variable with this capacity.
+    Local(u32),
+    /// A string literal of this byte length.
+    Lit(u32),
+    No,
 }
 
 /// `actual` is acceptable where `expected` is required.

@@ -22,7 +22,7 @@ first and refuse to generate code for anything that fails.
 | using a map lookup result before its NULL check| `map.get` has type `Option<&V>`. The only way to reach the `&V` is `if let Some(v) = ...`. `*` on an `Option` is a type error with the fix in the message |
 | using a checked pointer after the check's scope| the `Some(v)` binding exists only inside that `if` body; outside it is an unknown name |
 | reads of unknown length into the stack         | `read_user_str` may only initialise a declared `str<N>`; `N` is the read bound and cannot be omitted |
-| out-of-range stack access                      | `byte_at(i)` needs a constant `i < N`; `starts_with` literal must fit in `N` |
+| out-of-range stack access                      | `byte_at(i)` needs a constant `i < N`; `starts_with` and `==` literals must fit in `N` |
 | more than 512 bytes of stack                   | locals are summed along each scope path; the peak plus the compiler's reserve must fit, or it is an error naming the numbers |
 | writes through map value pointers (v1 choice)  | `*p = v` is rejected; `map.insert` is the supported update |
 | unsafe integer truncation                      | four unsigned widths plus `i64`, no implicit conversion; mixing widths is a type error and literals are range-checked |
@@ -75,7 +75,7 @@ All errors in a file are reported together, not just the first.
 
 - LSM and XDP probe kinds; uprobes.
 - Functions.
-- `as` casts, signed widths other than `i64`, in-place map updates, string equality.
+- `as` casts, signed widths other than `i64`, in-place map updates.
 - Rate limiting or sampling for `emit`.
 
 Each of these is an addition to the same checker, not a redesign.

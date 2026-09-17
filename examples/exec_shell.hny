@@ -1,0 +1,20 @@
+// exec_shell.hny — report every exec of a shell by its exact path.
+//
+// `read_user_str` pulls the filename argument of execve out of the calling
+// process, and `==` compares it with a literal: equal through the terminating
+// NUL, so "/bin/sh" does not match "/bin/shutdown". `starts_with` remains
+// the prefix test; `==` is the exact one.
+
+event Shell {
+    pid: u32,
+    uid: u32,
+    comm: str<16>,
+    path: str<32>,
+}
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let path: str<32> = read_user_str(arg(0));
+    if path == "/bin/sh" || path == "/bin/bash" || path == "/usr/bin/bash" {
+        emit Shell { pid: pid(), uid: uid(), comm: comm(), path: path };
+    }
+}

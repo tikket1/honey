@@ -1,0 +1,13 @@
+// error: cannot compare `str<32>` with `{integer}`
+//
+// A string and a number have no common comparison. honey has no implicit
+// conversions, so this is a type error rather than a silent pointer compare.
+
+event E { p: u32 }
+
+probe tracepoint("syscalls", "sys_enter_execve") {
+    let path: str<32> = read_user_str(arg(0));
+    if path == 5 {
+        emit E { p: pid() };
+    }
+}
