@@ -20,13 +20,15 @@ Everything after it is a draft that will firm up as each stage lands.
    loops, no unchecked map pointers, no out-of-bounds stack access, no
    unbounded memory reads. Each of these is a *type* or *syntax* rule, not a
    runtime discovery.
-2. **Security detection first.** v1 targets kprobe/tracepoint programs that
-   emit records to a ring buffer. Enforcement (LSM) and networking (XDP) are
-   explicitly out of scope for v1.
+2. **Security detection first.** The core shape is a probe that observes a
+   kernel or packet event and emits a typed record to a ring buffer.
+   Enforcement (LSM `deny()`) and packet decisions (XDP drop/tx/redirect)
+   use the same language, not a second one.
 3. **No hidden runtime.** No heap, no GC, no stdlib beyond BPF helpers. What
    you write is what runs.
-4. **Familiar surface.** Syntax is deliberately Rust-flavoured, because the
-   compiler author is learning Rust at the same time.
+4. **Familiar surface.** Syntax is deliberately Rust-flavoured: `let`,
+   `if let Some(v)`, `Option`, typed integers with no implicit widening.
+   The verifier's rules map onto that vocabulary without inventing one.
 
 ## 2. A complete program
 
