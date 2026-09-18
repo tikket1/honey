@@ -123,33 +123,16 @@ pub struct Stmt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StmtKind {
     /// `let [mut] name [: type] = value;`
-    Let {
-        mutable: bool,
-        name: Ident,
-        ty: Option<Type>,
-        value: Expr,
-    },
+    Let { mutable: bool, name: Ident, ty: Option<Type>, value: Expr },
     /// `target = value;` where `target` is a name or `*name`.
     Assign { target: Expr, value: Expr },
     /// `if cond { } [else { }]`. An `else if` is represented as an `else`
     /// block containing a single `If` statement.
-    If {
-        cond: Cond,
-        then: Block,
-        otherwise: Option<Block>,
-    },
+    If { cond: Cond, then: Block, otherwise: Option<Block> },
     /// `for var in start..end { }`
-    For {
-        var: Ident,
-        start: Expr,
-        end: Expr,
-        body: Block,
-    },
+    For { var: Ident, start: Expr, end: Expr, body: Block },
     /// `emit Event { field: value, ... };`
-    Emit {
-        event: Ident,
-        fields: Vec<(Ident, Expr)>,
-    },
+    Emit { event: Ident, fields: Vec<(Ident, Expr)> },
     /// `return [value];`
     Return(Option<Expr>),
     /// `expr;`
@@ -161,7 +144,10 @@ pub enum StmtKind {
 pub enum Cond {
     Expr(Expr),
     /// `if let pattern = value`
-    Let { pattern: Pattern, value: Expr },
+    Let {
+        pattern: Pattern,
+        value: Expr,
+    },
 }
 
 /// `Some(x)` or `None`. Only used in `if let`.
@@ -225,32 +211,32 @@ pub enum ExprKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
-    Not,   // !
-    Neg,   // -
+    Not,    // !
+    Neg,    // -
     BitNot, // ~
-    Deref, // *
+    Deref,  // *
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
-    Or,  // ||
-    And, // &&
-    Eq,  // ==
-    Ne,  // !=
-    Lt,  // <
-    Le,  // <=
-    Gt,  // >
-    Ge,  // >=
+    Or,     // ||
+    And,    // &&
+    Eq,     // ==
+    Ne,     // !=
+    Lt,     // <
+    Le,     // <=
+    Gt,     // >
+    Ge,     // >=
     BitOr,  // |
     BitXor, // ^
     BitAnd, // &
-    Shl, // <<
-    Shr, // >>
-    Add, // +
-    Sub, // -
-    Mul, // *
-    Div, // /
-    Rem, // %
+    Shl,    // <<
+    Shr,    // >>
+    Add,    // +
+    Sub,    // -
+    Mul,    // *
+    Div,    // /
+    Rem,    // %
 }
 
 impl UnaryOp {

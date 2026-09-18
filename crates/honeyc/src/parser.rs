@@ -90,11 +90,7 @@ impl Parser {
 
     /// Byte just past the previous token; used to close spans.
     fn prev_end(&self) -> usize {
-        if self.pos == 0 {
-            0
-        } else {
-            self.tokens[self.pos - 1].span.end
-        }
+        if self.pos == 0 { 0 } else { self.tokens[self.pos - 1].span.end }
     }
 
     fn advance(&mut self) -> Token {
@@ -128,11 +124,7 @@ impl Parser {
     }
 
     fn expect(&mut self, kind: TokenKind, what: &str) -> PResult<Token> {
-        if self.at(&kind) {
-            Ok(self.advance())
-        } else {
-            self.unexpected(what)
-        }
+        if self.at(&kind) { Ok(self.advance()) } else { self.unexpected(what) }
     }
 
     fn expect_ident(&mut self, what: &str) -> PResult<Ident> {
@@ -178,10 +170,7 @@ impl Parser {
             }
             TokenKind::Shr => {
                 let span = self.peek_span();
-                self.tokens[self.pos] = Token {
-                    kind: TokenKind::Gt,
-                    span: Span::new(span.start + 1, span.end),
-                };
+                self.tokens[self.pos] = Token { kind: TokenKind::Gt, span: Span::new(span.start + 1, span.end) };
                 Ok(())
             }
             _ => self.unexpected("`>`"),
@@ -315,10 +304,7 @@ impl Parser {
             TokenKind::Emit => self.emit_stmt()?,
             TokenKind::Return => self.return_stmt()?,
             TokenKind::While => {
-                return self.error(
-                    "`while` is not allowed: loops must have a constant bound, use `for i in a..b`",
-                    self.peek_span(),
-                );
+                return self.error("`while` is not allowed: loops must have a constant bound, use `for i in a..b`", self.peek_span());
             }
             _ => self.expr_or_assign_stmt()?,
         };

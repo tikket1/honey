@@ -5,10 +5,10 @@
 //! is the loader's job and lives in `linux/`. The kernel verifier is the
 //! ultimate check, but these catch regressions without needing Linux.
 
-use honeyc::codegen::{compile, Arch};
-use honeyc::layout::{layout_event, FieldKind};
-use honeyc::parser::parse;
 use honeyc::ast::Item;
+use honeyc::codegen::{Arch, compile};
+use honeyc::layout::{FieldKind, layout_event};
+use honeyc::parser::parse;
 
 fn asm(src: &str) -> String {
     let prog = parse(src).unwrap();
@@ -122,11 +122,7 @@ fn uid_field_high_half_is_not_shifted() {
 #[test]
 fn unsupported_constructs_report_clearly() {
     let probe = |body: &str| format!("event E {{ a: u32 }} probe tracepoint(\"s\",\"n\") {{ {body} emit E {{ a: pid() }}; }}");
-    let cases = [
-        (probe("let x = 1 as u8;"), "as"),
-        (probe("return 7;"), "return"),
-        ("event E { a: u32 }".to_string(), "no probe"),
-    ];
+    let cases = [(probe("let x = 1 as u8;"), "as"), (probe("return 7;"), "return"), ("event E { a: u32 }".to_string(), "no probe")];
     for (src, needle) in cases {
         let prog = parse(&src).unwrap();
         let err = compile(&prog, Arch::Aarch64).unwrap_err();
@@ -455,7 +451,7 @@ fn sample_creates_one_counter_map_sized_to_the_sites() {
 fn sample_increments_a_counter_and_tests_the_rate() {
     let src = "event E { a: u32 } probe tracepoint(\"s\",\"n\") { if sample(100) { emit E { a: 1 }; } }";
     let asm = asm_helper(src);
-    assert!(asm.contains("call 1"), "map_lookup_elem\n{asm}");   // lookup
+    assert!(asm.contains("call 1"), "map_lookup_elem\n{asm}"); // lookup
     assert!(asm.contains("add r1, 1"), "increment\n{asm}");
     assert!(asm.contains("mod r1, 100"), "1-in-100\n{asm}");
 }
@@ -481,10 +477,7 @@ const SHELL: &str = include_str!("../../../examples/exec_shell.hny");
 /// (A plain `if r0 != 0 goto` also appears for boolean conditions.)
 fn nul_checks(text: &str) -> usize {
     let lines: Vec<&str> = text.lines().collect();
-    lines
-        .windows(2)
-        .filter(|w| w[0].contains("ldx8 r0, [r10") && w[1].contains("if r0 != 0 goto"))
-        .count()
+    lines.windows(2).filter(|w| w[0].contains("ldx8 r0, [r10") && w[1].contains("if r0 != 0 goto")).count()
 }
 
 #[test]
@@ -507,7 +500,8 @@ fn string_inequality_flips_the_result() {
 
 #[test]
 fn literal_filling_the_capacity_has_no_terminator_check() {
-    let src = "event E { a: u8 } probe tracepoint(\"s\",\"n\") { let p: str<2> = read_user_str(arg(0)); if p == \"ab\" { emit E { a: 1 }; } }";
+    let src =
+        "event E { a: u8 } probe tracepoint(\"s\",\"n\") { let p: str<2> = read_user_str(arg(0)); if p == \"ab\" { emit E { a: 1 }; } }";
     let text = asm_helper(src);
     assert_eq!(nul_checks(&text), 0, "{text}");
 }

@@ -1,13 +1,16 @@
 # Stage 1 — the lexer
 
-**Goal:** make every test in `crates/honeyc/tests/lexer.rs` pass by writing
-`crates/honeyc/src/lexer.rs`. Nothing else needs to change.
+honey's lexer (`crates/honeyc/src/lexer.rs`) is ~300 lines with no
+dependencies, and it is the most self-contained piece of the compiler: its
+whole contract is `src/token.rs` (the token vocabulary) plus
+`docs/LANGUAGE.md` § 3 (the lexical rules), and it is pinned by the 50
+tests in `crates/honeyc/tests/lexer.rs`.
 
-**Contract:** `src/token.rs` (read it, do not edit it) and
-`docs/LANGUAGE.md` § 3 (the rules).
-
-**You write the code.** This document tells you what to read, the order to
-attack the tests in, the Rust you will need, and the traps.
+That makes it the right place to start if you want to write part of a
+compiler yourself: delete `lexer.rs`, and this document tells you what to
+read, the order to attack the tests in, the Rust you will need, and the
+traps. The tests are the specification; when they are green you have a
+lexer that is interchangeable with the shipped one.
 
 ---
 
@@ -93,9 +96,11 @@ lexer; the parser will split it. There is a test that pins this behaviour.
 
 ## Done when
 
-- `cargo test` is green.
-- `cargo run -- examples/sensitive_open.hny` prints a token per line and
-  exits 0.
+- `cargo test --test lexer` is green (and then all of `cargo test`: every
+  later stage runs on your tokens).
+- `cargo run -- --tokens examples/sensitive_open.hny` prints a token per
+  line and exits 0.
 - `cargo clippy` has nothing to say (install with `rustup component add clippy`).
 
-Then tell me and I'll review it before we start stage 2 (the parser).
+The parser (`docs/LANGUAGE.md` § 4, `tests/parser.rs`) is the same exercise
+one level up, with `src/ast.rs` as its contract.

@@ -5,20 +5,16 @@
 //!
 //! Rules under test: docs/LANGUAGE.md § 3. Types: src/token.rs.
 
+use TokenKind::*;
 use honeyc::lexer::lex;
 use honeyc::token::{LexError, LexErrorKind, Span, Token, TokenKind};
-use TokenKind::*;
 
 // ---------------------------------------------------------------- helpers
 
 /// Lex, assert the stream ends in Eof, return the kinds *without* the Eof.
 fn kinds(src: &str) -> Vec<TokenKind> {
     let toks = lex(src).unwrap_or_else(|e| panic!("lex({src:?}) failed: {e:?}"));
-    assert_eq!(
-        toks.last().map(|t| &t.kind),
-        Some(&Eof),
-        "token stream must end with Eof: {toks:?}"
-    );
+    assert_eq!(toks.last().map(|t| &t.kind), Some(&Eof), "token stream must end with Eof: {toks:?}");
     toks.into_iter().map(|t| t.kind).filter(|k| *k != Eof).collect()
 }
 
@@ -52,10 +48,7 @@ fn empty_input_is_just_eof() {
 #[test]
 fn whitespace_only_is_just_eof() {
     let src = "  \t\n\r\n ";
-    assert_eq!(
-        lex(src).unwrap(),
-        vec![Token { kind: Eof, span: sp(src.len(), src.len()) }]
-    );
+    assert_eq!(lex(src).unwrap(), vec![Token { kind: Eof, span: sp(src.len(), src.len()) }]);
 }
 
 // ----------------------------------------------- 2. single-char punctuation
@@ -65,8 +58,8 @@ fn single_char_punctuation() {
     assert_eq!(
         kinds("( ) { } [ ] , ; : . = ! < > + - * / % & | ^ ~"),
         vec![
-            LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi, Colon, Dot, Eq,
-            Bang, Lt, Gt, Plus, Minus, Star, Slash, Percent, Amp, Pipe, Caret, Tilde,
+            LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi, Colon, Dot, Eq, Bang, Lt, Gt, Plus, Minus, Star, Slash,
+            Percent, Amp, Pipe, Caret, Tilde,
         ]
     );
 }
@@ -87,15 +80,7 @@ fn single_identifier() {
 fn identifiers_allow_underscores_and_digits() {
     assert_eq!(
         kinds("_ _x x1 foo_bar __init sys_enter_execve u32"),
-        vec![
-            ident("_"),
-            ident("_x"),
-            ident("x1"),
-            ident("foo_bar"),
-            ident("__init"),
-            ident("sys_enter_execve"),
-            ident("u32"),
-        ]
+        vec![ident("_"), ident("_x"), ident("x1"), ident("foo_bar"), ident("__init"), ident("sys_enter_execve"), ident("u32"),]
     );
 }
 
@@ -137,25 +122,14 @@ fn keywords_are_case_sensitive() {
 
 #[test]
 fn identifier_with_keyword_prefix_is_an_identifier() {
-    assert_eq!(
-        kinds("probes mapping iffy letter"),
-        vec![ident("probes"), ident("mapping"), ident("iffy"), ident("letter")]
-    );
+    assert_eq!(kinds("probes mapping iffy letter"), vec![ident("probes"), ident("mapping"), ident("iffy"), ident("letter")]);
 }
 
 #[test]
 fn type_names_and_builtins_are_plain_identifiers() {
     assert_eq!(
         kinds("hash array str bool Some None pid"),
-        vec![
-            ident("hash"),
-            ident("array"),
-            ident("str"),
-            ident("bool"),
-            ident("Some"),
-            ident("None"),
-            ident("pid"),
-        ]
+        vec![ident("hash"), ident("array"), ident("str"), ident("bool"), ident("Some"), ident("None"), ident("pid"),]
     );
 }
 
@@ -197,10 +171,7 @@ fn three_in_a_row_is_greedy_then_single() {
 fn shr_is_greedy_even_when_closing_generics() {
     // The lexer does NOT know about generics. `str<16>>` ends in `Shr`, and
     // the parser is responsible for splitting it. (rustc does the same.)
-    assert_eq!(
-        kinds("hash<u32, str<16>>"),
-        vec![ident("hash"), Lt, ident("u32"), Comma, ident("str"), Lt, Int(16), Shr]
-    );
+    assert_eq!(kinds("hash<u32, str<16>>"), vec![ident("hash"), Lt, ident("u32"), Comma, ident("str"), Lt, Int(16), Shr]);
 }
 
 // ------------------------------------------------------------- 5. integers
@@ -217,10 +188,7 @@ fn underscores_are_ignored_in_integers() {
 
 #[test]
 fn hex_integers() {
-    assert_eq!(
-        kinds("0xFF 0xff 0x0 0xDEAD_BEEF"),
-        vec![Int(0xFF), Int(0xFF), Int(0), Int(0xDEAD_BEEF)]
-    );
+    assert_eq!(kinds("0xFF 0xff 0x0 0xDEAD_BEEF"), vec![Int(0xFF), Int(0xFF), Int(0), Int(0xDEAD_BEEF)]);
 }
 
 #[test]
@@ -347,14 +315,7 @@ fn non_ascii_inside_string_is_allowed() {
 fn strings_next_to_punctuation() {
     assert_eq!(
         kinds(r#"tracepoint("syscalls", "sys_enter_execve")"#),
-        vec![
-            ident("tracepoint"),
-            LParen,
-            string("syscalls"),
-            Comma,
-            string("sys_enter_execve"),
-            RParen,
-        ]
+        vec![ident("tracepoint"), LParen, string("syscalls"), Comma, string("sys_enter_execve"), RParen,]
     );
 }
 

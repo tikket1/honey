@@ -46,7 +46,7 @@ use crate::addr;
 use crate::ast::*;
 use crate::bpf::{self, *};
 use crate::btf::{Btf, Resolved};
-use crate::layout::{layout_event, EventLayout, FieldKind};
+use crate::layout::{EventLayout, FieldKind, layout_event};
 
 // ------------------------------------------------------------------ output
 
@@ -86,7 +86,7 @@ impl Arch {
     /// Byte offset in `struct pt_regs` of the return value register.
     fn retval_offset(self) -> i16 {
         match self {
-            Arch::Aarch64 => 0,  // x0
+            Arch::Aarch64 => 0, // x0
             Arch::X86_64 => 80, // rax
         }
     }
@@ -94,19 +94,36 @@ impl Arch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeKind {
-    Tracepoint { category: String, name: String },
-    Kprobe { function: String },
-    Kretprobe { function: String },
+    Tracepoint {
+        category: String,
+        name: String,
+    },
+    Kprobe {
+        function: String,
+    },
+    Kretprobe {
+        function: String,
+    },
     /// An LSM hook. The program returns 0 to allow, negative to deny.
-    Lsm { hook: String },
+    Lsm {
+        hook: String,
+    },
     /// An XDP program on a network interface. Returns an XDP action.
-    Xdp { interface: String },
+    Xdp {
+        interface: String,
+    },
     /// A uprobe on a userspace function entry (`path:symbol`).
-    Uprobe { target: String },
+    Uprobe {
+        target: String,
+    },
     /// A uretprobe on a userspace function return (`path:symbol`).
-    Uretprobe { target: String },
+    Uretprobe {
+        target: String,
+    },
     /// A USDT marker in a user binary (`path:provider:name`).
-    Usdt { target: String },
+    Usdt {
+        target: String,
+    },
 }
 
 const XDP_DROP: i32 = 1;
@@ -222,7 +239,12 @@ enum Ty {
     /// the named struct the pointer really points at and `path` the dotted
     /// member path from it — what a relocation is expressed as, so the
     /// loader can re-walk it against the running kernel's BTF.
-    KPtr { id: u32, root: String, path: String, off: i32 },
+    KPtr {
+        id: u32,
+        root: String,
+        path: String,
+        off: i32,
+    },
     /// Kernel pointer to char (a string address).
     KCharPtr,
     /// A packet struct view: the BTF type at this constant packet offset.
@@ -236,7 +258,9 @@ enum Ty {
     PktBytes,
     /// A DNS message over the payload (R9). `end` is the stack slot holding
     /// the offset just past the question name once `name()` has decoded it.
-    Dns { end: i16 },
+    Dns {
+        end: i16,
+    },
 }
 
 impl Ty {
@@ -308,7 +332,6 @@ struct Shared<'a> {
     /// Map index of the hidden USDT argument-spec array, if any usdt probe.
     usdt_map: Option<i32>,
 }
-
 
 struct Cg<'a> {
     sh: &'a Shared<'a>,
@@ -409,7 +432,13 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
     for i in 0..keyed_sites {
         let idx = (sh.maps.len() as i32) + 1;
         sh.rate_key_maps.push(idx);
-        sh.maps.push(MapSpec { name: format!("__honey_ratek{i}"), kind: MapKind::Hash, key_size: 8, value_size: 16, max_entries: RATE_KEYS });
+        sh.maps.push(MapSpec {
+            name: format!("__honey_ratek{i}"),
+            kind: MapKind::Hash,
+            key_size: 8,
+            value_size: 16,
+            max_entries: RATE_KEYS,
+        });
     }
 
     // USDT: one argument spec per program (keyed by program index), filled
@@ -455,15 +484,7 @@ pub fn compile_with_btf(program: &Program, arch: Arch, btf: Option<&Btf>) -> Res
     }
 
     let stack_bytes = programs.iter().map(|p| p.stack_bytes).max().unwrap_or(0);
-    Ok(Compiled {
-        programs,
-        ringbuf_bytes: 1 << 16,
-        maps: sh.maps,
-        events: sh.events,
-        license: "GPL".into(),
-        arch,
-        stack_bytes,
-    })
+    Ok(Compiled { programs, ringbuf_bytes: 1 << 16, maps: sh.maps, events: sh.events, license: "GPL".into(), arch, stack_bytes })
 }
 
 type ProbeOutput = (Vec<u8>, u32, Vec<Reloc>, Vec<IfaceReloc>);
@@ -530,10 +551,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sites: &mut Sites
     cg.prog.push(bpf::exit());
 
     if cg.max_stack > BPF_STACK_LIMIT {
-        return Err(format!(
-            "probe uses {} bytes of stack, the BPF limit is {BPF_STACK_LIMIT}",
-            cg.max_stack
-        ));
+        return Err(format!("probe uses {} bytes of stack, the BPF limit is {BPF_STACK_LIMIT}", cg.max_stack));
     }
     let max_stack = cg.max_stack as u32;
     let reloc_sites = std::mem::take(&mut cg.relocs);
@@ -547,10 +565,7 @@ fn compile_probe(sh: &Shared, kind: &ProbeKind, p: &ProbeDecl, sites: &mut Sites
         slot_start.push(slot);
         slot += insn.slots();
     }
-    let relocs = reloc_sites
-        .into_iter()
-        .map(|(idx, st, f)| Reloc { slot: slot_start[idx], struct_name: st, field: f })
-        .collect();
+    let relocs = reloc_sites.into_iter().map(|(idx, st, f)| Reloc { slot: slot_start[idx], struct_name: st, field: f }).collect();
     let ifaces = iface_sites.into_iter().map(|(idx, name)| IfaceReloc { slot: slot_start[idx], name }).collect();
     let mut out = Vec::with_capacity(insns.len() * 8);
     for insn in &insns {
@@ -573,31 +588,16 @@ fn map_spec(m: &MapDecl) -> Result<(MapSpec, Ty, Ty), String> {
         ("hash", [k, v]) => {
             let kty = Ty::from_ast(k)?;
             let vty = Ty::from_ast(v)?;
-            let spec = MapSpec {
-                name: m.name.name.clone(),
-                kind: MapKind::Hash,
-                key_size: kty.size(),
-                value_size: vty.size(),
-                max_entries: cap,
-            };
+            let spec =
+                MapSpec { name: m.name.name.clone(), kind: MapKind::Hash, key_size: kty.size(), value_size: vty.size(), max_entries: cap };
             Ok((spec, kty, vty))
         }
         ("array", [v]) => {
             let vty = Ty::from_ast(v)?;
-            let spec = MapSpec {
-                name: m.name.name.clone(),
-                kind: MapKind::Array,
-                key_size: 4,
-                value_size: vty.size(),
-                max_entries: cap,
-            };
+            let spec = MapSpec { name: m.name.name.clone(), kind: MapKind::Array, key_size: 4, value_size: vty.size(), max_entries: cap };
             Ok((spec, Ty::Uint(4), vty))
         }
-        (kind, args) => Err(format!(
-            "map `{}`: unsupported kind `{kind}` with {} type argument(s)",
-            m.name.name,
-            args.len()
-        )),
+        (kind, args) => Err(format!("map `{}`: unsupported kind `{kind}` with {} type argument(s)", m.name.name, args.len())),
     }
 }
 
@@ -731,7 +731,15 @@ fn bitfield_container(bit_offset: u32, bit_size: u32) -> (u32, u32, u32) {
     let byte = bit_offset / 8;
     let shift = bit_offset % 8;
     let span = shift + bit_size;
-    let width = if span <= 8 { 1 } else if span <= 16 { 2 } else if span <= 32 { 4 } else { 8 };
+    let width = if span <= 8 {
+        1
+    } else if span <= 16 {
+        2
+    } else if span <= 32 {
+        4
+    } else {
+        8
+    };
     (byte, width, shift)
 }
 
@@ -768,8 +776,7 @@ fn body_uses_dyn_view(body: &Block) -> bool {
     fn expr(e: &Expr) -> bool {
         match &e.kind {
             ExprKind::MethodCall { receiver, method, args } => {
-                (matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt")
-                    && matches!(method.name.as_str(), "view" | "ipv6_l4" | "l4"))
+                (matches!(&receiver.kind, ExprKind::Ident(n) if n == "pkt") && matches!(method.name.as_str(), "view" | "ipv6_l4" | "l4"))
                     || method.name == "payload"
                     || expr(receiver)
                     || args.iter().any(expr)
@@ -989,9 +996,7 @@ impl Cg<'_> {
         match &e.kind {
             ExprKind::Int(n) => Ok(*n as i64),
             ExprKind::Bool(b) => Ok(*b as i64),
-            ExprKind::Ident(name) => self
-                .const_lookup(name)
-                .ok_or_else(|| format!("`{name}` is not a compile-time constant")),
+            ExprKind::Ident(name) => self.const_lookup(name).ok_or_else(|| format!("`{name}` is not a compile-time constant")),
             ExprKind::Binary { op, lhs, rhs } => {
                 let a = self.const_eval(lhs)?;
                 let b = self.const_eval(rhs)?;
@@ -1169,10 +1174,7 @@ impl Cg<'_> {
             StmtKind::Assign { target, value } => match &target.kind {
                 ExprKind::Ident(n) => {
                     self.expr(value)?;
-                    let local = self
-                        .lookup(n)
-                        .cloned()
-                        .ok_or_else(|| format!("assignment to unknown variable `{n}`"))?;
+                    let local = self.lookup(n).cloned().ok_or_else(|| format!("assignment to unknown variable `{n}`"))?;
                     self.store_local(&local);
                     Ok(())
                 }
@@ -1337,11 +1339,7 @@ impl Cg<'_> {
     // ---- emit ------------------------------------------------------------
 
     fn emit(&mut self, event: &Ident, fields: &[(Ident, Expr)]) -> Result<(), String> {
-        let id = *self
-            .sh
-            .event_ids
-            .get(&event.name)
-            .ok_or_else(|| format!("unknown event `{}`", event.name))?;
+        let id = *self.sh.event_ids.get(&event.name).ok_or_else(|| format!("unknown event `{}`", event.name))?;
         let layout = self.sh.events[id as usize].clone();
         let total = RECORD_HEADER + layout.size;
         let skip = self.prog.new_label();
@@ -1510,11 +1508,7 @@ impl Cg<'_> {
                 let ExprKind::Ident(name) = &callee.kind else {
                     return Err("only builtins can be called".into());
                 };
-                if args.is_empty() {
-                    self.builtin(name)
-                } else {
-                    self.builtin_with_args(name, args)
-                }
+                if args.is_empty() { self.builtin(name) } else { self.builtin_with_args(name, args) }
             }
             ExprKind::MethodCall { receiver, method, args } => {
                 if let ExprKind::Ident(n) = &receiver.kind
@@ -1705,8 +1699,12 @@ impl Cg<'_> {
                     _ => Err(format!("`{n}` is not an address")),
                 },
                 ExprKind::Str(lit) => match other_kind {
-                    Some(Ty::Ipv6) => addr::parse_ipv6(lit).map(|b| Side::Lit(b.to_vec())).ok_or_else(|| format!("{lit:?} is not an ipv6 literal")),
-                    Some(Ty::Mac) => addr::parse_mac(lit).map(|b| Side::Lit(b.to_vec())).ok_or_else(|| format!("{lit:?} is not a mac literal")),
+                    Some(Ty::Ipv6) => {
+                        addr::parse_ipv6(lit).map(|b| Side::Lit(b.to_vec())).ok_or_else(|| format!("{lit:?} is not an ipv6 literal"))
+                    }
+                    Some(Ty::Mac) => {
+                        addr::parse_mac(lit).map(|b| Side::Lit(b.to_vec())).ok_or_else(|| format!("{lit:?} is not a mac literal"))
+                    }
                     _ => Err("address literal needs an address on the other side".into()),
                 },
                 _ => Err("address comparison needs a variable or a literal".into()),
@@ -1728,7 +1726,15 @@ impl Cg<'_> {
         let mut done = 0u32;
         while done < n {
             let left = n - done;
-            let (size, w) = if left >= 8 { (Size::DW, 8) } else if left >= 4 { (Size::W, 4) } else if left >= 2 { (Size::H, 2) } else { (Size::B, 1) };
+            let (size, w) = if left >= 8 {
+                (Size::DW, 8)
+            } else if left >= 4 {
+                (Size::W, 4)
+            } else if left >= 2 {
+                (Size::H, 2)
+            } else {
+                (Size::B, 1)
+            };
             // chunk of A -> R1, chunk of B -> R0
             for (sd, reg) in [(&a, Reg::R1), (&b, Reg::R0)] {
                 match sd {
@@ -1841,10 +1847,7 @@ impl Cg<'_> {
             let t = self.prog.new_label();
             let f = self.prog.new_label();
             let end = self.prog.new_label();
-            let e = Expr {
-                kind: ExprKind::Binary { op, lhs: Box::new(lhs.clone()), rhs: Box::new(rhs.clone()) },
-                span: lhs.span,
-            };
+            let e = Expr { kind: ExprKind::Binary { op, lhs: Box::new(lhs.clone()), rhs: Box::new(rhs.clone()) }, span: lhs.span };
             self.cond(&e, t, f)?;
             self.prog.bind(t);
             self.prog.push(mov64_imm(Reg::R0, 1));
@@ -2249,11 +2252,15 @@ impl Cg<'_> {
                 }
                 Ok(Ty::Uint(bytes))
             }
-            Resolved::Struct { name, .. } if name == "in6_addr" => Err("`in6_addr` is a 16-byte value: bind it with `let` or emit it".into()),
+            Resolved::Struct { name, .. } if name == "in6_addr" => {
+                Err("`in6_addr` is a 16-byte value: bind it with `let` or emit it".into())
+            }
             // an embedded struct: a view at a deeper offset from the same base
             Resolved::Struct { id, .. } if base == Reg::R9 => Ok(Ty::PktDyn(id, off)),
             Resolved::Struct { id, .. } => Ok(Ty::PktPtr(id, off)),
-            Resolved::Array { elem_bytes: 1, len: 6 | 16 } => Err(format!("`{field}` is a byte blob: bind it with `let` or emit it directly")),
+            Resolved::Array { elem_bytes: 1, len: 6 | 16 } => {
+                Err(format!("`{field}` is a byte blob: bind it with `let` or emit it directly"))
+            }
             _ => Err(format!("field `{field}` has a type honey can't read from a packet")),
         }
     }
@@ -2391,7 +2398,9 @@ impl Cg<'_> {
             ExprKind::Field { expr, field } => {
                 let Some((id, base, off)) = self.view_of(expr)? else { return Ok(None) };
                 let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
-                let member = btf.member_of(id, &field.name).ok_or_else(|| format!("struct `{}` has no field `{}`", self.struct_name(id), field.name))?;
+                let member = btf
+                    .member_of(id, &field.name)
+                    .ok_or_else(|| format!("struct `{}` has no field `{}`", self.struct_name(id), field.name))?;
                 Ok(match btf.resolve(member.type_id) {
                     Resolved::Struct { id, .. } => Some((id, base, off + member.offset_bytes as i16)),
                     _ => None,
@@ -2408,7 +2417,8 @@ impl Cg<'_> {
             && let Some((id, base, poff)) = self.view_of(expr)?
         {
             let btf = self.sh.btf.ok_or("packet struct access needs BTF")?;
-            let member = btf.member_of(id, &field.name).ok_or_else(|| format!("struct `{}` has no field `{}`", self.struct_name(id), field.name))?;
+            let member =
+                btf.member_of(id, &field.name).ok_or_else(|| format!("struct `{}` has no field `{}`", self.struct_name(id), field.name))?;
             let off = poff + member.offset_bytes as i16;
             return Ok(match btf.resolve(member.type_id) {
                 Resolved::Array { elem_bytes: 1, len: 6 } => Some((6, base, off)),

@@ -40,9 +40,7 @@ pub fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
         if part.is_empty() {
             return Some(Vec::new());
         }
-        part.split(':')
-            .map(|g| if g.is_empty() || g.len() > 4 { None } else { u16::from_str_radix(g, 16).ok() })
-            .collect()
+        part.split(':').map(|g| if g.is_empty() || g.len() > 4 { None } else { u16::from_str_radix(g, 16).ok() }).collect()
     }
     let all: Vec<u16> = match s.split_once("::") {
         Some((l, r)) => {

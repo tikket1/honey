@@ -141,14 +141,8 @@ impl Btf {
         };
 
         // Type id 0 is the implicit void type.
-        let mut types = vec![BtfType {
-            name: String::new(),
-            kind: 0,
-            size_or_type: 0,
-            int_signed: false,
-            members: Vec::new(),
-            array: None,
-        }];
+        let mut types =
+            vec![BtfType { name: String::new(), kind: 0, size_or_type: 0, int_signed: false, members: Vec::new(), array: None }];
         let mut struct_by_name = HashMap::new();
 
         let mut p = type_start;
@@ -186,13 +180,7 @@ impl Btf {
                         // byte-aligned, so bit offset / 8 is the byte offset.
                         let bit_off = if kind_flag == 1 { moff & 0xffffff } else { moff };
                         let bit_size = if kind_flag == 1 { moff >> 24 } else { 0 };
-                        members.push(Member {
-                            name: name_of(mn),
-                            offset_bytes: bit_off / 8,
-                            type_id: mt,
-                            bit_offset: bit_off,
-                            bit_size,
-                        });
+                        members.push(Member { name: name_of(mn), offset_bytes: bit_off / 8, type_id: mt, bit_offset: bit_off, bit_size });
                     }
                 }
                 ENUM => p += vlen * 8,
@@ -338,11 +326,7 @@ impl Btf {
             ARRAY => {
                 let Some((elem, n)) = t.array else { return Resolved::Other };
                 let Some(et) = self.strip(elem) else { return Resolved::Other };
-                if et.kind == INT {
-                    Resolved::Array { elem_bytes: et.size_or_type, len: n }
-                } else {
-                    Resolved::Other
-                }
+                if et.kind == INT { Resolved::Array { elem_bytes: et.size_or_type, len: n } } else { Resolved::Other }
             }
             STRUCT | UNION => Resolved::Struct { id: tid, name: t.name.clone() },
             PTR => {

@@ -9,7 +9,7 @@ mod common;
 
 use honeyc::parser::parse;
 use honeyc::token::Span;
-use honeyc::typeck::{check, Diag};
+use honeyc::typeck::{Diag, check};
 
 fn diags(src: &str) -> Vec<Diag> {
     let prog = parse(src).unwrap_or_else(|e| panic!("parse failed: {e:?}"));
@@ -29,9 +29,7 @@ fn ok(src: &str) -> u32 {
 
 /// Wrap statements in a minimal program with a map, an event, and a probe.
 fn probe(body: &str) -> String {
-    format!(
-        "map m: hash<u32, u64>[8];\nevent E {{ a: u64, b: bool }}\nprobe tracepoint(\"syscalls\", \"sys_enter_execve\") {{\n{body}\n}}"
-    )
+    format!("map m: hash<u32, u64>[8];\nevent E {{ a: u64, b: bool }}\nprobe tracepoint(\"syscalls\", \"sys_enter_execve\") {{\n{body}\n}}")
 }
 
 fn first_message(src: &str) -> String {
@@ -385,7 +383,9 @@ fn multiple_probes_each_get_their_own_stack_budget() {
 
 #[test]
 fn probes_can_emit_different_events() {
-    ok("event A { x: u64 }\nevent B { y: u32 }\nprobe kprobe(\"f\") { emit A { x: arg(0) }; }\nprobe kretprobe(\"f\") { emit B { y: uid() }; }");
+    ok(
+        "event A { x: u64 }\nevent B { y: u32 }\nprobe kprobe(\"f\") { emit A { x: arg(0) }; }\nprobe kretprobe(\"f\") { emit B { y: uid() }; }",
+    );
 }
 
 // ------------------------------------------------------------- lsm probes
@@ -503,7 +503,9 @@ fn sample_works_in_any_probe_kind() {
 // ---------------------------------------------------------- string equality
 
 fn with_path(body: &str) -> String {
-    format!("event E {{ a: u32, b: bool }}\nprobe tracepoint(\"syscalls\", \"sys_enter_execve\") {{\n    let path: str<32> = read_user_str(arg(0));\n    let other: str<16> = read_user_str(arg(0));\n{body}\n}}")
+    format!(
+        "event E {{ a: u32, b: bool }}\nprobe tracepoint(\"syscalls\", \"sys_enter_execve\") {{\n    let path: str<32> = read_user_str(arg(0));\n    let other: str<16> = read_user_str(arg(0));\n{body}\n}}"
+    )
 }
 
 #[test]
@@ -584,7 +586,8 @@ fn blobs_only_come_from_the_packet_and_cannot_be_compared_or_reassigned() {
     assert!(msg.contains("an `ipv6` value can only come straight from the packet") || msg.contains("expected `ipv6`"), "{msg}");
     // same-kind addresses compare; `<` on them does not
     ok("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.ipv6(22); let b = pkt.ipv6(38); if a == b { emit E { a: 1 }; } }");
-    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.ipv6(22); let b = pkt.ipv6(38); if a < b { emit E { a: 1 }; } }");
+    let msg =
+        first_message("event E { a: u8 } probe xdp(\"lo\") { let a = pkt.ipv6(22); let b = pkt.ipv6(38); if a < b { emit E { a: 1 }; } }");
     assert!(msg.contains("do not support `<`"), "{msg}");
     let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let mut a = pkt.mac(0); a = pkt.mac(6); emit E { a: 1 }; }");
     assert!(msg.contains("is a `mac` buffer and cannot be reassigned"), "{msg}");
@@ -617,7 +620,8 @@ fn address_literals_are_validated_and_kinds_must_match() {
     assert!(msg.contains("is not a valid `ipv6` literal"), "{msg}");
     let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let m = pkt.mac(6); if m == \"::1\" { emit E { a: 1 }; } }");
     assert!(msg.contains("is not a valid `mac` literal"), "{msg}");
-    let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { let s = pkt.ipv6(22); let m = pkt.mac(6); if s == m { emit E { a: 1 }; } }");
+    let msg =
+        first_message("event E { a: u8 } probe xdp(\"lo\") { let s = pkt.ipv6(22); let m = pkt.mac(6); if s == m { emit E { a: 1 }; } }");
     assert!(msg.contains("cannot compare `ipv6` with `mac`"), "{msg}");
     let msg = first_message("event E { a: u8 } probe xdp(\"lo\") { if pkt.u32(26) == \"1.2.3\" { emit E { a: 1 }; } }");
     assert!(msg.contains("is not an IPv4 address literal"), "{msg}");

@@ -240,11 +240,20 @@ fn manifest(c: &Compiled) -> String {
 
     s.push_str("  \"maps\": [\n");
     for (i, m) in c.maps.iter().enumerate() {
-        let kind = match m.kind { MapKind::Hash => "hash", MapKind::Array => "array" };
+        let kind = match m.kind {
+            MapKind::Hash => "hash",
+            MapKind::Array => "array",
+        };
         let comma = if i + 1 < c.maps.len() { "," } else { "" };
         s.push_str(&format!(
             "    {{ \"index\": {}, \"map\": {}, \"kind\": \"{}\", \"key_size\": {}, \"value_size\": {}, \"max_entries\": {} }}{}\n",
-            i + 1, jstr(&m.name), kind, m.key_size, m.value_size, m.max_entries, comma
+            i + 1,
+            jstr(&m.name),
+            kind,
+            m.key_size,
+            m.value_size,
+            m.max_entries,
+            comma
         ));
     }
     s.push_str("  ],\n");
@@ -265,7 +274,12 @@ fn manifest(c: &Compiled) -> String {
             let comma = if i + 1 < ev.fields.len() { "," } else { "" };
             s.push_str(&format!(
                 "      {{ \"name\": {}, \"offset\": {}, \"size\": {}, \"kind\": \"{}\", {} }}{}\n",
-                jstr(&f.name), f.offset, f.size, kind, extra, comma
+                jstr(&f.name),
+                f.offset,
+                f.size,
+                kind,
+                extra,
+                comma
             ));
         }
         let comma = if id + 1 < c.events.len() { "," } else { "" };
@@ -277,10 +291,9 @@ fn manifest(c: &Compiled) -> String {
     let mut offset = 0usize;
     for (i, p) in c.programs.iter().enumerate() {
         let attach = match &p.kind {
-            ProbeKind::Tracepoint { category, name } => format!(
-                "\"type\": \"tracepoint\", \"category\": {}, \"tracepoint\": {}",
-                jstr(category), jstr(name)
-            ),
+            ProbeKind::Tracepoint { category, name } => {
+                format!("\"type\": \"tracepoint\", \"category\": {}, \"tracepoint\": {}", jstr(category), jstr(name))
+            }
             ProbeKind::Kprobe { function } => format!("\"type\": \"kprobe\", \"function\": {}", jstr(function)),
             ProbeKind::Kretprobe { function } => format!("\"type\": \"kretprobe\", \"function\": {}", jstr(function)),
             ProbeKind::Lsm { hook } => format!("\"type\": \"lsm\", \"hook\": {}", jstr(hook)),
@@ -292,13 +305,17 @@ fn manifest(c: &Compiled) -> String {
         let comma = if i + 1 < c.programs.len() { "," } else { "" };
         let mut relocs = String::from("[");
         for (j, r) in p.relocs.iter().enumerate() {
-            if j > 0 { relocs.push_str(", "); }
+            if j > 0 {
+                relocs.push_str(", ");
+            }
             relocs.push_str(&format!("{{ \"slot\": {}, \"struct\": {}, \"field\": {} }}", r.slot, jstr(&r.struct_name), jstr(&r.field)));
         }
         relocs.push(']');
         let mut ifaces = String::from("[");
         for (j, r) in p.ifaces.iter().enumerate() {
-            if j > 0 { ifaces.push_str(", "); }
+            if j > 0 {
+                ifaces.push_str(", ");
+            }
             ifaces.push_str(&format!("{{ \"slot\": {}, \"iface\": {} }}", r.slot, jstr(&r.name)));
         }
         ifaces.push(']');

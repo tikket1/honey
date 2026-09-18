@@ -169,10 +169,7 @@ impl<'a> Lexer<'a> {
         self.bump_while(|c| c == '_' || c.is_digit(radix));
 
         // `_` is only a visual separator; strip it before parsing.
-        let digits: String = self.src[digits_start..self.pos]
-            .chars()
-            .filter(|&c| c != '_')
-            .collect();
+        let digits: String = self.src[digits_start..self.pos].chars().filter(|&c| c != '_').collect();
 
         match u64::from_str_radix(&digits, radix) {
             Ok(value) => {

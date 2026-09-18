@@ -266,11 +266,7 @@ pub fn check_with_btf(program: &Program, btf: Option<&Btf>) -> Result<Checked, V
         dns_named: false,
     };
     let peak = c.program(program);
-    if c.diags.is_empty() {
-        Ok(Checked { stack_bytes: peak })
-    } else {
-        Err(c.diags)
-    }
+    if c.diags.is_empty() { Ok(Checked { stack_bytes: peak }) } else { Err(c.diags) }
 }
 
 impl Checker<'_> {
@@ -341,11 +337,7 @@ impl Checker<'_> {
                 Item::Probe(_) => {}
             }
         }
-        let probes: Vec<&ProbeDecl> = p
-            .items
-            .iter()
-            .filter_map(|i| if let Item::Probe(p) = i { Some(p) } else { None })
-            .collect();
+        let probes: Vec<&ProbeDecl> = p.items.iter().filter_map(|i| if let Item::Probe(p) = i { Some(p) } else { None }).collect();
         if probes.is_empty() {
             self.error(Span::new(0, 0), "program has no `probe`");
         }
@@ -407,11 +399,7 @@ impl Checker<'_> {
                 Err(e) => return self.error(v.span, e),
             },
             (kind, _) => {
-                return self.error_help(
-                    m.kind.span,
-                    format!("unknown map kind `{kind}`"),
-                    "use `hash<K, V>` or `array<V>`",
-                );
+                return self.error_help(m.kind.span, format!("unknown map kind `{kind}`"), "use `hash<K, V>` or `array<V>`");
             }
         };
         if m.capacity == 0 {
@@ -517,10 +505,7 @@ impl Checker<'_> {
         if self.stack_peak > budget {
             self.error_help(
                 p.body.span,
-                format!(
-                    "probe needs {} bytes of stack for its locals; the BPF limit leaves {budget}",
-                    self.stack_peak
-                ),
+                format!("probe needs {} bytes of stack for its locals; the BPF limit leaves {budget}", self.stack_peak),
                 "shrink a `str<N>` buffer or narrow a scope",
             );
         }
@@ -799,7 +784,11 @@ impl Checker<'_> {
             self.error_help(value.span, "strings can only come from `read_user_str`", "declare `let s: str<N> = read_user_str(ptr);`");
         }
         if matches!(ty, Ty::Ipv6 | Ty::Mac) && !is_pkt_call(value) && !matches!(value.kind, ExprKind::Field { .. }) {
-            self.error_help(value.span, format!("an `{ty}` value can only come straight from the packet"), format!("write `let x: {ty} = pkt.{ty}(offset);`"));
+            self.error_help(
+                value.span,
+                format!("an `{ty}` value can only come straight from the packet"),
+                format!("write `let x: {ty} = pkt.{ty}(offset);`"),
+            );
         }
         self.declare(&name.name, ty, mutable, None);
     }
@@ -873,11 +862,18 @@ impl Checker<'_> {
                         _ => self.error_help(
                             value.span,
                             format!("a `{ft}` can only be written from the packet, a `{ft}` local, or a literal"),
-                            format!("e.g. `eth.h_dest = eth.h_source;` or `eth.h_dest = \"{}\";`", if ft == Ty::Mac { "aa:bb:cc:dd:ee:ff" } else { "fe80::1" }),
+                            format!(
+                                "e.g. `eth.h_dest = eth.h_source;` or `eth.h_dest = \"{}\";`",
+                                if ft == Ty::Mac { "aa:bb:cc:dd:ee:ff" } else { "fe80::1" }
+                            ),
                         ),
                     },
                     Ty::PktPtr(..) => {
-                        self.error_help(target.span, format!("cannot assign the embedded struct `{}`", field.name), "write its fields one by one");
+                        self.error_help(
+                            target.span,
+                            format!("cannot assign the embedded struct `{}`", field.name),
+                            "write its fields one by one",
+                        );
                         self.expr(value);
                     }
                     Ty::Unit => {
@@ -912,10 +908,7 @@ impl Checker<'_> {
         }
         self.push_scope();
         // The loop variable is a constant inside the body: no size on stack.
-        self.scopes.last_mut().unwrap().vars.insert(
-            var.name.clone(),
-            Var { ty: Ty::U64, mutable: false, konst: Some(lo) },
-        );
+        self.scopes.last_mut().unwrap().vars.insert(var.name.clone(), Var { ty: Ty::U64, mutable: false, konst: Some(lo) });
         self.block(body);
         self.pop_scope();
     }
@@ -951,11 +944,7 @@ impl Checker<'_> {
         }
         for (n, _) in &declared {
             if !seen.contains(&n.as_str()) {
-                self.error_help(
-                    span,
-                    format!("`emit {}` is missing field `{n}`", event.name),
-                    "every field of the event must be set",
-                );
+                self.error_help(span, format!("`emit {}` is missing field `{n}`", event.name), "every field of the event must be set");
             }
         }
     }
@@ -984,11 +973,7 @@ impl Checker<'_> {
             } else {
                 None
             };
-            self.diags.push(Diag {
-                message: format!("mismatched types: expected `{expected}`, found `{actual}`"),
-                span,
-                help,
-            });
+            self.diags.push(Diag { message: format!("mismatched types: expected `{expected}`, found `{actual}`"), span, help });
         }
     }
 
@@ -1050,7 +1035,10 @@ impl Checker<'_> {
             // A char array (task_struct.comm): its address, readable with read_kernel_str.
             Resolved::Array { elem_bytes: 1, .. } => Ty::KCharPtr,
             Resolved::Array { .. } => {
-                self.error(field.span, format!("field `{}` is an array honey can't read as a value; only byte arrays are supported", field.name));
+                self.error(
+                    field.span,
+                    format!("field `{}` is an array honey can't read as a value; only byte arrays are supported", field.name),
+                );
                 Ty::Unit
             }
             Resolved::Struct { id, name } => Ty::KPtr(id, Self::embedded_name(struct_name, &name, &field.name)),
@@ -1113,7 +1101,11 @@ impl Checker<'_> {
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Bool(_) => Ty::Bool,
             ExprKind::Str(_) => {
-                self.error_help(e.span, "string literals can only be used as `starts_with` arguments in v1", "there is no string type you can hold in a variable except `str<N>` from `read_user_str`");
+                self.error_help(
+                    e.span,
+                    "string literals can only be used as `starts_with` arguments in v1",
+                    "there is no string type you can hold in a variable except `str<N>` from `read_user_str`",
+                );
                 Ty::Unit
             }
             ExprKind::Ident(name) => {
@@ -1172,7 +1164,11 @@ impl Checker<'_> {
             ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, e.span),
             ExprKind::Cast { expr, ty } => {
                 self.expr(expr);
-                self.error_help(e.span, "`as` casts are not supported in v1", format!("declare the value with the width you need, e.g. `let x: {} = ...`", crate::pretty::ty(ty)));
+                self.error_help(
+                    e.span,
+                    "`as` casts are not supported in v1",
+                    format!("declare the value with the width you need, e.g. `let x: {} = ...`", crate::pretty::ty(ty)),
+                );
                 Ty::from_ast(ty).unwrap_or(Ty::Unit)
             }
             ExprKind::Call { callee, args } => self.call(callee, args, e.span),
@@ -1220,7 +1216,11 @@ impl Checker<'_> {
         let (ls, rs) = (self.str_side(lhs), self.str_side(rhs));
         if ls != StrSide::No || rs != StrSide::No {
             if !matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
-                self.error_help(span, format!("strings and addresses do not support `{}`", op.symbol()), "they can only be compared with `==` and `!=`");
+                self.error_help(
+                    span,
+                    format!("strings and addresses do not support `{}`", op.symbol()),
+                    "they can only be compared with `==` and `!=`",
+                );
                 return Ty::Bool;
             }
             let lhs_plain = ls == StrSide::No;
@@ -1275,9 +1275,17 @@ impl Checker<'_> {
                     let is_u32 = other == Ty::U32 || other == Ty::Int;
                     if other != Ty::Unit && !(is_u32 && addr::parse_ipv4(&lit).is_some()) {
                         if is_u32 {
-                            self.error_help(span, format!("{lit:?} is not an IPv4 address literal"), "compare a `u32` address with a dotted quad like \"10.0.0.1\"");
+                            self.error_help(
+                                span,
+                                format!("{lit:?} is not an IPv4 address literal"),
+                                "compare a `u32` address with a dotted quad like \"10.0.0.1\"",
+                            );
                         } else {
-                            self.error_help(span, format!("cannot compare a string literal with `{other}`"), "only a `str<N>`, `ipv6`, `mac`, or `u32` address can be compared with a literal");
+                            self.error_help(
+                                span,
+                                format!("cannot compare a string literal with `{other}`"),
+                                "only a `str<N>`, `ipv6`, `mac`, or `u32` address can be compared with a literal",
+                            );
                         }
                     }
                 }
@@ -1294,7 +1302,14 @@ impl Checker<'_> {
         }
         // Errors in operands already reported; don't cascade.
         if l == Ty::Unit || r == Ty::Unit {
-            return if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge) { Ty::Bool } else { Ty::Unit };
+            return if matches!(
+                op,
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+            ) {
+                Ty::Bool
+            } else {
+                Ty::Unit
+            };
         }
         match op {
             BinaryOp::And | BinaryOp::Or => {
@@ -1327,7 +1342,11 @@ impl Checker<'_> {
                     (Ty::Int, t) | (t, Ty::Int) => t.clone(),
                     (a, b) if a == b => a.clone(),
                     (a, b) => {
-                        self.error_help(span, format!("mismatched integer widths: `{a}` {} `{b}`", op.symbol()), "honey has no implicit conversions; give both sides the same declared type");
+                        self.error_help(
+                            span,
+                            format!("mismatched integer widths: `{a}` {} `{b}`", op.symbol()),
+                            "honey has no implicit conversions; give both sides the same declared type",
+                        );
                         a.clone()
                     }
                 }
@@ -1357,7 +1376,11 @@ impl Checker<'_> {
             ("pid" | "tgid" | "tid" | "uid" | "gid", []) => Ty::U32,
             ("ktime", []) => Ty::U64,
             ("comm", []) => {
-                self.error_help(span, "`comm()` can only be used directly as an `emit` field value", "e.g. `emit Exec { comm: comm() }` with `comm: str<16>` in the event");
+                self.error_help(
+                    span,
+                    "`comm()` can only be used directly as an `emit` field value",
+                    "e.g. `emit Exec { comm: comm() }` with `comm: str<16>` in the event",
+                );
                 Ty::Str(16)
             }
             ("arg", [idx]) => {
@@ -1435,20 +1458,30 @@ impl Checker<'_> {
                     _ => {}
                 }
                 match self.const_eval(ms) {
-                    Some(v) if !(1..=86_400_000).contains(&v) => self.error(ms.span, "`rate_limit`: the window is in milliseconds, 1..=86400000"),
+                    Some(v) if !(1..=86_400_000).contains(&v) => {
+                        self.error(ms.span, "`rate_limit`: the window is in milliseconds, 1..=86400000")
+                    }
                     _ => {}
                 }
                 Ty::Bool
             }
             ("rate_limit", _) => {
-                self.error_help(span, "`rate_limit` takes `(N, window_ms)` or `(key, N, window_ms)`", "e.g. `rate_limit(ip.saddr, 20, 1000)`: true while that source has sent at most 20 in the current second");
+                self.error_help(
+                    span,
+                    "`rate_limit` takes `(N, window_ms)` or `(key, N, window_ms)`",
+                    "e.g. `rate_limit(ip.saddr, 20, 1000)`: true while that source has sent at most 20 in the current second",
+                );
                 for a in args {
                     self.expr(a);
                 }
                 Ty::Unit
             }
             ("read_user_str" | "read_kernel_str", _) => {
-                self.error_help(span, format!("`{name}` must initialise a bounded string"), format!("write `let s: str<N> = {name}(ptr);`"));
+                self.error_help(
+                    span,
+                    format!("`{name}` must initialise a bounded string"),
+                    format!("write `let s: str<N> = {name}(ptr);`"),
+                );
                 Ty::Unit
             }
             ("csum_update", [c, old, new]) => {
@@ -1471,12 +1504,20 @@ impl Checker<'_> {
             }
             ("redirect", [iface]) => {
                 if self.probe_kind != Some(ProbeKind::Xdp) {
-                    self.error_help(span, "`redirect()` is only available in an `xdp` probe", "only an XDP program holds a packet to send elsewhere");
+                    self.error_help(
+                        span,
+                        "`redirect()` is only available in an `xdp` probe",
+                        "only an XDP program holds a packet to send elsewhere",
+                    );
                 }
                 match &iface.kind {
                     ExprKind::Str(n) if !n.is_empty() && n.len() < 16 => {}
                     ExprKind::Str(_) => self.error(iface.span, "an interface name is 1..15 characters"),
-                    _ => self.error_help(iface.span, "`redirect` takes an interface name literal", "e.g. `redirect(\"eth1\")`; the loader resolves it to an ifindex"),
+                    _ => self.error_help(
+                        iface.span,
+                        "`redirect` takes an interface name literal",
+                        "e.g. `redirect(\"eth1\")`; the loader resolves it to an ifindex",
+                    ),
                 }
                 Ty::Unit
             }
@@ -1547,14 +1588,20 @@ impl Checker<'_> {
             return match (method.name.as_str(), args) {
                 ("len", []) => Ty::U32,
                 ("at" | "view" | "l4", _) => {
-                    self.error_help(span, format!("`pkt.{}` needs a struct type", method.name), "bind it: `let ip: ptr<iphdr> = pkt.at(14);` then read `ip.saddr`");
+                    self.error_help(
+                        span,
+                        format!("`pkt.{}` needs a struct type", method.name),
+                        "bind it: `let ip: ptr<iphdr> = pkt.at(14);` then read `ip.saddr`",
+                    );
                     Ty::Unit
                 }
                 ("ipv6_l4", [off]) => {
                     // walks the extension-header chain from the IPv6 header at `off`
                     match self.const_eval_global(off) {
                         Some(o) if o < 0 => self.error(off.span, "packet offset must not be negative"),
-                        Some(o) if o as u32 + 40 > MAX_PKT_BOUND => self.error(off.span, "the IPv6 header must lie within the first 256 bytes"),
+                        Some(o) if o as u32 + 40 > MAX_PKT_BOUND => {
+                            self.error(off.span, "the IPv6 header must lie within the first 256 bytes")
+                        }
                         _ => {}
                     }
                     self.l4_ready = true;
@@ -1649,7 +1696,9 @@ impl Checker<'_> {
                     };
                     match self.const_eval(off) {
                         Some(o) if o < 0 => self.error(off.span, "payload offset must not be negative"),
-                        Some(o) if o as u32 + width > MAX_PKT_BOUND => self.error(off.span, format!("payload read at offset {o} ends past {MAX_PKT_BOUND} bytes")),
+                        Some(o) if o as u32 + width > MAX_PKT_BOUND => {
+                            self.error(off.span, format!("payload read at offset {o} ends past {MAX_PKT_BOUND} bytes"))
+                        }
                         _ => {}
                     }
                     match width {
@@ -1665,7 +1714,9 @@ impl Checker<'_> {
                 ("starts_with", [arg]) => {
                     match &arg.kind {
                         ExprKind::Str(lit) if lit.is_empty() => self.error(arg.span, "an empty prefix matches everything"),
-                        ExprKind::Str(lit) if lit.len() as u32 > MAX_PKT_BOUND => self.error(arg.span, format!("prefix longer than {MAX_PKT_BOUND} bytes")),
+                        ExprKind::Str(lit) if lit.len() as u32 > MAX_PKT_BOUND => {
+                            self.error(arg.span, format!("prefix longer than {MAX_PKT_BOUND} bytes"))
+                        }
                         ExprKind::Str(_) => {}
                         _ => self.error(arg.span, "`starts_with` takes a string literal"),
                     }
@@ -1689,14 +1740,20 @@ impl Checker<'_> {
                         }
                     };
                     match self.const_eval(window) {
-                        Some(w) if w < 1 || w > MAX_PKT_BOUND as i64 => self.error(window.span, format!("the search window must be 1..={MAX_PKT_BOUND} bytes")),
+                        Some(w) if w < 1 || w > MAX_PKT_BOUND as i64 => {
+                            self.error(window.span, format!("the search window must be 1..={MAX_PKT_BOUND} bytes"))
+                        }
                         Some(w) if n > w => self.error(window.span, format!("the needle is {n} bytes but the window only {w}")),
                         _ => {}
                     }
                     Ty::Bool
                 }
                 ("contains", _) => {
-                    self.error_help(span, "`contains` takes a literal and a window", "`body.contains(\"Failed password\", 96)` searches the first 96 bytes; the window is the bound the verifier needs");
+                    self.error_help(
+                        span,
+                        "`contains` takes a literal and a window",
+                        "`body.contains(\"Failed password\", 96)` searches the first 96 bytes; the window is the bound the verifier needs",
+                    );
                     Ty::Unit
                 }
                 ("str", _) => {
@@ -1747,7 +1804,11 @@ impl Checker<'_> {
                     Ty::OptionVal(Box::new(Ty::U32))
                 }
                 ("opt", _) => {
-                    self.error_help(span, "`.opt(kind)` takes one constant option kind", "e.g. `tcp.opt(2)` for MSS, `tcp.opt(3)` for window scale");
+                    self.error_help(
+                        span,
+                        "`.opt(kind)` takes one constant option kind",
+                        "e.g. `tcp.opt(2)` for MSS, `tcp.opt(3)` for window scale",
+                    );
                     Ty::Unit
                 }
                 ("fix_csum", []) => {
@@ -1794,7 +1855,11 @@ impl Checker<'_> {
                 ("byte_at", [arg]) => {
                     match self.const_eval(arg) {
                         Some(i) if i >= 0 && (i as u32) < cap => {}
-                        Some(i) => self.error_help(arg.span, format!("`byte_at({i})` is outside `str<{cap}>`"), "the index must be a constant below the string's capacity so the read is bounded"),
+                        Some(i) => self.error_help(
+                            arg.span,
+                            format!("`byte_at({i})` is outside `str<{cap}>`"),
+                            "the index must be a constant below the string's capacity so the read is bounded",
+                        ),
                         None => {}
                     }
                     Ty::U8
@@ -1838,7 +1903,10 @@ impl Checker<'_> {
                 Ty::Unit
             }
             (m, a) => {
-                self.error(method.span, format!("map has no method `{m}` with {} argument(s); use `get(k)`, `insert(k, v)`, `delete(k)`", a.len()));
+                self.error(
+                    method.span,
+                    format!("map has no method `{m}` with {} argument(s); use `get(k)`, `insert(k, v)`, `delete(k)`", a.len()),
+                );
                 for x in a {
                     self.expr(x);
                 }

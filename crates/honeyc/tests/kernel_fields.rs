@@ -6,9 +6,9 @@
 mod common;
 
 use common::kernel_btf;
-use honeyc::codegen::{compile_with_btf, Arch};
+use honeyc::codegen::{Arch, compile_with_btf};
 use honeyc::parser::parse;
-use honeyc::typeck::{check_with_btf, Diag};
+use honeyc::typeck::{Diag, check_with_btf};
 
 fn prog(body: &str) -> String {
     format!("event E {{ a: u32, path: str<32> }}\nprobe kprobe(\"vfs_open\") {{\n{body}\n}}")
@@ -49,7 +49,8 @@ fn scalar_field_has_the_btf_width() {
     // f_flags is u32 in the synthetic BTF; storing it in a u32 is fine.
     check_ok("event E { flags: u32 }\nprobe kprobe(\"vfs_open\") {\n    let f: ptr<file> = arg(1);\n    emit E { flags: f.f_flags };\n}");
     // ... but not in a u16 (no implicit narrowing).
-    let msg = first("event E { flags: u16 }\nprobe kprobe(\"vfs_open\") {\n    let f: ptr<file> = arg(1);\n    emit E { flags: f.f_flags };\n}");
+    let msg =
+        first("event E { flags: u16 }\nprobe kprobe(\"vfs_open\") {\n    let f: ptr<file> = arg(1);\n    emit E { flags: f.f_flags };\n}");
     assert!(msg.contains("expected `u16`, found `u32`"), "{msg}");
 }
 
@@ -69,7 +70,9 @@ fn unknown_struct_is_rejected() {
 
 #[test]
 fn unknown_field_is_rejected() {
-    let msg = first("event E { a: u32 }\nprobe kprobe(\"vfs_open\") {\n    let p: ptr<path> = arg(0);\n    let d: ptr<dentry> = p.nosuch;\n    emit E { a: 1 };\n}");
+    let msg = first(
+        "event E { a: u32 }\nprobe kprobe(\"vfs_open\") {\n    let p: ptr<path> = arg(0);\n    let d: ptr<dentry> = p.nosuch;\n    emit E { a: 1 };\n}",
+    );
     assert!(msg.contains("has no field `nosuch`"), "{msg}");
 }
 
@@ -81,7 +84,9 @@ fn a_field_on_a_non_pointer_is_rejected() {
 
 #[test]
 fn read_kernel_str_needs_a_bounded_destination() {
-    let msg = first("event E { a: u32 }\nprobe kprobe(\"vfs_open\") {\n    let p: ptr<path> = arg(0);\n    let s = read_kernel_str(p.dentry.d_name.name);\n    emit E { a: 1 };\n}");
+    let msg = first(
+        "event E { a: u32 }\nprobe kprobe(\"vfs_open\") {\n    let p: ptr<path> = arg(0);\n    let s = read_kernel_str(p.dentry.d_name.name);\n    emit E { a: 1 };\n}",
+    );
     assert!(msg.contains("needs a bounded destination"), "{msg}");
 }
 
@@ -152,7 +157,8 @@ fn reloc_slots_point_at_add_instructions_with_the_compile_time_offset() {
 #[test]
 fn anonymous_members_are_reached_by_type_id() {
     // packet view: un (anonymous union) . echo (anonymous struct) . sequence
-    let text = asm_xdp("    let icmp: ptr<icmphdr> = pkt.at(34);\n    emit E { a: icmp.un.echo.sequence, m: pkt.mac(0), b: icmp.type == 8 };");
+    let text =
+        asm_xdp("    let icmp: ptr<icmphdr> = pkt.at(34);\n    emit E { a: icmp.un.echo.sequence, m: pkt.mac(0), b: icmp.type == 8 };");
     assert!(text.contains("ldx16 r0, [r7 +40]"), "{text}");
     assert!(text.contains("ldx8 r0, [r7 +34]"), "{text}");
     // kernel pointer: one reloc naming the whole path, imm = 4 + 0 + 2
@@ -191,7 +197,9 @@ fn xdp(body: &str) -> String {
 
 #[test]
 fn packet_views_type_fields_from_btf() {
-    check_ok(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: ip.saddr, m: eth.h_source, b: ip.protocol == 1 };"));
+    check_ok(&xdp(
+        "    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: ip.saddr, m: eth.h_source, b: ip.protocol == 1 };",
+    ));
     // h_proto is a __be16 -> u16, not u32
     let msg = first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    emit E { a: eth.h_proto, m: eth.h_dest, b: true };"));
     assert!(msg.contains("expected `u32`, found `u16`"), "{msg}");
@@ -213,7 +221,8 @@ fn saddr_is_found_through_the_anonymous_union() {
 fn pointers_and_unbound_views_are_errors() {
     let msg = first(&xdp("    let x = pkt.at(14);\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
     assert!(msg.contains("`pkt.at` needs a struct type"), "{msg}");
-    let msg = first(&xdp("    let f: ptr<file> = pkt.at(0);\n    emit E { a: 1, m: pkt.mac(0), b: f.f_path.dentry.d_name.name == \"x\" };"));
+    let msg =
+        first(&xdp("    let f: ptr<file> = pkt.at(0);\n    emit E { a: 1, m: pkt.mac(0), b: f.f_path.dentry.d_name.name == \"x\" };"));
     assert!(msg.contains("is a pointer; packet structs are read by value") || msg.contains("cannot compare"), "{msg}");
     // a view past the bound
     let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(240);\n    emit E { a: ip.saddr, m: pkt.mac(0), b: true };"));
@@ -229,7 +238,9 @@ fn asm_xdp(body: &str) -> String {
 
 #[test]
 fn view_fields_are_plain_loads_swapped_when_big_endian() {
-    let text = asm_xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: ip.saddr, m: eth.h_source, b: eth.h_proto == 0x0800 };");
+    let text = asm_xdp(
+        "    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    emit E { a: ip.saddr, m: eth.h_source, b: eth.h_proto == 0x0800 };",
+    );
     // saddr: 14 + 12 = 26, a 32-bit load then bswap32
     assert!(text.contains("ldx32 r0, [r7 +26]"), "{text}");
     assert!(text.contains("bswap32 r0"), "{text}");
@@ -363,7 +374,9 @@ fn ipv6_walk_then_l4_view() {
 
 #[test]
 fn packet_writes_store_through_the_view() {
-    let text = asm_xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ttl = 7;\n    ip.saddr = 1;\n    eth.h_dest = eth.h_source;\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    let text = asm_xdp(
+        "    let eth: ptr<ethhdr> = pkt.at(0);\n    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ttl = 7;\n    ip.saddr = 1;\n    eth.h_dest = eth.h_source;\n    emit E { a: 1, m: pkt.mac(0), b: true };",
+    );
     // ttl: a plain byte store at 14 + 8
     assert!(text.contains("stx8 [r7 +22], r0"), "{text}");
     // saddr is __be32: swapped back to network order, then stored at 14 + 12
@@ -377,7 +390,9 @@ fn packet_writes_store_through_the_view() {
 
 #[test]
 fn a_mac_literal_is_stored_as_immediates() {
-    let text = asm_xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = \"01:02:03:04:05:06\";\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    let text = asm_xdp(
+        "    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = \"01:02:03:04:05:06\";\n    emit E { a: 1, m: pkt.mac(0), b: true };",
+    );
     // 04030201 little-endian = 0x04030201 = 67305985, then 0x0605 = 1541
     assert!(text.contains("67305985") && text.contains("stx32 [r7 +0], r0"), "{text}");
     assert!(text.contains("1541") && text.contains("stx16 [r7 +4], r0"), "{text}");
@@ -386,7 +401,9 @@ fn a_mac_literal_is_stored_as_immediates() {
 #[test]
 fn packet_write_type_rules() {
     // scalar width must match the field
-    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let x: u16 = 1;\n    ip.ttl = x;\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    let msg = first(&xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    let x: u16 = 1;\n    ip.ttl = x;\n    emit E { a: 1, m: pkt.mac(0), b: true };",
+    ));
     assert!(msg.contains("expected `u8`, found `u16`"), "{msg}");
     // bitfields are read-only
     let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ihl = 5;\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
@@ -394,7 +411,8 @@ fn packet_write_type_rules() {
     // blobs come from the packet, a blob local, or a literal
     let msg = first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = 1;\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
     assert!(msg.contains("a `mac` can only be written from the packet"), "{msg}");
-    let msg = first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = \"not a mac\";\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    let msg =
+        first(&xdp("    let eth: ptr<ethhdr> = pkt.at(0);\n    eth.h_dest = \"not a mac\";\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
     assert!(msg.contains("is not a `mac` literal"), "{msg}");
     // only packet views are writable
     let msg = first("event E { a: u32 } probe kprobe(\"vfs_open\") { let f: ptr<file> = arg(1); f.f_flags = 1; emit E { a: 1 }; }");
@@ -414,7 +432,9 @@ fn tx_is_an_xdp_verdict() {
 
 #[test]
 fn embedded_structs_in_a_runtime_view_stay_relative_to_r9() {
-    let text = asm_xdp("    let f: ptr<frame> = pkt.view(0);\n    f.ip.ttl = 1;\n    emit E { a: f.ip.saddr, m: f.eth.h_source, b: f.eth.h_proto == 0x0800 };");
+    let text = asm_xdp(
+        "    let f: ptr<frame> = pkt.view(0);\n    f.ip.ttl = 1;\n    emit E { a: f.ip.saddr, m: f.eth.h_source, b: f.eth.h_proto == 0x0800 };",
+    );
     assert!(text.contains("stx8 [r9 +22], r0"), "{text}");
     assert!(text.contains("ldx32 r0, [r9 +26]"), "{text}");
     assert!(text.contains("ldx16 r0, [r9 +12]"), "{text}");
@@ -427,7 +447,8 @@ fn embedded_structs_in_a_runtime_view_stay_relative_to_r9() {
 
 #[test]
 fn fix_csum_zeroes_sums_and_stores_the_check_field() {
-    let text = asm_xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ttl = 7;\n    ip.fix_csum();\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    let text =
+        asm_xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.ttl = 7;\n    ip.fix_csum();\n    emit E { a: 1, m: pkt.mac(0), b: true };");
     // r3 = r7 + 14; check (offset 10) is zeroed, then written from the folded sum
     assert!(text.contains("add r3, 14"), "{text}");
     assert!(text.contains("stx16 [r3 +10], r0") && text.contains("stx16 [r3 +10], r1"), "{text}");
@@ -440,13 +461,21 @@ fn fix_csum_zeroes_sums_and_stores_the_check_field() {
 
 #[test]
 fn csum_update_is_a_u16_from_three_integers() {
-    check_ok(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 0x4000, 0x0700);\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
-    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 1);\n    emit E { a: 1, m: pkt.mac(0), b: true };"));
+    check_ok(&xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 0x4000, 0x0700);\n    emit E { a: 1, m: pkt.mac(0), b: true };",
+    ));
+    let msg = first(&xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 1);\n    emit E { a: 1, m: pkt.mac(0), b: true };",
+    ));
     assert!(msg.contains("takes three arguments"), "{msg}");
-    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let a: u32 = csum_update(ip.check, 1, 2);\n    emit E { a: a, m: pkt.mac(0), b: true };"));
+    let msg = first(&xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    let a: u32 = csum_update(ip.check, 1, 2);\n    emit E { a: a, m: pkt.mac(0), b: true };",
+    ));
     assert!(msg.contains("expected `u32`, found `u16`"), "{msg}");
     // the check field is __sum16: read and written swapped, like __be16
-    let text = asm_xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 1, 2);\n    emit E { a: 1, m: pkt.mac(0), b: true };");
+    let text = asm_xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    ip.check = csum_update(ip.check, 1, 2);\n    emit E { a: 1, m: pkt.mac(0), b: true };",
+    );
     assert!(text.contains("ldx16 r0, [r7 +24]"), "{text}");
     assert!(text.contains("stx16 [r7 +24], r0"), "{text}");
     assert_eq!(text.matches("bswap16 r0").count(), 2, "{text}");
@@ -456,23 +485,32 @@ fn csum_update_is_a_u16_from_three_integers() {
 
 #[test]
 fn tcp_opt_is_an_option_value_bound_by_if_let() {
-    check_ok(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: mss, m: pkt.mac(0), b: true };\n    }"));
+    check_ok(&xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    let tcp: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: mss, m: pkt.mac(0), b: true };\n    }",
+    ));
     // the binding is a value, not a pointer
-    let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: *mss, m: pkt.mac(0), b: true };\n    }"));
+    let msg = first(&xdp(
+        "    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: *mss, m: pkt.mac(0), b: true };\n    }",
+    ));
     assert!(msg.contains("cannot dereference `u32`"), "{msg}");
     // it can't be used unchecked
     let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    emit E { a: tcp.opt(2), m: pkt.mac(0), b: true };"));
     assert!(msg.contains("expected `u32`, found `Option<u32>`"), "{msg}");
     // only on a tcphdr view, with a one-byte kind
-    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    if let Some(v) = ip.opt(2) { emit E { a: v, m: pkt.mac(0), b: true }; }"));
+    let msg =
+        first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    if let Some(v) = ip.opt(2) { emit E { a: v, m: pkt.mac(0), b: true }; }"));
     assert!(msg.contains("`ip` is a `ptr<iphdr>`"), "{msg}");
-    let msg = first(&xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(v) = tcp.opt(256) { emit E { a: v, m: pkt.mac(0), b: true }; }"));
+    let msg = first(&xdp(
+        "    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(v) = tcp.opt(256) { emit E { a: v, m: pkt.mac(0), b: true }; }",
+    ));
     assert!(msg.contains("one byte (0..=255)"), "{msg}");
 }
 
 #[test]
 fn tcp_opt_walks_ten_bounded_hops() {
-    let text = asm_xdp("    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: mss, m: pkt.mac(0), b: true };\n    }");
+    let text = asm_xdp(
+        "    let tcp: ptr<tcphdr> = pkt.at(34);\n    if let Some(mss) = tcp.opt(2) {\n        emit E { a: mss, m: pkt.mac(0), b: true };\n    }",
+    );
     // doff: the byte at 34 + 12, shifted by 4 and masked to 4 bits, times 4
     assert!(text.contains("ldx8 r0, [r7 +46]") && text.contains("rsh r0, 4") && text.contains("and r0, 15"), "{text}");
     assert!(text.contains("lsh r2, 2"), "{text}");
@@ -492,12 +530,16 @@ const HTTP: &str = "    let ip: ptr<iphdr> = pkt.at(14);\n    let tcp: ptr<tcphd
 
 #[test]
 fn payload_view_types_its_methods() {
-    check_ok(&xdp(&format!("{HTTP}    let line: str<16> = body.str();\n    emit E {{ a: body.len() + body.u32(4), m: pkt.mac(0), b: body.starts_with(\"GET \") && body.u8(0) == 71 }};")));
+    check_ok(&xdp(&format!(
+        "{HTTP}    let line: str<16> = body.str();\n    emit E {{ a: body.len() + body.u32(4), m: pkt.mac(0), b: body.starts_with(\"GET \") && body.u8(0) == 71 }};"
+    )));
     let msg = first(&xdp(&format!("{HTTP}    let line = body.str();\n    emit E {{ a: 1, m: pkt.mac(0), b: true }};")));
     assert!(msg.contains("`.str()` needs a bounded destination"), "{msg}");
     let msg = first(&xdp(&format!("{HTTP}    emit E {{ a: body.u32(254), m: pkt.mac(0), b: true }};")));
     assert!(msg.contains("ends past 256 bytes"), "{msg}");
-    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let body = ip.payload();\n    emit E { a: body.len(), m: pkt.mac(0), b: true };"));
+    let msg = first(&xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    let body = ip.payload();\n    emit E { a: body.len(), m: pkt.mac(0), b: true };",
+    ));
     assert!(msg.contains("`ip` is a `ptr<iphdr>`"), "{msg}");
     let msg = first(&xdp(&format!("{HTTP}    emit E {{ a: 1, m: pkt.mac(0), b: body.starts_with(\"\") }};")));
     assert!(msg.contains("empty prefix"), "{msg}");
@@ -509,7 +551,9 @@ fn taking_the_payload_consumes_the_transport_view() {
     let msg = first(&xdp(&format!("{HTTP}    emit E {{ a: tcp.dest, m: pkt.mac(0), b: true }};")));
     assert!(msg.contains("`tcp` is no longer a valid view: `body` took the packet pointer"), "{msg}");
     // the same rule for two runtime views
-    let msg = first(&xdp("    let ip: ptr<iphdr> = pkt.at(14);\n    let a: ptr<tcphdr> = pkt.view(34);\n    let b: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    emit E { a: a.dest, m: pkt.mac(0), b: true };"));
+    let msg = first(&xdp(
+        "    let ip: ptr<iphdr> = pkt.at(14);\n    let a: ptr<tcphdr> = pkt.view(34);\n    let b: ptr<tcphdr> = pkt.view(14 + ip.ihl * 4);\n    emit E { a: a.dest, m: pkt.mac(0), b: true };",
+    ));
     assert!(msg.contains("`a` is no longer a valid view: `b` took the packet pointer"), "{msg}");
     // static views are unaffected
     check_ok(&xdp(&format!("{HTTP}    emit E {{ a: ip.saddr, m: pkt.mac(0), b: sport == 80 }};")));
@@ -517,7 +561,9 @@ fn taking_the_payload_consumes_the_transport_view() {
 
 #[test]
 fn payload_reads_are_checked_against_data_end() {
-    let text = asm_xdp(&format!("{HTTP}    let line: str<8> = body.str();\n    emit E {{ a: body.u16(2), m: pkt.mac(0), b: body.starts_with(\"GET\") }};"));
+    let text = asm_xdp(&format!(
+        "{HTTP}    let line: str<8> = body.str();\n    emit E {{ a: body.u16(2), m: pkt.mac(0), b: body.starts_with(\"GET\") }};"
+    ));
     // r9 = tcp + doff*4
     assert!(text.contains("lsh r0, 2") && text.contains("mov r9, r1"), "{text}");
     // entry bound + the tcp view's sizeof check, then str<8>: 7 guarded byte
@@ -574,7 +620,9 @@ const DNS: &str = "    let udp: ptr<udphdr> = pkt.at(34);\n    let body = udp.pa
 
 #[test]
 fn dns_view_types_its_methods_and_orders_name_before_qtype() {
-    check_ok(&xdp(&format!("{DNS}    let q: str<32> = dns.name();\n    let sum: u16 = dns.id() + dns.flags() + dns.qdcount() + dns.qtype() + dns.qclass();\n    emit E {{ a: 1, m: pkt.mac(0), b: dns.is_response() && dns.rcode() == 0 && sum == 0 }};")));
+    check_ok(&xdp(&format!(
+        "{DNS}    let q: str<32> = dns.name();\n    let sum: u16 = dns.id() + dns.flags() + dns.qdcount() + dns.qtype() + dns.qclass();\n    emit E {{ a: 1, m: pkt.mac(0), b: dns.is_response() && dns.rcode() == 0 && sum == 0 }};"
+    )));
     let msg = first(&xdp(&format!("{DNS}    emit E {{ a: dns.qtype(), m: pkt.mac(0), b: true }};")));
     assert!(msg.contains("`dns.qtype()` needs the question name first"), "{msg}");
     let msg = first(&xdp(&format!("{DNS}    let q = dns.name();\n    emit E {{ a: 1, m: pkt.mac(0), b: true }};")));

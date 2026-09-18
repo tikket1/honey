@@ -33,7 +33,17 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Reg {
-    R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10,
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+    R5,
+    R6,
+    R7,
+    R8,
+    R9,
+    R10,
 }
 
 impl Reg {
@@ -158,15 +168,7 @@ impl Insn {
     /// Rebuild an instruction from decoded fields (used by the disassembler
     /// when reading bytecode back). Pass `imm_high` for a wide LD_IMM64.
     pub fn from_parts(opcode: u8, dst: u8, src: u8, off: i16, imm: i32, imm_high: Option<i32>) -> Self {
-        Insn {
-            opcode,
-            dst,
-            src,
-            off,
-            imm,
-            wide: imm_high.is_some(),
-            imm_high: imm_high.unwrap_or(0),
-        }
+        Insn { opcode, dst, src, off, imm, wide: imm_high.is_some(), imm_high: imm_high.unwrap_or(0) }
     }
 
     /// Append this instruction's raw bytes to `out`.
@@ -291,7 +293,19 @@ pub fn exit() -> Insn {
 /// Arithmetic and bitwise operations for `alu*` builders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluOp {
-    Add, Sub, Mul, Div, Or, And, Lsh, Rsh, Mod, Xor, Arsh, Neg, Mov,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Or,
+    And,
+    Lsh,
+    Rsh,
+    Mod,
+    Xor,
+    Arsh,
+    Neg,
+    Mov,
 }
 
 impl AluOp {
@@ -317,9 +331,18 @@ impl AluOp {
 /// Comparisons for the `jmp_*` builders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JmpOp {
-    Eq, Ne, Gt, Ge, Lt, Le, Set,
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Set,
     /// Signed comparisons (two's-complement interpretation of the operands).
-    Sgt, Sge, Slt, Sle,
+    Sgt,
+    Sge,
+    Slt,
+    Sle,
 }
 
 impl JmpOp {
@@ -343,7 +366,10 @@ impl JmpOp {
 /// Memory access widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Size {
-    B, H, W, DW,
+    B,
+    H,
+    W,
+    DW,
 }
 
 impl Size {
@@ -449,14 +475,12 @@ impl Prog {
         slot_of.push(slot); // one past the end
 
         for &(at, label) in &self.fixups {
-            let target = self.labels[label as usize]
-                .ok_or_else(|| format!("label {label} used but never bound"))?;
+            let target = self.labels[label as usize].ok_or_else(|| format!("label {label} used but never bound"))?;
             // offset = target_slot - (slot after this jump)
             let from = slot_of[at] + 1;
             let to = slot_of[target];
             let off = to as isize - from as isize;
-            self.insns[at].off = i16::try_from(off)
-                .map_err(|_| format!("jump offset {off} out of range for i16"))?;
+            self.insns[at].off = i16::try_from(off).map_err(|_| format!("jump offset {off} out of range for i16"))?;
         }
         Ok(self.insns)
     }
@@ -491,11 +515,7 @@ pub fn disasm(insn: &Insn) -> String {
             if op == NEG {
                 return format!("{name}{suffix} {dst}");
             }
-            if insn.opcode & X != 0 {
-                format!("{name}{suffix} {dst}, {src}")
-            } else {
-                format!("{name}{suffix} {dst}, {}", insn.imm)
-            }
+            if insn.opcode & X != 0 { format!("{name}{suffix} {dst}, {src}") } else { format!("{name}{suffix} {dst}, {}", insn.imm) }
         }
         LD if insn.opcode == (LD | DW | IMM) => {
             if insn.src == PSEUDO_MAP_FD {
@@ -550,23 +570,47 @@ pub fn disasm_prog(insns: &[Insn]) -> String {
 
 fn alu_name(op: u8) -> &'static str {
     match op {
-        ADD => "add", SUB => "sub", MUL => "mul", DIV => "div", OR => "or",
-        AND => "and", LSH => "lsh", RSH => "rsh", NEG => "neg", MOD => "mod",
-        XOR => "xor", MOV => "mov", ARSH => "arsh", _ => "alu?",
+        ADD => "add",
+        SUB => "sub",
+        MUL => "mul",
+        DIV => "div",
+        OR => "or",
+        AND => "and",
+        LSH => "lsh",
+        RSH => "rsh",
+        NEG => "neg",
+        MOD => "mod",
+        XOR => "xor",
+        MOV => "mov",
+        ARSH => "arsh",
+        _ => "alu?",
     }
 }
 
 fn jmp_name(op: u8) -> &'static str {
     match op {
-        JEQ => "==", JNE => "!=", JGT => ">", JGE => ">=", JLT => "<",
-        JLE => "<=", JSET => "&", JSGT => "s>", JSGE => "s>=", JSLT => "s<",
-        JSLE => "s<=", _ => "jmp?",
+        JEQ => "==",
+        JNE => "!=",
+        JGT => ">",
+        JGE => ">=",
+        JLT => "<",
+        JLE => "<=",
+        JSET => "&",
+        JSGT => "s>",
+        JSGE => "s>=",
+        JSLT => "s<",
+        JSLE => "s<=",
+        _ => "jmp?",
     }
 }
 
 fn size_name(opcode: u8) -> &'static str {
     match opcode & 0x18 {
-        B => "8", H => "16", W => "32", DW => "64", _ => "?",
+        B => "8",
+        H => "16",
+        W => "32",
+        DW => "64",
+        _ => "?",
     }
 }
 

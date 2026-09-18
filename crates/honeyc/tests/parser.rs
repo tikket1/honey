@@ -6,7 +6,7 @@
 //! building expected ASTs by hand.
 
 use honeyc::ast::*;
-use honeyc::parser::{parse, parse_expr, Error};
+use honeyc::parser::{Error, parse, parse_expr};
 use honeyc::pretty;
 use honeyc::token::Span;
 
@@ -183,10 +183,7 @@ fn map_decl() {
 #[test]
 fn map_decl_with_nested_generics_splits_shr() {
     // The lexer produced `Shr` for `>>`; the parser must split it.
-    assert_eq!(
-        p("map names: hash<u32, str<16>>[1024];"),
-        "map names: hash<u32, str<16>>[1024];\n"
-    );
+    assert_eq!(p("map names: hash<u32, str<16>>[1024];"), "map names: hash<u32, str<16>>[1024];\n");
     assert_eq!(p("map m: hash<u32, hash<u8, str<4>>>[1];"), "map m: hash<u32, hash<u8, str<4>>>[1];\n");
 }
 
@@ -240,10 +237,7 @@ fn expr_stmt() {
 #[test]
 fn if_stmt() {
     assert_eq!(stmt("if x { return; }"), "    if x {\n        return;\n    }");
-    assert_eq!(
-        stmt("if x { a(); } else { b(); }"),
-        "    if x {\n        a();\n    } else {\n        b();\n    }"
-    );
+    assert_eq!(stmt("if x { a(); } else { b(); }"), "    if x {\n        a();\n    } else {\n        b();\n    }");
 }
 
 #[test]
@@ -278,10 +272,7 @@ fn for_stmt() {
 
 #[test]
 fn emit_stmt() {
-    assert_eq!(
-        stmt("emit Exec { pid: pid(), uid: uid() };"),
-        "    emit Exec { pid: pid(), uid: uid() };"
-    );
+    assert_eq!(stmt("emit Exec { pid: pid(), uid: uid() };"), "    emit Exec { pid: pid(), uid: uid() };");
     assert_eq!(stmt("emit E { a: 1, };"), "    emit E { a: 1 };");
     assert_eq!(stmt("emit E {};"), "    emit E {  };");
 }
